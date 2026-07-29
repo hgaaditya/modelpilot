@@ -70,6 +70,7 @@ Same script, `-Action`:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action stop
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action restart
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action tray
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action status -Latest
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action upgrade
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Url '<direct .gguf url>'
@@ -77,6 +78,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 ```
 
 - **stop** / **restart** — kills `llama-swap`, any spawned `llama-server`, and the open-webui backend. The backend is matched by `python.exe` whose `ExecutablePath` is under the repo root, so a machine's other interpreters are never touched.
+- **tray** — (re)starts just the notification-area indicator, `tray.ps1`. It comes up automatically after a successful launch; `-NoTray` suppresses that. A coloured dot polls `/health` on both services every 5s — green for both up, yellow for one, red for neither — with the currently loaded model in the tooltip (from llama-swap's `/running`). Double-click opens the chat UI; right-click gives open/restart/stop/logs. It raises a balloon when the stack drops on its own, which is the point: a backend that dies unattended is otherwise invisible until you next try to use it. Icons are drawn at runtime rather than shipped as `.ico` files, and a named mutex keeps it to one instance no matter how often `start.ps1` fires it off. Exiting the tray leaves the stack running; `uninstall` kills it.
 - **add-model** — resumable `.gguf` download into `llama.cpp\models\` via `curl.exe -L -C -` (ships with Windows 10+; `Invoke-WebRequest` has neither resume nor progress, which makes it useless for a multi-GB file). Writes to `<name>.part` and only renames on success, so an interrupted pull resumes on re-run and a partial file is never mistaken for a complete model. `-Name` overrides the filename. On success it prints the `config.yaml` block to paste. Hugging Face URLs must be the `/resolve/` form, not `/blob/` — the failure message says so.
 - **status** — installed vs. pinned versions; `-Latest` adds the newest upstream release of each component (GitHub releases API + nodejs.org dist index).
 - **upgrade** — moves to the versions in the `$VER` table at the top of `start.ps1`, or to the newest upstream releases with `-Latest`. Stops the stack, deletes only the artifacts whose version actually changed, re-runs the deploy steps, relaunches. `llama.cpp\models\` and `llamaswap\config.yaml` are never touched. An open-webui version bump lands in a new `open-webui-<ver>\` directory with `backend\data\` (the `webui.db` holding users/chats/settings) and `.env` (holding `WEBUI_SECRET_KEY`) copied over; the previous directory is parked as `_old-open-webui-<ver>\` rather than deleted, so delete it manually once the upgrade is confirmed good.

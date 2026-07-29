@@ -7,10 +7,12 @@
 #   .\start.ps1 -Action upgrade      # move to the versions pinned in $VER below
 #   .\start.ps1 -Action upgrade -Latest   # move to the newest upstream release of each component
 #   .\start.ps1 -Action add-model -Url <direct .gguf url>   # resumable weight download into llama.cpp\models
+#   .\start.ps1 -Action tray         # (re)start just the tray status indicator
 #   .\start.ps1 -Action uninstall    # stop + remove everything (keeps .gguf weights unless -IncludeModels)
 #
-# Launching verifies both services answer /health before reporting success, and warns up front
-# about any model in config.yaml whose .gguf is missing.
+# Launching verifies both services answer /health before reporting success, warns up front about
+# any model in config.yaml whose .gguf is missing, and raises a tray indicator (see tray.ps1,
+# suppress with -NoTray).
 #
 # Versions live in $VER and are stamped to .stack-versions.json after each successful run, so
 # a plain re-run relaunches what's installed instead of silently re-provisioning.
@@ -21,8 +23,11 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray')]
     [string]$Action = 'deploy',
+
+    # deploy/restart: don't launch the tray status indicator.
+    [switch]$NoTray,
 
     # upgrade/status: resolve the newest upstream release of each component instead of using $VER.
     [switch]$Latest,
@@ -140,6 +145,20 @@ function Resolve-Latest($ver) {
 function Get-WebuiProcess {
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }
+}
+
+function Get-TrayProcess {
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -match 'tray\.ps1' }
+}
+
+# The tray script self-deduplicates via a named mutex, so firing this off unconditionally is safe.
+function Start-Tray {
+    $tray = Join-Path $root 'tray.ps1'
+    if (-not (Test-Path $tray)) { return }
+    Start-Process powershell -WindowStyle Hidden `
+        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $tray,
+                      '-SwapPort', "$swapPort", '-WebuiPort', "$webuiPort"
 }
 
 function Test-StackRunning {
@@ -379,6 +398,8 @@ function Start-Stack($webui) {
         Write-Host "Stack is already running - use '-Action restart' to bounce it, or '-Action stop' to stop it."
         Write-Host "  llama-swap dashboard: http://127.0.0.1:$swapPort/ui"
         Write-Host "  open-webui chat:      http://127.0.0.1:$webuiPort"
+        # Still worth doing: the user may have exited the tray and re-run this to get it back.
+        if (-not $NoTray) { Start-Tray }
         return
     }
 
@@ -416,6 +437,8 @@ function Start-Stack($webui) {
         throw
     }
 
+    if (-not $NoTray) { Start-Tray }
+
     Write-Host "`nllama-swap dashboard: http://127.0.0.1:$swapPort/ui"
     Write-Host "open-webui chat:      http://127.0.0.1:$webuiPort"
     Write-Host "Logs: $logDir  (both run detached - stop with '.\start.ps1 -Action stop')"
@@ -425,8 +448,10 @@ function Start-Stack($webui) {
 #  main
 # ==========================================================================
 
-# These three don't touch versions at all - handle them before any stamp/release resolution.
+# These don't touch versions at all - handle them before any stamp/release resolution.
 if ($Action -eq 'stop') { Stop-Stack; return }
+
+if ($Action -eq 'tray') { Start-Tray; Write-Host "Tray indicator started (look in the notification area)."; return }
 
 if ($Action -eq 'restart') {
     $webui = Find-WebuiDir
@@ -606,6 +631,8 @@ switch ($Action) {
         }
 
         Stop-Stack
+        # Otherwise a tray dot lingers in the notification area pointing at a stack that's gone.
+        Get-TrayProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
         if (Test-Path $llamaCpp) {
             if ($IncludeModels) { Remove-Item $llamaCpp -Recurse -Force }
