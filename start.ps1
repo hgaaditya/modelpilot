@@ -3,6 +3,7 @@
 #   .\start.ps1                      # deploy (first run) + launch. Idempotent.
 #   .\start.ps1 -Action stop         # stop llama-swap, any llama-server, and the open-webui backend
 #   .\start.ps1 -Action restart      # stop, then launch again
+#   .\start.ps1 -Action restart -Component swap    # just llama-swap: how a new model becomes routable
 #   .\start.ps1 -Action status       # what's installed vs. what's pinned vs. what's newest upstream
 #   .\start.ps1 -Action upgrade      # move to the versions pinned in $VER below
 #   .\start.ps1 -Action upgrade -Latest   # move to the newest upstream release of each component
@@ -28,6 +29,12 @@ param(
 
     # deploy/restart: don't launch the tray status indicator.
     [switch]$NoTray,
+
+    # stop/restart: act on one half of the stack only. 'swap' also takes down the llama-server
+    # processes it spawned. Restarting 'swap' alone is how a newly added model becomes routable,
+    # since llama-swap only reads config.yaml at startup.
+    [ValidateSet('all', 'swap', 'webui')]
+    [string]$Component = 'all',
 
     # upgrade/status: resolve the newest upstream release of each component instead of using $VER.
     [switch]$Latest,
@@ -176,24 +183,34 @@ function Start-Tray {
                       '-SwapPort', "$swapPort", '-WebuiPort', "$webuiPort"
 }
 
-function Test-StackRunning {
-    if (@(Get-Process -Name 'llama-swap' -ErrorAction SilentlyContinue).Count) { return $true }
-    [bool](@(Get-WebuiProcess).Count)
+# 'swap' covers llama-swap and the llama-server processes it spawns - they're its children and
+# are meaningless without it. 'webui' is the open-webui backend. 'all' is both.
+function Test-ComponentRunning($component = 'all') {
+    if ($component -ne 'webui' -and @(Get-Process -Name 'llama-swap' -ErrorAction SilentlyContinue).Count) { return $true }
+    if ($component -ne 'swap' -and @(Get-WebuiProcess).Count) { return $true }
+    $false
 }
 
-function Stop-Stack {
+function Test-StackRunning { Test-ComponentRunning 'all' }
+
+function Stop-Stack($component = 'all') {
     $stopped = 0
-    foreach ($n in 'llama-swap', 'llama-server') {
-        $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue)
-        $stopped += $procs.Count
-        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    if ($component -ne 'webui') {
+        foreach ($n in 'llama-swap', 'llama-server') {
+            $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue)
+            $stopped += $procs.Count
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        }
     }
-    Get-WebuiProcess | ForEach-Object {
-        $stopped++
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    if ($component -ne 'swap') {
+        Get-WebuiProcess | ForEach-Object {
+            $stopped++
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
     }
-    if ($stopped) { Write-Host "Stopped $stopped stack process(es)."; Start-Sleep -Seconds 1 }
-    else { Write-Host "Nothing was running." }
+    $what = if ($component -eq 'all') { 'stack' } else { $component }
+    if ($stopped) { Write-Host "Stopped $stopped $what process(es)."; Start-Sleep -Seconds 1 }
+    else { Write-Host "Nothing was running for '$what'." }
 }
 
 # ==========================================================================
@@ -358,7 +375,7 @@ function Test-ModelFiles {
     }
     if ($missing) {
         Write-Host "  -> those $missing model(s) will fail on first use. Fetch weights with:"
-        Write-Host "     .\start.ps1 -Action add-model -Url <direct .gguf url>"
+        Write-Host "     .\start.ps1 -Action add-model -Model <hf repo, hf url, or .gguf url>"
         Write-Host ""
     }
 }
@@ -408,9 +425,10 @@ function Wait-Healthy($label, $url, $proc, $logFiles, $timeoutSec) {
     throw "$label failed its health check."
 }
 
-function Start-Stack($webui) {
-    if (Test-StackRunning) {
-        Write-Host "Stack is already running - use '-Action restart' to bounce it, or '-Action stop' to stop it."
+function Start-Stack($webui, $component = 'all') {
+    if (Test-ComponentRunning $component) {
+        $what = if ($component -eq 'all') { 'Stack' } else { $component }
+        Write-Host "$what is already running - use '-Action restart' to bounce it, or '-Action stop' to stop it."
         Write-Host "  llama-swap dashboard: http://127.0.0.1:$swapPort/ui"
         Write-Host "  open-webui chat:      http://127.0.0.1:$webuiPort"
         # Still worth doing: the user may have exited the tray and re-run this to get it back.
@@ -418,7 +436,7 @@ function Start-Stack($webui) {
         return
     }
 
-    Test-ModelFiles
+    if ($component -ne 'webui') { Test-ModelFiles }
 
     # -NoNewWindow: Start-Process's default (a new console window) fails with
     # "operation was canceled by the user" when there's no window station to attach to
@@ -427,28 +445,36 @@ function Start-Stack($webui) {
     $swapLogs  = @((Join-Path $logDir 'llama-swap.err.log'), (Join-Path $logDir 'llama-swap.log'))
     $webuiLogs = @((Join-Path $logDir 'open-webui.err.log'), (Join-Path $logDir 'open-webui.log'))
 
-    Write-Host "Starting llama-swap on :$swapPort ..."
-    $swapProc = Start-Process -FilePath (Join-Path $llamaSwapDir 'llama-swap.exe') `
-        -ArgumentList '--config', $swapConfig, '--listen', ":$swapPort" `
-        -WorkingDirectory $llamaSwapDir -NoNewWindow -PassThru `
-        -RedirectStandardOutput $swapLogs[1] -RedirectStandardError $swapLogs[0]
+    $swapProc = $null
+    $webuiProc = $null
 
-    Write-Host "Starting open-webui on :$webuiPort ..."
-    $webuiProc = Start-Process -FilePath (Join-Path $webui '.venv\Scripts\python.exe') `
-        -ArgumentList '-m', 'uvicorn', 'open_webui.main:app', '--host', '0.0.0.0', '--port', "$webuiPort", '--forwarded-allow-ips', "'*'", '--ws', 'auto' `
-        -WorkingDirectory (Join-Path $webui 'backend') -NoNewWindow -PassThru `
-        -RedirectStandardOutput $webuiLogs[1] -RedirectStandardError $webuiLogs[0]
+    if ($component -ne 'webui') {
+        Write-Host "Starting llama-swap on :$swapPort ..."
+        $swapProc = Start-Process -FilePath (Join-Path $llamaSwapDir 'llama-swap.exe') `
+            -ArgumentList '--config', $swapConfig, '--listen', ":$swapPort" `
+            -WorkingDirectory $llamaSwapDir -NoNewWindow -PassThru `
+            -RedirectStandardOutput $swapLogs[1] -RedirectStandardError $swapLogs[0]
+    }
 
-    # If either service fails its check, tear the other one down too - a half-started stack left
+    if ($component -ne 'swap') {
+        Write-Host "Starting open-webui on :$webuiPort ..."
+        $webuiProc = Start-Process -FilePath (Join-Path $webui '.venv\Scripts\python.exe') `
+            -ArgumentList '-m', 'uvicorn', 'open_webui.main:app', '--host', '0.0.0.0', '--port', "$webuiPort", '--forwarded-allow-ips', "'*'", '--ws', 'auto' `
+            -WorkingDirectory (Join-Path $webui 'backend') -NoNewWindow -PassThru `
+            -RedirectStandardOutput $webuiLogs[1] -RedirectStandardError $webuiLogs[0]
+    }
+
+    # If a service fails its check, tear down whatever this call started - a half-started stack
     # holding ports and GPU memory is worse than no stack, and the next run's guard would refuse
-    # to launch because it looks "already running".
+    # to launch because it looks "already running". Only what we started, though: restarting one
+    # component must not take the other one down with it.
     try {
-        Wait-Healthy 'llama-swap' "http://127.0.0.1:$swapPort/health" $swapProc $swapLogs 20
+        if ($swapProc)  { Wait-Healthy 'llama-swap' "http://127.0.0.1:$swapPort/health" $swapProc $swapLogs 20 }
         # Generous budget: open-webui's first boot downloads sentence-transformers embedding weights.
-        Wait-Healthy 'open-webui' "http://127.0.0.1:$webuiPort/health" $webuiProc $webuiLogs 180
+        if ($webuiProc) { Wait-Healthy 'open-webui' "http://127.0.0.1:$webuiPort/health" $webuiProc $webuiLogs 180 }
     } catch {
         Write-Host "`nRolling back the partial launch..."
-        Stop-Stack
+        Stop-Stack $component
         throw
     }
 
@@ -564,15 +590,15 @@ function Add-ModelToConfig($id, $ggufPath, $context) {
 # ==========================================================================
 
 # These don't touch versions at all - handle them before any stamp/release resolution.
-if ($Action -eq 'stop') { Stop-Stack; return }
+if ($Action -eq 'stop') { Stop-Stack $Component; return }
 
 if ($Action -eq 'tray') { Start-Tray; Write-Host "Tray indicator started (look in the notification area)."; return }
 
 if ($Action -eq 'restart') {
     $webui = Find-WebuiDir
     if (-not $webui) { throw "Nothing deployed - run '.\start.ps1' with no arguments first." }
-    Stop-Stack
-    Start-Stack $webui
+    Stop-Stack $Component
+    Start-Stack $webui $Component
     return
 }
 
@@ -640,7 +666,8 @@ if ($Action -eq 'add-model') {
     }
     elseif (Add-ModelToConfig $Id $primary $Context) {
         Write-Host "Registered in $swapConfig as `"$Id`" (context $Context, previous config saved as config.yaml.bak)."
-        Write-Host "Run '.\start.ps1 -Action restart' to pick it up."
+        # llama-swap only reads config.yaml at startup, but open-webui has no reason to bounce.
+        Write-Host "Run '.\start.ps1 -Action restart -Component swap' to make it routable."
     }
     return
 }

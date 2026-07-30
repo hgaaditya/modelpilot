@@ -153,8 +153,22 @@ $menu.Add_Opening({
 
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void](Add-MenuItem 'Open logs folder'         { Start-Process explorer.exe $script:logDir })
-[void](Add-MenuItem 'Restart stack'            { Start-Detached @('-Action', 'restart') })
-[void](Add-MenuItem 'Stop stack'               { Start-Detached @('-Action', 'stop') })
+
+# Reloading just llama-swap is the common case: it only reads config.yaml at startup, so a model
+# added while the stack is up isn't routable until it bounces - and open-webui has no reason to.
+[void](Add-MenuItem 'Reload models (restart llama-swap)' { Start-Detached @('-Action', 'restart', '-Component', 'swap') })
+
+$miRestart = New-Object System.Windows.Forms.ToolStripMenuItem 'Restart'
+[void]$menu.Items.Add($miRestart)
+[void]$miRestart.DropDownItems.Add('Whole stack').Add_Click({ Start-Detached @('-Action', 'restart') })
+[void]$miRestart.DropDownItems.Add('llama-swap only').Add_Click({ Start-Detached @('-Action', 'restart', '-Component', 'swap') })
+[void]$miRestart.DropDownItems.Add('open-webui only').Add_Click({ Start-Detached @('-Action', 'restart', '-Component', 'webui') })
+
+$miStop = New-Object System.Windows.Forms.ToolStripMenuItem 'Stop'
+[void]$menu.Items.Add($miStop)
+[void]$miStop.DropDownItems.Add('Whole stack').Add_Click({ Start-Detached @('-Action', 'stop') })
+[void]$miStop.DropDownItems.Add('llama-swap only').Add_Click({ Start-Detached @('-Action', 'stop', '-Component', 'swap') })
+[void]$miStop.DropDownItems.Add('open-webui only').Add_Click({ Start-Detached @('-Action', 'stop', '-Component', 'webui') })
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void](Add-MenuItem 'Exit (leaves stack running)' {
     $script:notify.Visible = $false

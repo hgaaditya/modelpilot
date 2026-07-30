@@ -4,12 +4,36 @@
 healthCheckTimeout: 300   # big models take a while to load
 
 macros:
+  # -np 1        single client (this stack), so one request gets the whole context
+  # --context-shift  default is DISABLED in this build: without it llama-server hard-errors
+  #              once a conversation exceeds -c instead of dropping the oldest tokens.
+  #              Safety net only - the client should prune first (see contextLength in
+  #              continue.dev / open-webui), because shifting silently drops the system prompt.
   llama-server: >
     "C:\LocalLLM\llama.cpp\llama-server.exe"
     --host 127.0.0.1 --port ${PORT}
     -fa on -ngl 99
+    -np 1 --context-shift
 
 models:
+  "gemma4-coding-Q6_K":
+    cmd: >
+      ${llama-server}
+      -m "C:\LocalLLM\llama.cpp\models\gemma4-coding-Q6_K.gguf"
+      -c 32768
+      -ctk q4_0
+      -ctv q4_0
+    ttl: 600  # Unload after 10 minutes of idle
+    
+  "gemma4-v2-Q6_K":
+    cmd: >
+      ${llama-server}
+      -m "C:\LocalLLM\llama.cpp\models\gemma4-v2-Q6_K.gguf"
+      -c 32768
+      -ctk q4_0
+      -ctv q4_0
+    ttl: 600  # Unload after 10 minutes of idle
+    
   "qwen3-14b":
     cmd: >
       ${llama-server}
