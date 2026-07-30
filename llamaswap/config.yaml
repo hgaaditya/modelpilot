@@ -53,16 +53,17 @@ models:
       -c 16384 -ctk q8_0 -ctv q8_0
     ttl: 600
 
-  # 8551 MiB base, 68.0 MiB per 1k tokens - the expensive one, because every layer uses full
-  # attention. 24576 is the hard ceiling and it measured only 887 MiB free with the model loaded;
-  # the desktop alone was seen swinging 970-1463 MiB, so that ceiling OOMs the moment a browser
-  # window opens. 20480 keeps ~1.1 GB of slack. For more context switch to -ctk q4_0 -ctv q4_0,
-  # which roughly doubles it at a real cost to recall of anything early in the conversation.
+  # 8551 MiB base, and the expensive one for context because every layer uses full attention:
+  # 68 MiB per 1k tokens at q8_0 KV. A benchmark run at 20480/q8_0 peaked at 10959 MiB of the
+  # card's 12282, leaving ~1.3 GB - and the desktop compositor visibly glitched, because that is
+  # roughly what the desktop itself needs. q4_0 KV halves the cache instead of cutting context,
+  # so the 20480 stays and about 700 MiB comes back. The cost is real but narrow: q4_0 degrades
+  # recall of tokens early in a long conversation, not general quality.
   "qwen3-14b":
     cmd: >
       ${llama-server}
       -m "C:\LocalLLM\llama.cpp\models\Qwen3-14B-Q4_K_M.gguf"
-      -c 20480 -ctk q8_0 -ctv q8_0
+      -c 20480 -ctk q4_0 -ctv q4_0
     ttl: 600          # unload after 10 min idle
 
   "qwen3-8b-longctx":

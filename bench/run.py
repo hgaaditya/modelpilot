@@ -133,15 +133,24 @@ def grade_python(task, text):
 GRADERS = {"contains": grade_contains, "regex": grade_regex, "json": grade_json, "python": grade_python}
 
 
+FILLER = ("The archive contains routine maintenance records. "
+          "Nothing in this paragraph is relevant to the question. ")
+
+
 def build_prompt(task):
     """Needle tasks generate their own haystack so long-context behaviour is measured
-    rather than assumed - the filler is deterministic so every model sees the same input."""
+    rather than assumed - the filler is deterministic so every model sees the same input.
+
+    Sizing matters: English GGUF tokenisers land near 4 characters per token, and an earlier
+    version used a 12-chars-per-token guess that built 22.7k tokens for a task asking for 16k.
+    Every model then failed the task on a 400 for exceeding its context, which measured the
+    harness rather than the model.
+    """
     if task["type"] != "needle":
         return task["prompt"]
-    filler = ("The archive contains routine maintenance records. "
-              "Nothing in this paragraph is relevant to the question. ")
     approx_tokens = task.get("context_tokens", 8000)
-    body = filler * (approx_tokens // 12)
+    reps = max(1, int(approx_tokens * 4 / len(FILLER)))
+    body = FILLER * reps
     cut = int(len(body) * task.get("depth", 0.5))
     return (body[:cut] + "\n\n" + task["needle"] + "\n\n" + body[cut:] +
             "\n\n" + task["prompt"])
@@ -161,7 +170,13 @@ def run_one(base, model, task, timeout):
     try:
         resp = post(base + "/v1/chat/completions", payload, timeout)
     except urllib.error.HTTPError as e:
-        return {"ok": False, "note": "HTTP %s %s" % (e.code, e.read()[:120].decode("utf-8", "replace"))}
+        body = e.read()[:200].decode("utf-8", "replace")
+        # A prompt longer than this model's -c isn't a wrong answer, it's a task this model
+        # can't be asked. Scoring it as a failure would punish a small context twice: once in
+        # the config, again here.
+        if e.code == 400 and "exceed" in body.lower():
+            return {"skipped": True, "ok": False, "note": "context too small for this task"}
+        return {"ok": False, "note": "HTTP %s %s" % (e.code, body[:120])}
     except Exception as e:
         return {"ok": False, "note": str(e)[:120]}
     wall = time.time() - t0
@@ -173,6 +188,9 @@ def run_one(base, model, task, timeout):
     t = resp.get("timings") or {}
     return {
         "ok": ok, "note": note, "wall_s": round(wall, 2),
+        # Keep what a failing model actually said: a red cell you can't inspect tells you
+        # nothing about whether the model is weak or the grader is too strict.
+        "output": None if ok else text[:400],
         "gen_tps": round(t.get("predicted_per_second", 0), 1),
         "prompt_tps": round(t.get("prompt_per_second", 0), 1),
         "prompt_tokens": (resp.get("usage") or {}).get("prompt_tokens", 0),
@@ -221,18 +239,19 @@ def main():
                 peak = max(peak, v)
             passed = sum(1 for a in attempts if a["ok"])
             best = max(attempts, key=lambda a: (a["ok"], a.get("gen_tps", 0)))
-            best["id"], best["passed"], best["of"] = task["id"], passed, len(attempts)
+            skipped = all(a.get("skipped") for a in attempts)
+            best["id"], best["passed"] = task["id"], passed
+            best["of"] = 0 if skipped else len(attempts)   # 0 keeps it out of the pass rate
             rows.append(best)
-            print("  %-22s %s  %5.1f tok/s  %s" % (
-                task["id"],
-                "pass" if passed == len(attempts) else ("%d/%d" % (passed, len(attempts))),
-                best.get("gen_tps", 0),
-                best.get("note", "")[:60]))
+            label = "skip" if skipped else ("pass" if passed == len(attempts) else "%d/%d" % (passed, len(attempts)))
+            print("  %-24s %-5s %5.1f tok/s  %s" % (
+                task["id"], label, best.get("gen_tps", 0), best.get("note", "")[:58]))
         gen = [r["gen_tps"] for r in rows if r.get("gen_tps")]
         pro = [r["prompt_tps"] for r in rows if r.get("prompt_tps")]
         results[model] = {
             "rows": rows,
             "pass_rate": sum(r["passed"] for r in rows) / max(1, sum(r["of"] for r in rows)),
+            "skipped": sum(1 for r in rows if r["of"] == 0),
             "gen_tps": round(statistics.median(gen), 1) if gen else 0,
             "prompt_tps": round(statistics.median(pro), 1) if pro else 0,
             "peak_vram_mib": peak,
