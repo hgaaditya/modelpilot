@@ -22,10 +22,17 @@
 #   llama-swap  http://127.0.0.1:9292  (model router -> llama-server)
 #   open-webui  http://127.0.0.1:8080  (chat UI)
 
-[CmdletBinding()]
+# PositionalBinding=$false: -Action bench forwards everything it doesn't recognise to run.py via
+# $BenchArgs, and without this PowerShell grabs those trailing values positionally for whichever
+# parameter happens to be next in the declaration order.
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench')]
     [string]$Action = 'deploy',
+
+    # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$BenchArgs,
 
     # deploy/restart: don't launch the tray status indicator.
     [switch]$NoTray,
@@ -593,6 +600,22 @@ function Add-ModelToConfig($id, $ggufPath, $context) {
 if ($Action -eq 'stop') { Stop-Stack $Component; return }
 
 if ($Action -eq 'tray') { Start-Tray; Write-Host "Tray indicator started (look in the notification area)."; return }
+
+if ($Action -eq 'bench') {
+    $bench = Join-Path $root 'bench\run.py'
+    if (-not (Test-Path $bench)) { throw "$bench not found." }
+    if (-not (Test-ComponentRunning 'swap')) { throw "llama-swap isn't running - start the stack first." }
+    # Reuse the venv the deploy already built rather than depending on a machine-wide Python.
+    $webui = Find-WebuiDir
+    $py = if ($webui) { Join-Path $webui '.venv\Scripts\python.exe' } else { $null }
+    if (-not ($py -and (Test-Path $py))) {
+        $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+        if (-not $py) { throw "No Python found - deploy the stack first, or put python on PATH." }
+    }
+    # -u: a full run takes minutes per model, and buffered stdout would show nothing until the end.
+    & $py -u $bench --base "http://127.0.0.1:$swapPort" @BenchArgs
+    exit $LASTEXITCODE
+}
 
 if ($Action -eq 'restart') {
     $webui = Find-WebuiDir

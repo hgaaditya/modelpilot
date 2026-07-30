@@ -21,3 +21,6 @@
 
 # editor/session cruft
 /.claude/
+
+# benchmark output (timestamped runs, regenerable)
+/bench/results/

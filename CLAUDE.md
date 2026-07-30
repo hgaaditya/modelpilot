@@ -94,11 +94,36 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
   Downloads run through `curl.exe -L -C -` (ships with Windows 10+; `Invoke-WebRequest` has neither resume nor progress, which makes it useless for a multi-GB file), staging to `<name>.part` and renaming only on success, so an interrupted pull resumes on re-run and a partial file is never mistaken for a complete model.
 
   On success it appends an entry to `llamaswap\config.yaml` in the file's existing style, saving the previous version as `config.yaml.bak`. The id defaults to the file name lowercased (`-Id` overrides), context to 16384 (`-Context`). An id that already exists is left untouched rather than duplicated. `-NoConfig` downloads without touching the config. llama-swap reads its config at startup, so the new model needs `-Action restart` before it's routable.
+- **bench** — runs `bench\run.py` against the live llama-swap (see below). Anything after `-Action bench` is forwarded to the script verbatim, which is why the param block sets `PositionalBinding = $false`; without it PowerShell binds trailing values to whichever parameter is next in declaration order.
 - **status** — installed vs. pinned versions; `-Latest` adds the newest upstream release of each component (GitHub releases API + nodejs.org dist index).
 - **upgrade** — moves to the versions in the `$VER` table at the top of `start.ps1`, or to the newest upstream releases with `-Latest`. Stops the stack, deletes only the artifacts whose version actually changed, re-runs the deploy steps, relaunches. `llama.cpp\models\` and `llamaswap\config.yaml` are never touched. An open-webui version bump lands in a new `open-webui-<ver>\` directory with `backend\data\` (the `webui.db` holding users/chats/settings) and `.env` (holding `WEBUI_SECRET_KEY`) copied over; the previous directory is parked as `_old-open-webui-<ver>\` rather than deleted, so delete it manually once the upgrade is confirmed good.
 - **uninstall** — prints exactly what it will delete, then requires typing `yes` (`-Force` skips). Removes binaries, the open-webui tree, logs, the version stamp and the download cache. Keeps `.gguf` weights unless `-IncludeModels` is passed, and always keeps `start.ps1`, `CLAUDE.md`, `llamaswap\config.yaml`.
 
 Which versions are actually installed is tracked in `.stack-versions.json` (gitignored, written after each successful deploy/upgrade). Without it, `upgrade` treats every component as stale and re-provisions the lot. Bare `-Action deploy` deliberately *ignores* `$VER` when a stamp exists — bumping the pins requires `-Action upgrade`, so a routine relaunch can never surprise you with a re-download.
+
+## Benchmarking and evaluating models — `bench/`
+
+Compares the models in `config.yaml` against each other on both speed and correctness. Everything is graded locally by `bench\run.py`; there is no LLM judge and no external API call, so a full run costs nothing but GPU time and can be re-run as often as you like.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action bench
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action bench --models qwen3-14b gemma4-v2
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action bench --tasks code json --repeat 3
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action bench --compare bench\results\<earlier>.json
+```
+
+The constraint that shapes everything: **tasks must be machine-gradeable**, since an LLM judge would defeat the point. `bench\tasks.jsonl` holds one task per line, each with a `type` naming its grader:
+
+- `python` — extracts the code block and runs it against the task's `tests` in a subprocess. **This executes model-generated code on your machine**, sandboxed only by a timeout and a temp directory. Fine for models you chose to download; exclude these with `--tasks` if that isn't acceptable.
+- `json` — output must parse as JSON and carry the expected keys. Catches models that wrap JSON in prose or fences.
+- `regex` / `contains` — exact-format and exact-answer checks.
+- `needle` — the harness generates a long deterministic haystack, buries a fact at a given `depth`, and asks for it back. This is the one that actually exercises the context sizes configured in `config.yaml`.
+
+Speed numbers come from llama.cpp's own `timings` block in the response (`predicted_per_second`, `prompt_per_second`), so they measure the model rather than the harness. Reasoning models' `<think>` blocks are stripped before grading — otherwise every exact-match task would fail on output format rather than capability, which measures the wrong thing.
+
+Results land in `bench\results\<timestamp>.json` (gitignored). `--compare` diffs a run against an earlier one, which is the point of keeping them: it's how you tell whether a quant change or a context change actually helped. `--repeat N` runs each task N times and reports the median, for when a single sample is too noisy to trust.
+
+Adding a task is one line in `tasks.jsonl` — no code change, as long as an existing grader covers it.
 
 ## Working inside `open-webui-0.11.0/`
 
