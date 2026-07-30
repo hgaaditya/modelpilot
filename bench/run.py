@@ -189,6 +189,9 @@ def main():
     ap.add_argument("--repeat", type=int, default=1, help="runs per task; median is reported")
     ap.add_argument("--timeout", type=int, default=600, help="seconds per request (a cold model load is slow)")
     ap.add_argument("--compare", help="path to an earlier results .json to diff against")
+    ap.add_argument("--cooldown", type=int, default=10,
+                    help="seconds to idle between models, letting llama-swap free VRAM before the "
+                         "next one loads (0 to disable)")
     args = ap.parse_args()
 
     all_tasks = [json.loads(l) for l in TASKS.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -201,6 +204,12 @@ def main():
 
     print("%d model(s) x %d task(s) x %d run(s)\n" % (len(models), len(all_tasks), args.repeat))
     results = {}
+
+    # Checkpoint after every model. A long run drives the GPU hard for minutes at a time, and a
+    # driver timeout (bugcheck 0x116) takes the whole machine with it - without this, an hour of
+    # measurements is lost because the last model crashed.
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    out = RESULTS / (datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + ".json")
 
     for model in models:
         print("=== %s" % model)
@@ -228,7 +237,10 @@ def main():
             "prompt_tps": round(statistics.median(pro), 1) if pro else 0,
             "peak_vram_mib": peak,
         }
+        out.write_text(json.dumps(results, indent=2), encoding="utf-8")
         print()
+        if args.cooldown and model != models[-1]:
+            time.sleep(args.cooldown)
 
     print("%-28s %8s %10s %12s %10s" % ("model", "pass", "gen tok/s", "prompt tok/s", "peak VRAM"))
     print("-" * 72)
@@ -237,9 +249,6 @@ def main():
             m, r["pass_rate"] * 100, r["gen_tps"], r["prompt_tps"],
             ("%d MiB" % r["peak_vram_mib"]) if r["peak_vram_mib"] else "n/a"))
 
-    RESULTS.mkdir(parents=True, exist_ok=True)
-    out = RESULTS / (datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + ".json")
-    out.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print("\nwrote %s" % out)
 
     if args.compare:
