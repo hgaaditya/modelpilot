@@ -32,11 +32,26 @@ param(
     # upgrade/status: resolve the newest upstream release of each component instead of using $VER.
     [switch]$Latest,
 
-    # add-model: direct download URL of a .gguf (required for that action, ignored otherwise).
-    [string]$Url,
+    # add-model: what to fetch. A Hugging Face repo ("bartowski/Qwen_Qwen3-8B-GGUF", optionally
+    # suffixed ":Q4_K_M"), a huggingface.co URL of either a repo or a single file, or any other
+    # direct .gguf URL.
+    [Alias('Url')]
+    [string]$Model,
+
+    # add-model: which quantisation to pull from a repo that offers several.
+    [string]$Quant = 'Q4_K_M',
+
+    # add-model: llama-swap model id to register (defaults to the file name, lowercased).
+    [string]$Id,
+
+    # add-model: context size for the generated config.yaml entry.
+    [int]$Context = 16384,
 
     # add-model: save under this filename instead of the one in the URL.
     [string]$Name,
+
+    # add-model: download only, don't touch llamaswap\config.yaml.
+    [switch]$NoConfig,
 
     # uninstall: also delete the multi-GB .gguf weights (kept by default - they're slow to re-fetch).
     [switch]$IncludeModels,
@@ -445,6 +460,106 @@ function Start-Stack($webui) {
 }
 
 # ==========================================================================
+#  add-model: Hugging Face resolution + config.yaml registration
+# ==========================================================================
+
+# Accepts what a person actually has to hand: a repo id, a repo page URL, a file page URL, or a
+# direct download link. Returns @{ Repo = ...; Quant = ...; Url = ... } with Repo set when we
+# need to go ask Hugging Face which files exist, or Url set when we already know the file.
+function Resolve-ModelSpec($spec) {
+    $spec = $spec.Trim()
+
+    if ($spec -notmatch '^https?://') {
+        # "owner/name" or "owner/name:Q4_K_M"
+        $quant = $null
+        if ($spec -match '^(.+?):([^:/]+)$') { $spec = $Matches[1]; $quant = $Matches[2] }
+        if ($spec -notmatch '^[^/\s]+/[^/\s]+$') {
+            throw "'$spec' is neither a URL nor an 'owner/name' Hugging Face repo id."
+        }
+        return @{ Repo = $spec; Quant = $quant }
+    }
+
+    if ($spec -match '^https?://(?:www\.)?huggingface\.co/(.+)$') {
+        $path = $Matches[1] -replace '[?#].*$', ''
+        # .../resolve/<rev>/<file> is the download form; .../blob/<rev>/<file> is the page for it.
+        if ($path -match '^([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+)$') {
+            return @{ Url = "https://huggingface.co/$($Matches[1])/resolve/$($Matches[2])/$($Matches[3])" }
+        }
+        # .../tree/<rev>/... and bare repo pages both just identify a repo.
+        if ($path -match '^([^/]+/[^/]+)') { return @{ Repo = $Matches[1] } }
+    }
+
+    @{ Url = $spec }
+}
+
+# Every .gguf in a repo, grouped into one entry per variant. A large model is published as
+# "name-00001-of-00010.gguf" split parts, and pulling only part 1 gives you a model that won't
+# load - so parts are kept together and downloaded as a set.
+function Get-HfVariants($repo) {
+    $api = "https://huggingface.co/api/models/$repo/tree/main?recursive=true"
+    try {
+        $tree = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'localllm-setup' } -ErrorAction Stop
+    } catch {
+        $code = $_.Exception.Response.StatusCode.value__
+        if ($code -eq 401 -or $code -eq 404) {
+            throw "Hugging Face returned $code for '$repo' - check the spelling, and note that gated or private repos can't be fetched without a token."
+        }
+        throw "Could not query Hugging Face for '$repo': $($_.Exception.Message)"
+    }
+
+    $files = @($tree | Where-Object { $_.type -eq 'file' -and $_.path -match '\.gguf$' })
+    if (-not $files) { throw "No .gguf files in '$repo' - is it a GGUF conversion of the model, or the original weights?" }
+
+    $groups = @{}
+    foreach ($f in $files) {
+        $leaf = Split-Path $f.path -Leaf
+        # Collapse the split suffix so all parts of one variant land in the same group.
+        $key = [IO.Path]::GetFileNameWithoutExtension($leaf) -replace '-\d{5}-of-\d{5}$', ''
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = @() }
+        $groups[$key] += $f
+    }
+
+    $groups.Keys | Sort-Object | ForEach-Object {
+        $parts = @($groups[$_] | Sort-Object path)
+        [pscustomobject]@{
+            Name    = $_
+            Parts   = $parts
+            Bytes   = ($parts | Measure-Object -Property size -Sum).Sum
+            # The quant label is the tail of the name: Qwen_Qwen3-8B-Q4_K_M -> Q4_K_M
+            Quant   = if ($_ -match '(?i)[-_.]((?:IQ|Q)\d[A-Z0-9_]*|BF16|F16|F32)$') { $Matches[1] } else { $_ }
+        }
+    }
+}
+
+function Format-Size($bytes) { '{0:N1} GB' -f ($bytes / 1GB) }
+
+# Appends a model entry to config.yaml, matching the style already in the file. The file is
+# hand-maintained and git-tracked, so it gets a .bak first and is never rewritten wholesale.
+function Add-ModelToConfig($id, $ggufPath, $context) {
+    if (-not (Test-Path $swapConfig)) { Write-Warning "$swapConfig not found - skipping registration."; return $false }
+    $text = Get-Content $swapConfig -Raw
+    if ($text -match "(?m)^\s{2,}""$([regex]::Escape($id))""\s*:") {
+        Write-Warning "config.yaml already has a model called '$id' - leaving it alone."
+        return $false
+    }
+
+    Copy-Item $swapConfig "$swapConfig.bak" -Force
+    if (-not $text.EndsWith("`n")) { $text += "`r`n" }
+    $block = @'
+
+  "@ID@":
+    cmd: >
+      ${llama-server}
+      -m "@PATH@"
+      -c @CTX@ -ctk q8_0 -ctv q8_0
+    ttl: 600
+'@
+    $block = $block.Replace('@ID@', $id).Replace('@PATH@', $ggufPath).Replace('@CTX@', "$context")
+    Set-Content -Path $swapConfig -Value ($text + $block + "`r`n") -Encoding utf8 -NoNewline
+    $true
+}
+
+# ==========================================================================
 #  main
 # ==========================================================================
 
@@ -462,33 +577,71 @@ if ($Action -eq 'restart') {
 }
 
 if ($Action -eq 'add-model') {
-    if (-not $Url) { throw "-Action add-model needs -Url <direct .gguf url>." }
-    $file = if ($Name) { $Name } else { Split-Path ($Url -split '\?')[0] -Leaf }
-    if ($file -notlike '*.gguf') { throw "'$file' is not a .gguf - pass -Name <file>.gguf if the URL doesn't end in one." }
-
-    $dest = Join-Path $modelsDir $file
-    if (Test-Path $dest) { Write-Host "$dest already exists - nothing to do."; return }
+    if (-not $Model) { throw "-Action add-model needs -Model <hf repo, hf url, or direct .gguf url>." }
     New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null
 
-    Write-Host "Fetching $file (resumable - safe to interrupt and re-run)..."
-    try { Get-BigFile $Url $dest }
-    catch {
-        # The single most common cause: a Hugging Face /blob/ page URL instead of the file itself.
-        if ($Url -match 'huggingface\.co' -and $Url -match '/blob/') {
-            Write-Warning "That looks like a Hugging Face *page* URL - swap '/blob/' for '/resolve/' to get the file itself."
+    $spec = Resolve-ModelSpec $Model
+    $downloads = @()   # each: @{ Url = ...; File = ... }
+
+    if ($spec.Repo) {
+        Write-Host "Looking up $($spec.Repo) on Hugging Face..."
+        $variants = @(Get-HfVariants $spec.Repo)
+
+        # -Quant wins over a ":Q4_K_M" suffix on the spec only if the user actually typed it;
+        # otherwise the suffix wins, then the default.
+        $wanted = if ($PSBoundParameters.ContainsKey('Quant')) { $Quant }
+                  elseif ($spec.Quant) { $spec.Quant }
+                  else { $Quant }
+
+        $match = @($variants | Where-Object { $_.Quant -eq $wanted })
+        if (-not $match) { $match = @($variants | Where-Object { $_.Name -match "(?i)[-_.]$([regex]::Escape($wanted))$" }) }
+
+        if (-not $match) {
+            Write-Host "`nNo '$wanted' in $($spec.Repo). Available:`n"
+            $variants | ForEach-Object { Write-Host ("  {0,-12} {1,10}   {2}" -f $_.Quant, (Format-Size $_.Bytes), $_.Name) }
+            throw "Pick one with -Quant <label>."
         }
-        throw
+        if ($match.Count -gt 1) {
+            Write-Host "`n'$wanted' matches more than one variant:`n"
+            $match | ForEach-Object { Write-Host ("  {0,-40} {1,10}" -f $_.Name, (Format-Size $_.Bytes)) }
+            throw "Narrow it down with -Quant <label>."
+        }
+
+        $v = $match[0]
+        Write-Host "Selected $($v.Name)  [$($v.Quant), $(Format-Size $v.Bytes), $($v.Parts.Count) file(s)]"
+        foreach ($p in $v.Parts) {
+            # Split parts live in a subfolder upstream but must sit side by side locally.
+            $downloads += @{ Url = "https://huggingface.co/$($spec.Repo)/resolve/main/$($p.path)"; File = (Split-Path $p.path -Leaf) }
+        }
+        if (-not $Id) { $Id = $v.Name.ToLower() }
+    }
+    else {
+        $file = if ($Name) { $Name } else { Split-Path ($spec.Url -split '\?')[0] -Leaf }
+        if ($file -notlike '*.gguf') { throw "'$file' is not a .gguf - pass -Name <file>.gguf if the URL doesn't end in one." }
+        $downloads += @{ Url = $spec.Url; File = $file }
+        if (-not $Id) { $Id = [IO.Path]::GetFileNameWithoutExtension($file).ToLower() }
     }
 
-    $id = [IO.Path]::GetFileNameWithoutExtension($file).ToLower()
-    Write-Host "`nSaved to $dest"
-    Write-Host "Add this to $swapConfig under 'models:' (tune -c / -ctk / -ctv to taste):`n"
-    Write-Host "  `"$id`":"
-    Write-Host "    cmd: >"
-    Write-Host "      `${llama-server}"
-    Write-Host "      -m `"$dest`""
-    Write-Host "      -c 16384 -ctk q8_0 -ctv q8_0"
-    Write-Host "    ttl: 600"
+    $i = 0
+    foreach ($d in $downloads) {
+        $i++
+        $dest = Join-Path $modelsDir $d.File
+        if (Test-Path $dest) { Write-Host "[$i/$($downloads.Count)] $($d.File) already present - skipping."; continue }
+        Write-Host "[$i/$($downloads.Count)] Fetching $($d.File) (resumable - safe to interrupt and re-run)..."
+        Get-BigFile $d.Url $dest
+    }
+
+    # llama.cpp loads a split model from its first part and finds the rest itself.
+    $primary = Join-Path $modelsDir $downloads[0].File
+    Write-Host "`nSaved to $modelsDir"
+
+    if ($NoConfig) {
+        Write-Host "Skipped config.yaml (-NoConfig). Register it as '$Id' pointing at $primary when you're ready."
+    }
+    elseif (Add-ModelToConfig $Id $primary $Context) {
+        Write-Host "Registered in $swapConfig as `"$Id`" (context $Context, previous config saved as config.yaml.bak)."
+        Write-Host "Run '.\start.ps1 -Action restart' to pick it up."
+    }
     return
 }
 

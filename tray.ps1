@@ -19,10 +19,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Net.Http
 
-$root    = $PSScriptRoot
-$startPs = Join-Path $root 'start.ps1'
-$logDir  = Join-Path $root 'logs'
+$root       = $PSScriptRoot
+$startPs    = Join-Path $root 'start.ps1'
+$logDir     = Join-Path $root 'logs'
+$swapConfig = Join-Path $root 'llamaswap\config.yaml'
 
 # One tray icon per machine. start.ps1 fires this off on every successful launch without
 # checking, so a duplicate just exits here instead of stacking up dots in the notification area.
@@ -69,6 +71,38 @@ function Start-Detached($argList) {
     Start-Process powershell -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $argList)
 }
 
+# The configured models, straight from config.yaml so the list is right whether or not the stack
+# is up. Each entry carries the weight path so a model whose .gguf went missing can be greyed out
+# instead of silently failing the moment it's selected.
+function Get-ConfiguredModels {
+    if (-not (Test-Path $script:swapConfig)) { return @() }
+    $parts = [regex]::Split((Get-Content $script:swapConfig -Raw), '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
+    $out = @()
+    for ($i = 1; $i -lt $parts.Count; $i += 2) {
+        $m = [regex]::Match($parts[$i + 1], '-m\s+"?([^"\r\n]+?\.gguf)"?')
+        $out += [pscustomobject]@{
+            Id      = $parts[$i]
+            Path    = if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
+            Present = $m.Success -and (Test-Path $m.Groups[1].Value.Trim())
+        }
+    }
+    $out
+}
+
+# Asking llama-swap for a completion is what makes it swap the model in; one token is enough.
+# Fire and forget - waiting for a multi-GB model to load would freeze the tray.
+function Request-ModelLoad($id) {
+    $body = @{ model = $id; messages = @(@{ role = 'user'; content = 'hi' }); max_tokens = 1 } | ConvertTo-Json -Compress -Depth 4
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromMinutes(10)
+    $content = New-Object System.Net.Http.StringContent($body, [Text.Encoding]::UTF8, 'application/json')
+    [void]$client.PostAsync("http://127.0.0.1:$script:SwapPort/v1/chat/completions", $content)
+}
+
+function Invoke-UnloadAll {
+    try { Invoke-RestMethod -Uri "http://127.0.0.1:$script:SwapPort/api/models/unload" -Method Post -TimeoutSec 5 | Out-Null } catch { }
+}
+
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 function Add-MenuItem($text, $action) {
     $item = $menu.Items.Add($text)
@@ -84,6 +118,39 @@ $notify.Visible = $true
 
 $miChat = Add-MenuItem 'Open chat UI'          { Start-Process "http://127.0.0.1:$script:WebuiPort" }
 $miDash = Add-MenuItem 'Open llama-swap dashboard' { Start-Process "http://127.0.0.1:$script:SwapPort/ui" }
+[void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+$miModels = New-Object System.Windows.Forms.ToolStripMenuItem 'Models'
+[void]$menu.Items.Add($miModels)
+[void](Add-MenuItem 'Unload all models' { Invoke-UnloadAll })
+
+# Rebuilt when the menu opens rather than on the status timer: config.yaml changes while the tray
+# is running (that's what add-model does), and rebuilding under a menu the user has open is rude.
+$menu.Add_Opening({
+    $script:miModels.DropDownItems.Clear()
+    $models = Get-ConfiguredModels
+    if (-not $models) {
+        $none = $script:miModels.DropDownItems.Add('(none configured)')
+        $none.Enabled = $false
+        return
+    }
+    $loaded = Get-LoadedModel
+    foreach ($m in $models) {
+        $label = $m.Id
+        if ($m.Id -eq $loaded) { $label = "* $label  (loaded)" }
+        elseif (-not $m.Present) { $label = "$label  (file missing)" }
+        $item = $script:miModels.DropDownItems.Add($label)
+        if (-not $m.Present) {
+            $item.Enabled = $false
+            $item.ToolTipText = "Not on disk: $($m.Path)"
+        } else {
+            $id = $m.Id   # capture per iteration, not by reference to the loop variable
+            $item.ToolTipText = $m.Path
+            $item.Add_Click({ Request-ModelLoad $id }.GetNewClosure())
+        }
+    }
+})
+
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void](Add-MenuItem 'Open logs folder'         { Start-Process explorer.exe $script:logDir })
 [void](Add-MenuItem 'Restart stack'            { Start-Detached @('-Action', 'restart') })

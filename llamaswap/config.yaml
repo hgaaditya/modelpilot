@@ -1,5 +1,5 @@
-# ============================================================
-#  llama-swap config — ADD NEW MODELS HERE, NOTHING ELSE CHANGES
+﻿# ============================================================
+#  llama-swap config â€” ADD NEW MODELS HERE, NOTHING ELSE CHANGES
 # ============================================================
 healthCheckTimeout: 300   # big models take a while to load
 
@@ -31,3 +31,10 @@ models:
       -c 16384 -ctk q8_0 -ctv q8_0
       --n-cpu-moe 40
     ttl: 300
+
+  "qwen2.5-0.5b-instruct-q4_k_m":
+    cmd: >
+      ${llama-server}
+      -m "C:\LocalLLM\llama.cpp\models\qwen2.5-0.5b-instruct-q4_k_m.gguf"
+      -c 16384 -ctk q8_0 -ctv q8_0
+    ttl: 600
