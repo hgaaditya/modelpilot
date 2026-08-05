@@ -96,12 +96,14 @@ models:
   # stops at 41), hence the llama-server-prism macro.
   # q4_0 KV is not a compromise here the way it is for qwen3-14b: the vendor ships 4-bit KV as
   # the intended operating point, and the hybrid backbone grows a full-attention cache on only
-  # 16 of its 64 layers. 32768 is a starting point for a 12 GB card - measure before raising it.
+  # 16 of its 64 layers. That makes context unusually cheap - 32768 measured 9091 MiB with
+  # 2920 MiB still free, so 65536 fits comfortably. Sized for agentic clients (Claude Code sends
+  # 15-25k tokens of system prompt and tool definitions before your first message).
   "bonsai-27b":
     cmd: >
       ${llama-server-prism}
       -m "C:\LocalLLM\llama.cpp\models\Ternary-Bonsai-27B-Q2_0.gguf"
-      -c 32768 -ctk q4_0 -ctv q4_0
+      -c 65536 -ctk q4_0 -ctv q4_0
     ttl: 600
 
   "qwen2.5-0.5b-instruct-q4_k_m":

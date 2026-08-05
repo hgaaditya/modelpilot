@@ -106,6 +106,32 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
 Which versions are actually installed is tracked in `.stack-versions.json` (gitignored, written after each successful deploy/upgrade). Without it, `upgrade` treats every component as stale and re-provisions the lot. Bare `-Action deploy` deliberately *ignores* `$VER` when a stamp exists — bumping the pins requires `-Action upgrade`, so a routine relaunch can never surprise you with a re-download.
 
+## Using the local models from Claude Code
+
+Two different things, often confused:
+
+**Full local mode — `claude-local.ps1`.** Runs Claude Code entirely against llama-swap instead of Anthropic. llama-swap implements the Anthropic endpoints Claude Code needs (`v1/messages`, `v1/messages/count_tokens`), so it's just three environment variables. The script sets them **for its own process only** — putting `ANTHROPIC_BASE_URL` in the user environment would silently redirect *every* Claude Code session on the machine, which is almost never wanted. It validates that llama-swap is up and that the model ids exist before launching, so a typo fails immediately rather than as a connection error inside Claude Code.
+
+```powershell
+.\claude-local.ps1                      # bonsai-27b
+.\claude-local.ps1 -Model qwen3-14b
+```
+
+`-SmallModel` (default `qwen2.5-0.5b-instruct-q4_k_m`) backs `ANTHROPIC_SMALL_FAST_MODEL`, which Claude Code uses for background work like conversation titles. Pointing it at the main model makes every trivial call trigger a multi-GB swap.
+
+**Hybrid delegation — `local-llm.ps1`.** Usually the better arrangement: keep Claude Code on the cloud model for reasoning, planning and orchestration, and hand off only the token-heavy grinding to a local model.
+
+```powershell
+.\local-llm.ps1 -Prompt "List every distinct error and its frequency" -File logs\app.log
+Get-Content big.json | .\local-llm.ps1 -Prompt "Extract every user id, one per line"
+```
+
+Only the *answer* returns, so a 200k-token log costs nothing in cloud context. This is a script rather than a second backend because **`ANTHROPIC_BASE_URL` is global per process** — Claude Code cannot split its own traffic between two endpoints, so the local model has to be something it calls, not something it routes to.
+
+Worth knowing when deciding whether an offload pays: prompt processing (the compute-bound phase that dominates when you feed in a large file) measured **~2290–2400 tok/s on `gemma4-v2`**, 2176 on `gemma4-coding-Q6_K`, 1906 on `qwen3-14b` — so ~50k tokens of input costs 20–25 seconds. Don't judge this from a short prompt: a 31-token request reports ~57 tok/s because fixed overhead dominates, which is measurement noise, not throughput.
+
+Input larger than `-ChunkTokens` (default 40000) is split and each chunk answered independently, then concatenated. That is map-without-reduce: right for extract/filter/list work, wrong for "summarise this whole thing coherently" — for that, feed the output back through once more. Files are read as UTF-8 with invalid bytes and control characters stripped, because logs and dumps routinely contain bytes that would otherwise make llama-server reject the whole request as malformed JSON.
+
 ## Benchmarking and evaluating models — `bench/`
 
 Compares the models in `config.yaml` against each other on both speed and correctness. Everything is graded locally by `bench\run.py`; there is no LLM judge and no external API call, so a full run costs nothing but GPU time and can be re-run as often as you like.
