@@ -9,6 +9,7 @@
 #   .\start.ps1 -Action upgrade -Latest   # move to the newest upstream release of each component
 #   .\start.ps1 -Action add-model -Url <direct .gguf url>   # resumable weight download into llama.cpp\models
 #   .\start.ps1 -Action tray         # (re)start just the tray status indicator
+#   .\start.ps1 -Action install-prism      # PrismML llama.cpp fork (low-bit kernels), alongside the stock build
 #   .\start.ps1 -Action uninstall    # stop + remove everything (keeps .gguf weights unless -IncludeModels)
 #
 # Launching verifies both services answer /health before reporting success, warns up front about
@@ -27,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -85,11 +86,17 @@ $VER = @{
     openWebUI = '0.11.0'      # open-webui pins requires-python <3.13 and node <=22.x
     node      = 'v22.23.1'
     cuda      = 'cuda-13.3'   # only a fallback - the exact CUDA asset is resolved from the release
+    # PrismML's llama.cpp fork, installed alongside (never over) the stock build by
+    # '-Action install-prism'. It carries the custom low-bit kernels that stock llama.cpp lacks:
+    # Bonsai-style ternary weights use ggml tensor types 42/142, and stock b10155 tops out at 41,
+    # so those models fail to load on the normal binary no matter how they're configured.
+    prism     = 'prism-b9599-9ca265a'
 }
 
 $root         = $PSScriptRoot
 $llamaCpp     = Join-Path $root 'llama.cpp'
-$modelsDir    = Join-Path $llamaCpp 'models'
+$llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side with the stock build
+$modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
 $llamaSwapDir = Join-Path $root 'llamaswap'
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $logDir       = Join-Path $root 'logs'
@@ -601,6 +608,63 @@ if ($Action -eq 'stop') { Stop-Stack $Component; return }
 
 if ($Action -eq 'tray') { Start-Tray; Write-Host "Tray indicator started (look in the notification area)."; return }
 
+if ($Action -eq 'install-prism') {
+    # Deliberately a separate action rather than part of deploy: it's ~620 MB of downloads that
+    # only matters if you actually run a low-bit model, and it must never replace the stock
+    # build - every other model in config.yaml depends on that one.
+    $exe = Join-Path $llamaPrism 'llama-server.exe'
+    if ((Test-Path $exe) -and -not $Force) {
+        Write-Host "$exe already present (use -Force to reinstall)."
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $llamaPrism, $dl | Out-Null
+
+    $tag = $VER.prism
+    if ($Latest) {
+        $r = Get-GitHubRelease 'PrismML-Eng/llama.cpp'
+        if ($r) { $tag = $r.tag_name } else { Write-Warning "Could not query the fork's releases - using pinned $tag" }
+    }
+    Write-Host "Fetching PrismML llama.cpp fork $tag ..."
+    $rel = Get-GitHubRelease 'PrismML-Eng/llama.cpp' $tag
+    if (-not $rel) { throw "No release '$tag' in PrismML-Eng/llama.cpp." }
+
+    # The fork also publishes plain cpu/vulkan/hip builds; the CUDA one is the point of it here.
+    # Its Windows CUDA asset is named off the kernel build (llama-prism-b1-...), not the release
+    # tag, so match on shape rather than on the tag string.
+    $main = $rel.assets | Where-Object { $_.name -match 'bin-win-cuda-.*-x64\.zip$' -and $_.name -notmatch '^cudart' } | Select-Object -First 1
+    if (-not $main) {
+        Write-Host "`nNo Windows CUDA asset in $tag. Available:"
+        $rel.assets | ForEach-Object { Write-Host ("  {0,-58} {1,6:N0} MB" -f $_.name, ($_.size / 1MB)) }
+        throw "Nothing to install."
+    }
+    $cudart = $rel.assets | Where-Object { $_.name -match '^cudart-.*-x64\.zip$' } | Select-Object -First 1
+
+    foreach ($a in @($main, $cudart) | Where-Object { $_ }) {
+        $zip = Join-Path $dl $a.name
+        if (-not (Test-Path $zip)) { Get-BigFile $a.browser_download_url $zip } else { Write-Host "$($a.name) already downloaded." }
+        Write-Host "Extracting $($a.name) ..."
+        Expand-Archive -Path $zip -DestinationPath $llamaPrism -Force
+    }
+
+    if (-not (Test-Path $exe)) { throw "Extracted the archives but $exe is missing - check the asset layout." }
+    $stamp = Read-Stamp
+    if (-not $stamp) { $stamp = @{} }
+    $stamp['prism'] = $tag
+    Write-Stamp $stamp
+
+    Write-Host "`nInstalled to $llamaPrism"
+    Write-Host "Add a model that needs it to $swapConfig using the 'llama-server-prism' macro:"
+    Write-Host ""
+    Write-Host '  "<model-id>":'
+    Write-Host '    cmd: >'
+    Write-Host '      ${llama-server-prism}'
+    Write-Host "      -m `"$modelsDir\<file>.gguf`""
+    Write-Host '      -c 16384 -ctk q4_0 -ctv q4_0'
+    Write-Host '    ttl: 600'
+    Write-Host "`nThen '.\start.ps1 -Action restart -Component swap'."
+    return
+}
+
 if ($Action -eq 'bench') {
     $bench = Join-Path $root 'bench\run.py'
     if (-not (Test-Path $bench)) { throw "$bench not found." }
@@ -716,10 +780,13 @@ switch ($Action) {
             $lat  = if ($latestVer) { $latestVer[$k] } else { '-' }
             Write-Host ("{0,-12} {1,-14} {2,-14} {3}" -f $k, $inst, $VER[$k], $lat)
         }
+        $pi = if ($installed -and $installed.ContainsKey('prism')) { $installed['prism'] } else { '(not installed)' }
+        Write-Host ("{0,-12} {1,-14} {2,-14} {3}" -f 'prism fork', $pi, $VER['prism'], '-')
         $wd = Find-WebuiDir
         Write-Host ""
         Write-Host "open-webui dir: $(if ($wd) { $wd } else { '(none)' })"
         Write-Host "llama-server:   $(if (Test-Path (Join-Path $llamaCpp 'llama-server.exe')) { 'installed' } else { 'missing' })"
+        Write-Host "prism fork:     $(if (Test-Path (Join-Path $llamaPrism 'llama-server.exe')) { "installed ($llamaPrism)" } else { "not installed (-Action install-prism)" })"
         Write-Host "llama-swap:     $(if (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe')) { 'installed' } else { 'missing' })"
         Write-Host "running:        $((@(Get-Process -Name llama-swap, llama-server -ErrorAction SilentlyContinue)).Count) llama process(es)"
         if (-not $Latest) { Write-Host "`n(add -Latest to also show newest upstream releases)" }
@@ -810,6 +877,7 @@ switch ($Action) {
     'uninstall' {
         $targets = @()
         if (Test-Path $llamaCpp)     { $targets += if ($IncludeModels) { $llamaCpp } else { "$llamaCpp (except models\)" } }
+        if (Test-Path $llamaPrism)   { $targets += $llamaPrism }
         if (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe')) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
         Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
@@ -841,6 +909,7 @@ switch ($Action) {
             if ($IncludeModels) { Remove-Item $llamaCpp -Recurse -Force }
             else { Get-ChildItem $llamaCpp -Force | Where-Object { $_.Name -ne 'models' } | Remove-Item -Recurse -Force }
         }
+        Remove-Item $llamaPrism -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item (Join-Path $llamaSwapDir 'llama-swap.exe') -Force -ErrorAction SilentlyContinue
         Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like 'open-webui-*' -or $_.Name -like '_old-open-webui-*' } |

@@ -15,6 +15,16 @@ macros:
     -fa on -ngl 99
     -np 1 --context-shift
 
+  # PrismML's llama.cpp fork, installed by '-Action install-prism'. Use this macro instead of the
+  # one above ONLY for models the stock build can't load - low-bit formats whose ggml tensor types
+  # (42, 142 for Bonsai ternary) don't exist upstream, where stock b10155 stops at type 41.
+  # Everything else should stay on the stock binary, which is the better-tested path.
+  llama-server-prism: >
+    "C:\LocalLLM\llama.cpp-prism\llama-server.exe"
+    --host 127.0.0.1 --port ${PORT}
+    -fa on -ngl 99
+    -np 1 --context-shift
+
 models:
   # Context sizes below are measured, not guessed: each model was loaded at two context sizes
   # and the VRAM delta read from nvidia-smi, giving KV cost per token and the largest -c that
@@ -80,6 +90,19 @@ models:
       -c 16384 -ctk q8_0 -ctv q8_0
       --n-cpu-moe 40
     ttl: 300
+
+  # Ternary Bonsai 27B: 27B-class weights at ~1.71 bits, so ~7.15 GB resident where a normal
+  # Q4 27B would need ~17.6 GB. Requires the PrismML fork (ggml tensor type 42; stock llama.cpp
+  # stops at 41), hence the llama-server-prism macro.
+  # q4_0 KV is not a compromise here the way it is for qwen3-14b: the vendor ships 4-bit KV as
+  # the intended operating point, and the hybrid backbone grows a full-attention cache on only
+  # 16 of its 64 layers. 32768 is a starting point for a 12 GB card - measure before raising it.
+  "bonsai-27b":
+    cmd: >
+      ${llama-server-prism}
+      -m "C:\LocalLLM\llama.cpp\models\Ternary-Bonsai-27B-Q2_0.gguf"
+      -c 32768 -ctk q4_0 -ctv q4_0
+    ttl: 600
 
   "qwen2.5-0.5b-instruct-q4_k_m":
     cmd: >

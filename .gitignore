@@ -24,3 +24,6 @@
 
 # benchmark output (timestamped runs, regenerable)
 /bench/results/
+
+# PrismML llama.cpp fork (downloaded by -Action install-prism, ~1.2 GB of binaries)
+/llama.cpp-prism/
