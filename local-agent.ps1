@@ -27,6 +27,11 @@ param(
     # Treat it as a strong hint, not a sandbox - run against a clean git tree either way.
     [switch]$ReadOnly,
 
+    # Let the agent apply edits without asking. Required for any task that writes, because
+    # nothing can answer a permission prompt in a scripted run. It is exactly as risky as it
+    # sounds with a local model driving - only use it on a clean git tree you can reset.
+    [switch]$AutoApprove,
+
     [int]$Port = 9292,
 
     # Raw JSON event stream instead of formatted text, for scripting.
@@ -55,12 +60,16 @@ if ($ReadOnly) {
 $modelRef = "localllm/$Model"
 
 Write-Host "local-agent: $modelRef  in  $Directory" -ForegroundColor DarkGray
-Push-Location $Directory
-try {
-    # Auto-update would swap the binary mid-run and needs the network; neither is wanted here.
-    $env:OPENCODE_DISABLE_AUTOUPDATE = '1'
-    if ($Json) { & opencode run --model $modelRef --format json $task }
-    else        { & opencode run --model $modelRef $task }
-} finally {
-    Pop-Location
+
+# --dir, not Push-Location: OpenCode resolves its own project root and ignores the caller's
+# working directory, which silently sends it off to look at its own temp folder instead.
+$cliArgs = @('run', '--model', $modelRef, '--dir', $Directory)
+if ($Json)        { $cliArgs += @('--format', 'json') }
+if ($AutoApprove) { $cliArgs += '--auto' }
+elseif (-not $ReadOnly) {
+    Write-Host "note: no -AutoApprove, so edits will stall on a permission prompt nothing can answer." -ForegroundColor DarkYellow
 }
+
+# Auto-update would swap the binary mid-run and needs the network; neither is wanted here.
+$env:OPENCODE_DISABLE_AUTOUPDATE = '1'
+& opencode @cliArgs $task
