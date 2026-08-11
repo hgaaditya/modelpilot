@@ -55,6 +55,85 @@ $script:selfOrigin = "http://127.0.0.1:$Port"
 # Version strings cost a process launch each, so they're read once and kept.
 $script:versionCache = @{}
 
+# ---------------------------------------------------------------- window management
+
+# Chromium runs every --app window of a browser inside one process tree, and only one process in
+# that tree reports a MainWindowTitle. So Get-Process can never count the panel's windows: with
+# five of them open it still reports one, the check for "is a window already up" passes on the
+# wrong evidence, and each launch adds another. Five identical panels, which is what happened.
+#
+# EnumWindows is the only way to actually see them. The title match alone isn't enough either -
+# this repo lives in C:\LocalLLM, so an Explorer window on that folder is also titled "LocalLLM" -
+# hence the check that the owning process is a browser.
+Add-Type -ErrorAction SilentlyContinue @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class PanelWin {
+    delegate bool EnumProc(IntPtr h, IntPtr p);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] static extern int  GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+
+    public static List<IntPtr> Find(string title, string[] procNames) {
+        var found = new List<IntPtr>();
+        EnumWindows((h, p) => {
+            if (!IsWindowVisible(h)) return true;
+            int len = GetWindowTextLength(h);
+            if (len == 0) return true;
+            var sb = new StringBuilder(len + 1);
+            GetWindowText(h, sb, sb.Capacity);
+            if (sb.ToString() != title) return true;
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            try {
+                string n = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName.ToLower();
+                if (Array.IndexOf(procNames, n) >= 0) found.Add(h);
+            } catch { }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+    public static void Raise(IntPtr h) { ShowWindow(h, 9 /* SW_RESTORE */); SetForegroundWindow(h); }
+    public static void Close(IntPtr h) { PostMessage(h, 0x0010 /* WM_CLOSE */, IntPtr.Zero, IntPtr.Zero); }
+}
+'@
+
+$BROWSER_PROCS = @('chrome', 'msedge', 'brave')
+
+function Get-PanelWindows { @([PanelWin]::Find('LocalLLM', $BROWSER_PROCS)) }
+
+# Bring the panel back rather than opening another one. Returns false when there is nothing to
+# bring back, which is the only case where a new window should be launched.
+function Show-PanelWindow {
+    $w = Get-PanelWindows
+    if (-not $w.Count) { return $false }
+    # More than one already open is the bug this function exists to prevent; if it has already
+    # happened (from a build before this fix, or a browser restoring its last session), collapse
+    # them to one rather than leaving the user to close four identical windows by hand.
+    for ($i = 1; $i -lt $w.Count; $i++) { [PanelWin]::Close($w[$i]) }
+    [PanelWin]::Raise($w[0])
+    $true
+}
+
+# The only place a panel window is ever opened. Both launch paths route through here, because the
+# server being down does NOT mean no window is open - restarting the server (an upgrade, a crash,
+# an edit during development) leaves the old window sitting there pointing at a dead port, and it
+# reconnects on its own once the server is back. Opening another one then is what stacked them up.
+function Open-PanelWindow {
+    if (Show-PanelWindow) { return }
+    $browser = Find-AppBrowser
+    # Size the window to the content. Without this the browser opens at its own last-used
+    # geometry, which is a large mostly-empty frame around a compact panel.
+    if ($browser) { Start-Process $browser @("--app=http://127.0.0.1:$Port", '--window-size=1040,720') }
+    else { Start-Process "http://127.0.0.1:$Port" }
+}
+
 # ---------------------------------------------------------------- shortcuts
 
 function Find-AppBrowser {
@@ -948,18 +1027,7 @@ $alreadyUp = $false
 try { $alreadyUp = (Invoke-WebRequest "http://127.0.0.1:$Port/api/ping" -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 } catch { }
 if ($alreadyUp) {
     Write-Host "Panel already running on $Port."
-    if (-not $NoWindow) {
-        # Focus the window that exists rather than opening another one.
-        $existing = Get-Process -Name chrome, msedge, brave -ErrorAction SilentlyContinue |
-                    Where-Object { $_.MainWindowTitle -eq 'LocalLLM' } | Select-Object -First 1
-        if ($existing) {
-            Add-Type -Namespace Win -Name N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);' -ErrorAction SilentlyContinue
-            [void][Win.N]::SetForegroundWindow($existing.MainWindowHandle)
-        } else {
-            $b = Find-AppBrowser
-            if ($b) { Start-Process $b @("--app=http://127.0.0.1:$Port", '--window-size=1040,720') }
-        }
-    }
+    if (-not $NoWindow) { Open-PanelWindow }
     return
 }
 
@@ -978,13 +1046,7 @@ if (Test-Path $trayPs) {
         -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $trayPs
 }
 
-if (-not $NoWindow) {
-    $browser = Find-AppBrowser
-    # Size the window to the content. Without this the browser opens at its own last-used
-    # geometry, which is a large mostly-empty frame around a compact panel.
-    if ($browser) { Start-Process $browser @("--app=http://127.0.0.1:$Port", '--window-size=1040,720') }
-    else { Start-Process "http://127.0.0.1:$Port" }
-}
+if (-not $NoWindow) { Open-PanelWindow }
 
 function Read-Body($req) {
     $s = (New-Object IO.StreamReader($req.InputStream)).ReadToEnd()

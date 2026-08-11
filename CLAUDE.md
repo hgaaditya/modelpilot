@@ -136,6 +136,16 @@ matters — closing the panel window is a minimise, not a quit, so the server ha
 launcher. The polling matters just as much: without it a failure to start is completely invisible,
 which is the worst possible first-run outcome. `README.md` is the user-facing version of this.
 
+- **One window, enforced by `EnumWindows`.** Chromium runs every `--app` window of a browser
+  inside one process tree, and only one process in that tree reports a `MainWindowTitle` — so
+  `Get-Process` reports one window whether there is one or seven, and the old single-instance check
+  passed on that evidence and opened another every time. Seven accumulated in one session.
+  `Get-PanelWindows` enumerates real top-level windows instead, filtered to browser-owned ones
+  (this repo lives in `C:\LocalLLM`, so an Explorer window on that folder is *also* titled
+  `LocalLLM`). `Open-PanelWindow` is now the only place a window is opened, and both launch paths
+  route through it — because the server being down does **not** mean no window is open: restarting
+  the server leaves the old window pointing at a dead port, and it reconnects by itself once the
+  server is back. Extras found are collapsed to one rather than left for the user to close by hand.
 - `/api/ping` is **deliberately exempt** from the CSRF gate that covers every other `/api/*` path.
   It's how a second launch discovers a panel is already up, and that check runs before any token
   exists to send. Gating it broke single-instance detection outright — every launch believed
