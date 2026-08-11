@@ -84,7 +84,11 @@ if ($Install) {
 # ---------------------------------------------------------------- settings
 
 function Get-Settings {
-    $d = @{ modelsDir = (Join-Path $llamaCpp 'models'); swapPort = $swapPort; webuiPort = $webuiPort }
+    # useSwap/useWebui are the "part of my stack" switches. Start, Stop and Restart act on these
+    # and nothing else, so someone who only wants the router doesn't get open-webui started, and
+    # doesn't get told the stack is half-down because a service they deselected isn't running.
+    $d = @{ modelsDir = (Join-Path $llamaCpp 'models'); swapPort = $swapPort; webuiPort = $webuiPort
+            useSwap = $true; useWebui = $true }
     if (Test-Path $settingsFile) {
         $s = Get-Content $settingsFile -Raw | ConvertFrom-Json
         foreach ($k in $d.Keys.Clone()) { if ($s.PSObject.Properties.Name -contains $k) { $d[$k] = $s.$k } }
@@ -200,12 +204,21 @@ function Get-Dashboard {
     try { $loaded = ((Invoke-RestMethod "http://127.0.0.1:$swapPort/running" -TimeoutSec 2).running |
                      Where-Object { $_.state -ne 'stopped' } | Select-Object -First 1).model } catch { }
     Update-Usage $loaded
+    $cfg = Get-Settings
     $os = Get-CimInstance Win32_OperatingSystem
     @{
+        # 'selected' marks what Start/Stop act on. opencode is a CLI invoked per task, not a
+        # service with a lifecycle, so it is reported but never started or stopped - selectable
+        # would imply a button that cannot do anything.
         services = @(
-            @{ name = 'llama-swap'; role = 'model router'; up = (Test-Endpoint "http://127.0.0.1:$swapPort/health"); url = "http://127.0.0.1:$swapPort/ui"; installed = (Test-Path (Join-Path $root 'llamaswap\llama-swap.exe')) }
-            @{ name = 'open-webui'; role = 'chat interface'; up = (Test-Endpoint "http://127.0.0.1:$webuiPort/health"); url = "http://127.0.0.1:$webuiPort"; installed = [bool](Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue) }
-            @{ name = 'opencode'; role = 'local coding agent'; up = $false; url = ''; installed = [bool](Get-Command opencode -ErrorAction SilentlyContinue) }
+            @{ key = 'swap'; name = 'llama-swap'; role = 'model router'; managed = $true; selected = [bool]$cfg.useSwap
+               up = (Test-Endpoint "http://127.0.0.1:$swapPort/health"); url = "http://127.0.0.1:$swapPort/ui"
+               installed = (Test-Path (Join-Path $root 'llamaswap\llama-swap.exe')) }
+            @{ key = 'webui'; name = 'open-webui'; role = 'chat interface'; managed = $true; selected = [bool]$cfg.useWebui
+               up = (Test-Endpoint "http://127.0.0.1:$webuiPort/health"); url = "http://127.0.0.1:$webuiPort"
+               installed = [bool](Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue) }
+            @{ key = 'opencode'; name = 'opencode'; role = 'local coding agent (per-task CLI)'; managed = $false; selected = $false
+               up = $false; url = ''; installed = [bool](Get-Command opencode -ErrorAction SilentlyContinue) }
         )
         gpu     = $gpu
         loaded  = $loaded
@@ -358,7 +371,8 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 
 <div class="pane on" id="p0">
  <fieldset><legend>Services</legend>
-  <table><thead><tr><th>Service</th><th>Role</th><th>State</th><th></th></tr></thead><tbody id="svc"></tbody></table>
+  <table><thead><tr><th style="width:24px"></th><th>Service</th><th>Role</th><th>State</th><th></th></tr></thead><tbody id="svc"></tbody></table>
+  <div class="hint" style="margin:7px 0 0">Ticked services are your stack: Start, Stop and Restart act on those only, and the status light ignores the rest.</div>
  </fieldset>
  <fieldset><legend>Hardware</legend><div class="kv" id="hw"></div></fieldset>
 </div>
@@ -420,7 +434,19 @@ let S={},E={},M={};
 function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on')}
 async function post(u,o){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})})}
-async function act(a,c){await post('/api/action',{action:a,component:c});setTimeout(tick,1200)}
+// Map the ticked services onto start.ps1's -Component, which takes all|swap|webui.
+function selected(){
+ const s=(S.services||[]).filter(x=>x.managed&&x.selected).map(x=>x.key);
+ if(s.length===2)return 'all';
+ if(s.length===1)return s[0];
+ return null;   // nothing ticked - there is no action to take
+}
+async function act(a,c){
+ const comp=(c!==undefined)?c:selected();
+ if(comp===null){alert('No services are ticked, so Start/Stop have nothing to act on.\n\nTick at least one on the Dashboard.');return}
+ await post('/api/action',{action:a,component:comp});setTimeout(tick,1200);
+}
+async function toggleSvc(key,on){await post('/api/settings',key==='swap'?{useSwap:on}:{useWebui:on});tick()}
 async function load(id){await post('/api/load',{id});setTimeout(tick,700)}
 async function unloadAll(){await post('/api/unload',{});setTimeout(tick,700)}
 async function tune(id){await post('/api/autotune',{id});setTimeout(tick,700)}
@@ -465,12 +491,16 @@ async function inspect(){
 async function dl(repo,quant){await post('/api/download',{model:repo,quant});document.getElementById('insp').innerHTML='<div class="hint">Download started - watch Activity below.</div>';setTimeout(tick,800)}
 async function tick(){
  try{S=await (await fetch('/api/status')).json()}catch(e){return}
- const up=S.services.filter(s=>s.up).length, need=2;
- document.getElementById('d').className='dot '+(up>=need?'up':up?'part':'down');
- document.getElementById('sub').textContent=up>=need?'running':up?'partly running':'stopped';
- document.getElementById('go').disabled=up>=need;
- document.getElementById('svc').innerHTML=S.services.map(s=>`<tr><td>${s.name}</td><td style="color:var(--dim)">${s.role}</td>
-  <td>${s.installed?(s.up?'<span class="on2">running</span>':'<span class="miss">stopped</span>'):'<span class="tag">not installed</span>'}</td>
+ // Health is judged only against ticked services - a deselected one being down is not a fault.
+ const mine=S.services.filter(s=>s.managed&&s.selected);
+ const up=mine.filter(s=>s.up).length, need=mine.length;
+ document.getElementById('d').className='dot '+(need===0?'down':up===need?'up':up?'part':'down');
+ document.getElementById('sub').textContent=need===0?'nothing selected':up===need?'running':up?'partly running':'stopped';
+ document.getElementById('go').disabled=(need>0&&up===need);
+ document.getElementById('svc').innerHTML=S.services.map(s=>`<tr>
+  <td>${s.managed?`<input type="checkbox" style="width:auto" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)">`:''}</td>
+  <td>${s.name}</td><td style="color:var(--dim)">${s.role}</td>
+  <td>${s.installed?(s.up?'<span class="on2">running</span>':(s.managed&&!s.selected?'<span style="color:var(--dim)">stopped (not selected)</span>':'<span class="miss">stopped</span>')):'<span class="tag">not installed</span>'}</td>
   <td>${s.url&&s.up?`<a href="${s.url}" target="_blank"><button class="gh">Open</button></a>`:''}</td></tr>`).join('');
  document.getElementById('hw').innerHTML=`<span>GPU</span><div>${S.gpu.name}</div>
   <span>VRAM</span><div>${fmt(S.gpu.used)} / ${fmt(S.gpu.total)}<div class="bar"><i style="width:${100*S.gpu.used/S.gpu.total}%"></i></div></div>
@@ -478,8 +508,9 @@ async function tick(){
   <span>System RAM</span><div>${S.ramUsed} / ${S.ramTot} GB<div class="bar"><i style="width:${100*S.ramUsed/S.ramTot}%"></i></div></div>
   <span>Loaded model</span><div>${S.loaded||'<span style="color:var(--dim)">idle</span>'}</div>`;
  let g='';
- if(!up) g='<div class="hint">Nothing is running. Press <b>Start</b> - the first run downloads components and can take several minutes.</div>';
- else if(up<need) g='<div class="hint">Only part of the stack is up. <b>Restart</b> brings the rest back.</div>';
+ if(need===0) g='<div class="hint">No services are ticked, so Start and Stop have nothing to act on. Tick llama-swap and/or open-webui below.</div>';
+ else if(!up) g='<div class="hint">Nothing is running. Press <b>Start</b> - the first run downloads components and can take several minutes.</div>';
+ else if(up<need) g='<div class="hint">Only part of your stack is up. <b>Restart</b> brings the rest back.</div>';
  document.getElementById('guide').innerHTML=g;
 
  try{E=await (await fetch('/api/engine')).json()}catch(e){}

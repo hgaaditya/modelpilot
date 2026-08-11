@@ -1168,7 +1168,9 @@ switch ($Action) {
     'deploy' {
         $webui = Invoke-Deploy $target
         Write-Stamp $target
-        Start-Stack $webui
+        # Honour -Component here too: provisioning still covers everything, but a caller who only
+        # wants the router running should get only the router started.
+        Start-Stack $webui $Component
     }
 
     'upgrade' {
