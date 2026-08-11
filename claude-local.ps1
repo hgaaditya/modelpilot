@@ -39,6 +39,25 @@ param(
     # -Check as JSON, for the control panel.
     [switch]$Json,
 
+    # -Check: how long the tool-use probe gets before it counts as "does not converge". Generous
+    # enough for a cold multi-GB load plus a couple of agent turns, short enough to be a check
+    # rather than a wait.
+    [int]$ProbeTimeoutSec = 300,
+
+    # Which of Claude Code's tools to send. Not a preference - a workaround for a hard llama.cpp
+    # limit. Claude Code's built-in Workflow tool declares its `script` parameter with
+    # maxLength: 524288; llama.cpp turns a maxLength into a GBNF repetition `char{0,N}`, and
+    # 524288 blows the repetition sanity ceiling its own grammar parser enforces. The whole
+    # tool-call grammar then fails to compile and every request 400s with
+    # "Failed to initialize samplers: failed to parse grammar" - which reads as the model being
+    # broken when nothing about the model is involved.
+    #
+    # --disallowedTools does NOT help: it withholds permission but still sends the schema.
+    # Only --tools, which picks the set that gets sent at all, keeps Workflow out of the request.
+    # Pass -Tools '' to send everything, i.e. to check whether upstream has fixed it.
+    # See github.com/ggml-org/llama.cpp issues 25746 / 25923 / 25895.
+    [string]$Tools = 'Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill,Agent,TaskCreate',
+
     # Continue the existing Claude Code session in -Directory instead of starting a new one.
     # A switch rather than the usual `-- --continue`, because `--` is not passed through by
     # `powershell -File script.ps1` - it is parsed as an empty parameter name and the launch fails
@@ -60,6 +79,50 @@ param(
 $ErrorActionPreference = 'Stop'
 $base = "http://127.0.0.1:$Port"
 $swapConfig = Join-Path $PSScriptRoot 'llamaswap\config.yaml'
+
+# Settings handed to Claude Code for this session only, via --settings. The one that matters:
+#
+#   CLAUDE_CODE_ATTRIBUTION_HEADER=0
+#
+# Claude Code injects an x-anthropic-billing-header string as a text block at the FRONT of the
+# system prompt, and its cch= segment changes on every request. llama.cpp's prompt cache matches
+# on a prefix, so a prefix that differs every turn means the cache never hits and the entire
+# context - 20k+ tokens of system prompt and tool definitions - is reprocessed from scratch on
+# every single turn. Reported at roughly 90% slower, and it matches what was measured here before
+# this existed: ~45s per turn on a model that does 2300 tok/s of prompt processing.
+#
+# It has to be a settings file: `export CLAUDE_CODE_ATTRIBUTION_HEADER=0` is ignored when routing
+# through ANTHROPIC_BASE_URL. Written per-run rather than into the user's ~/.claude/settings.json,
+# for the same reason this script sets ANTHROPIC_BASE_URL for one process only - a global change
+# would follow every other Claude Code session on the machine.
+# Everything Claude Code needs to talk to llama-swap instead of Anthropic, set for THIS process
+# only. Shared by the -Check probe and the real launch so the two cannot drift - a probe that
+# passes under different settings than the session it is vouching for is worthless.
+function Set-LocalEnv($ctx) {
+    $env:ANTHROPIC_BASE_URL   = $base
+    $env:ANTHROPIC_AUTH_TOKEN = 'local'      # llama-swap doesn't check it, but the client requires one
+    $env:ANTHROPIC_MODEL      = $Model
+    $env:ANTHROPIC_SMALL_FAST_MODEL = $SmallModel
+    # Claude Code also asks for model tiers by name - it fires background requests at
+    # claude-haiku-4-5-* for titles and tool checks, dozens before your first real turn. Left
+    # unmapped those hit llama-swap as an unknown model. Pointing every tier at something that
+    # exists here keeps the housekeeping off the big model and out of the error log.
+    $env:ANTHROPIC_DEFAULT_HAIKU_MODEL  = $SmallModel
+    $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $Model
+    $env:ANTHROPIC_DEFAULT_OPUS_MODEL   = $Model
+    # Local models are far slower than the hosted ones, and the default first-token timeout is
+    # optimistic once a multi-GB model has to be swapped in before anything can be generated.
+    $env:API_TIMEOUT_MS = '600000'
+    # See the note on CLAUDE_CODE_MAX_CONTEXT_TOKENS below - without it Claude Code assumes 200k.
+    $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "$ctx"
+}
+
+function New-SessionSettings {
+    $f = Join-Path $env:TEMP 'localllm-claude-settings.json'
+    @{ env = @{ CLAUDE_CODE_ATTRIBUTION_HEADER = '0' } } | ConvertTo-Json -Depth 4 |
+        Set-Content $f -Encoding utf8
+    $f
+}
 
 # Which models have actually been shown to work with Claude Code, as opposed to merely answering
 # a request. The distinction is not academic: bonsai-27b answers every synthetic payload thrown at
@@ -205,24 +268,45 @@ if ($Check -and -not $report.problem) {
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
         $report.problem = "Claude Code isn't on PATH, so the handoff can't be tested. Install it first."
     } else {
-        Write-Host "Running Claude Code against '$Model' - this loads the model, so give it a minute..."
-        $env:ANTHROPIC_BASE_URL = $base
-        $env:ANTHROPIC_AUTH_TOKEN = 'local'
-        $env:ANTHROPIC_MODEL = $Model
-        $env:ANTHROPIC_SMALL_FAST_MODEL = $SmallModel
-        $env:API_TIMEOUT_MS = '600000'
-        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "$($report.context)"
-        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $out = try { & claude -p 'Reply with the single word: ok' 2>&1 | ForEach-Object { "$_" } }
-               finally { $ErrorActionPreference = $old }
-        $text = ($out -join ' ').Trim()
-        if ($text -match 'API Error|Jinja|error:') {
-            # Keep the model's own words - "System message must be at the beginning" is the whole
-            # diagnosis, and a generic "the test failed" would throw it away.
-            $report.problem = "Claude Code failed against '$Model': " +
-                              (($text -replace '\s+', ' ') -replace '^.*?(API Error.*|Jinja.*|error:.*)$', '$1').Substring(0, [Math]::Min(220, $text.Length))
-        } elseif (-not $text) {
-            $report.problem = "Claude Code returned nothing against '$Model'."
+        # The probe has to make Claude Code actually CALL a tool, not just answer. A plain question
+        # ("reply with the word ok") passed on a model that then died the instant real work started
+        # with 'Failed to initialize samplers: failed to parse grammar' - llama.cpp compiles the
+        # tool schemas into a GBNF grammar only when it constrains output to a tool call, so a
+        # prompt that needs no tool never reaches the code that breaks. That false "verified" is
+        # worse than no check at all, hence a scratch file with a deliberately unguessable
+        # function name: the model cannot answer without reading it.
+        $probeDir = Join-Path $env:TEMP 'localllm-agent-probe'
+        New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+        Set-Content (Join-Path $probeDir 'probe_target.py') "def marmalade_sprocket(a, b):`n    return a + b`n" -Encoding utf8
+        $logOut = Join-Path $probeDir 'out.txt'; $logErr = Join-Path $probeDir 'err.txt'
+
+        Write-Host "Running Claude Code against '$Model' - it has to load the model and use a tool, so give it a minute..."
+        Set-LocalEnv $report.context
+        # Bounded, because "never converges" is one of the two ways this fails and an unbounded
+        # probe would simply hang instead of reporting it.
+        $probeArgs = @('-p', 'Read the file probe_target.py and reply with only the name of the function it defines.',
+                       '--settings', (New-SessionSettings))
+        if ($Tools) { $probeArgs += @('--tools', $Tools) }
+        $p = Start-Process -FilePath (Get-Command claude).Source -PassThru -WindowStyle Hidden `
+                 -WorkingDirectory $probeDir -RedirectStandardOutput $logOut -RedirectStandardError $logErr `
+                 -ArgumentList $probeArgs
+        if (-not $p.WaitForExit($ProbeTimeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+            $report.problem = "Claude Code did not finish within $ProbeTimeoutSec s against '$Model' - it can answer, " +
+                              "but it does not converge on a task that needs a tool call. Usable for direct questions, not for agent work."
+        } else {
+            $text = ((Get-Content $logOut, $logErr -ErrorAction SilentlyContinue) -join ' ').Trim()
+            if ($text -match 'API Error|Jinja|failed to parse grammar|error:') {
+                # Keep the model's own words - "System message must be at the beginning" and
+                # "failed to parse grammar" are each the whole diagnosis.
+                $one = ($text -replace '\s+', ' ')
+                $m = [regex]::Match($one, '(API Error.*|Jinja.*|error:.*)')
+                $report.problem = "Claude Code failed against '$Model': " +
+                                  $(if ($m.Success) { $m.Value.Substring(0, [Math]::Min(220, $m.Value.Length)) } else { $one.Substring(0, [Math]::Min(220, $one.Length)) })
+            } elseif ($text -notmatch 'marmalade_sprocket') {
+                $report.problem = "Claude Code answered against '$Model' but got the tool-use probe wrong " +
+                                  "(expected 'marmalade_sprocket', got: $(($text -replace '\s+', ' ').Substring(0, [Math]::Min(120, $text.Length))))."
+            }
         }
     }
 }
@@ -234,7 +318,7 @@ if ($Json) { $report | ConvertTo-Json -Depth 5 -Compress; exit $(if ($report.ok)
 
 if ($Check) {
     if ($report.ok) {
-        Write-Host "Ready. Claude Code ran against '$($report.model)' and answered."
+        Write-Host "Ready. Claude Code drove '$($report.model)' through a tool call and got the right answer."
         Write-Host "  model:       $($report.model)  (-c $($report.context))"
         Write-Host "  small model: $($report.smallModel)"
     } else {
@@ -253,24 +337,17 @@ if ($Directory) {
     Set-Location $Directory
 }
 
-$env:ANTHROPIC_BASE_URL   = $base
-$env:ANTHROPIC_AUTH_TOKEN = 'local'      # llama-swap doesn't check it, but the client requires one
-$env:ANTHROPIC_MODEL      = $Model
-$env:ANTHROPIC_SMALL_FAST_MODEL = $SmallModel
-# Local models are far slower than the hosted ones, and the default first-token timeout is
-# optimistic once a multi-GB model has to be swapped in before anything can be generated.
-$env:API_TIMEOUT_MS       = '600000'
-
-# The one that decides whether this is usable at all. Claude Code doesn't recognise these model
-# ids, so it assumes a 200k context window and runs auto-compact against that assumption - while
-# the model behind it has whatever -c config.yaml gave it. Left unset against a 65536 model, a
-# one-word question turned into 84 requests over 27 minutes, with single responses of 3.6 MB: the
-# client kept feeding a history the model could not hold, so it never converged.
+# CLAUDE_CODE_MAX_CONTEXT_TOKENS, set inside Set-LocalEnv, is the one that decides whether this is
+# usable at all. Claude Code doesn't recognise these model ids, so it assumes a 200k context window
+# and runs auto-compact against that assumption - while the model behind it has whatever -c
+# config.yaml gave it. Left unset against a 65536 model, a one-word question turned into 84
+# requests over 27 minutes, with single responses of 3.6 MB: the client kept feeding a history the
+# model could not hold, so it never converged.
 #
-# This is the same failure the rest of this stack already documents for open-webui and
-# continue.dev - the client can only prune correctly if it knows the real budget - and the number
-# is right here, parsed out of the model's own -c.
-$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "$($report.context)"
+# Same failure the rest of this stack already documents for open-webui and continue.dev - the
+# client can only prune correctly if it knows the real budget - and the number is right here,
+# parsed out of the model's own -c.
+Set-LocalEnv $report.context
 
 Write-Host "Claude Code -> $base"
 Write-Host "  model:       $Model  (-c $($report.context))"
@@ -280,8 +357,10 @@ Write-Host "  context:     $($report.context) tokens (told to Claude Code, which
 Write-Host ""
 if (-not $Resume) { Write-Host "Picking up an existing session in this directory? Add -Resume." ; Write-Host "" }
 
-$a = @()
+$a = @('--settings', (New-SessionSettings))
 if ($Resume) { $a += '--continue' }
 if ($Prompt) { $a += @('-p', $Prompt) }
+# Keeps the Workflow tool's 524288-character maxLength out of the request - see -Tools above.
+if ($Tools) { $a += @('--tools', $Tools) }
 $a += $ClaudeArgs
 & claude @a
