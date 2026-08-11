@@ -27,3 +27,7 @@
 
 # PrismML llama.cpp fork (downloaded by -Action install-prism, ~1.2 GB of binaries)
 /llama.cpp-prism/
+
+# per-machine panel state (paths, ports, which services you run) - not shareable
+/.ui-settings.json
+/.ui-usage.json

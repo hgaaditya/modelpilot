@@ -1,7 +1,0 @@
-﻿{
-    "useSwap":  true,
-    "useWebui":  true,
-    "modelsDir":  "C:\\LocalLLM\\llama.cpp\\models",
-    "webuiPort":  8080,
-    "swapPort":  9292
-}

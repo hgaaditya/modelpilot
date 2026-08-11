@@ -39,6 +39,17 @@ New-Item -ItemType Directory -Force -Path $jobDir | Out-Null
 # Version lookups hit the GitHub API, so they are fetched on demand and kept until refreshed.
 $script:verInfo = $null
 
+# Binding to 127.0.0.1 keeps the network out, but it does NOT keep websites out: any page the
+# user visits can post to localhost, and a form-style POST (text/plain, no custom headers) is a
+# "simple request" that skips the CORS preflight entirely. Without this, a visited page could
+# silently call /api/delete-model and destroy multi-GB weights. Verified exploitable before the
+# fix, so it is enforced two ways:
+#   1. a per-run secret the page is given and must echo in a header - a custom header forces a
+#      preflight, which this server never answers, so cross-origin requests die there;
+#   2. an Origin check, since browsers always attach Origin to cross-origin requests.
+$script:csrfToken = [guid]::NewGuid().ToString('N')
+$script:selfOrigin = "http://127.0.0.1:$Port"
+
 # Version strings cost a process launch each, so they're read once and kept.
 $script:versionCache = @{}
 
@@ -425,6 +436,11 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 </main>
 <script>
 let S={},E={},M={},VER={};
+// Every API call carries the per-run token. Being a custom header, it also forces a CORS
+// preflight for anyone cross-origin, which this server does not answer.
+const TOK='@@TOKEN@@';
+const _f=window.fetch;
+window.fetch=(u,o)=>{o=o||{};o.headers=Object.assign({},o.headers,{'X-LocalLLM-Token':TOK});return _f(u,o)};
 function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on')}
 async function post(u,o){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})})}
@@ -615,6 +631,23 @@ try {
         $ctx = $listener.GetContext()
         $req = $ctx.Request; $res = $ctx.Response
         $body = ''; $type = 'application/json'
+
+        # Gate every API path. The page itself is served without a token (it has to be, it is
+        # what carries the token) but it only renders - it cannot act.
+        if ($req.Url.AbsolutePath -like '/api/*') {
+            $origin = $req.Headers['Origin']
+            $token  = $req.Headers['X-LocalLLM-Token']
+            $bad = ($origin -and $origin -ne $script:selfOrigin) -or ($token -ne $script:csrfToken)
+            if ($bad) {
+                $res.StatusCode = 403
+                $deny = [Text.Encoding]::UTF8.GetBytes('{"error":"forbidden: cross-origin or missing token"}')
+                $res.ContentType = 'application/json'
+                $res.ContentLength64 = $deny.Length
+                try { $res.OutputStream.Write($deny, 0, $deny.Length) } catch { }
+                try { $res.Close() } catch { }
+                continue
+            }
+        }
         try {
             switch -Regex ($req.Url.AbsolutePath) {
                 # Deliberately does no work: the single-instance check needs an answer that can
@@ -707,7 +740,10 @@ try {
                     $p = Read-Body $req
                     $body = (Remove-ModelFiles $p.id ([bool]$p.alsoConfig)) | ConvertTo-Json -Compress
                 }
-                default { $type = 'text/html; charset=utf-8'; $body = $html }
+                default {
+                    $type = 'text/html; charset=utf-8'
+                    $body = $html.Replace('@@TOKEN@@', $script:csrfToken)
+                }
             }
         } catch {
             $res.StatusCode = 500; $body = (@{ error = $_.Exception.Message } | ConvertTo-Json -Compress)
