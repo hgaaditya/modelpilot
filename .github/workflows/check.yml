@@ -112,10 +112,22 @@ jobs:
         shell: bash
         run: |
           fail=0
-          for f in *.md; do
-            grep -oE '\]\(([^)#:]+)\)' "$f" | sed -E 's/^\]\(//; s/\)$//' | while read -r link; do
-              if [ ! -e "$link" ]; then echo "::error file=$f::missing link target: $link"; fail=1; fi
+          for f in *.md docs/img/*.md; do
+            [ -e "$f" ] || continue
+            # `|| true` because grep exits 1 on no matches, and a file with no links is fine.
+            # The results feed a `for`, not a pipeline: a `while` on the right of a pipe runs in a
+            # subshell, so anything it sets - including the failure flag - is lost on exit.
+            links=$(grep -oE '\]\([^)#:]+\)' "$f" | sed -E 's/^\]\(//; s/\)$//' || true)
+            for link in $links; do
+              # Screenshots are referenced before they are taken; docs/img/README.md explains that.
+              case "$link" in docs/img/*.png) continue ;; esac
+              target="$(dirname "$f")/$link"
+              [ "$(dirname "$f")" = "." ] && target="$link"
+              if [ ! -e "$target" ]; then
+                echo "::error file=$f::link target does not exist: $link"
+                fail=1
+              fi
             done
           done
-          # docs/img/*.png are referenced before they exist; that is expected until screenshots land
-          exit 0
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "all relative links resolve"
