@@ -483,8 +483,13 @@ function Get-ClaudeSessions([switch]$Refresh) {
     $root = Join-Path $env:USERPROFILE '.claude\projects'
     $rows = @()
     if (Test-Path $root) {
-        # Our own probe directory is not a project anyone wants to resume.
-        $probe = Join-Path $env:TEMP 'localllm-agent-probe'
+        # A "project" is somewhere you'd actually work. Temp directories are where this app's own
+        # probes and one-shot runs live, and a session started in a system directory is a stray
+        # `claude` typed into the wrong window - neither is something you'd hand over, and both
+        # crowd out the real projects. Matching the temp root rather than named probe directories
+        # keeps this working when the next diagnostic invents a new folder name.
+        $skipRoots = @($env:TEMP, $env:TMP, (Join-Path $env:SystemRoot 'system32'), $env:SystemRoot) |
+                     Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') } | Select-Object -Unique
         # One row per PROJECT, not per session. Resuming means "the conversation I was having in
         # that repo", and a directory can hold dozens of sessions - eight identical one-shot runs
         # crowding out eight real projects is the opposite of useful.
@@ -528,9 +533,10 @@ function Get-ClaudeSessions([switch]$Refresh) {
             # projects or dead paths, and tail-reading a 9 MB transcript only to throw the result
             # away is what made this tab take ten seconds to paint.
             if (-not $cwd) { continue }
-            if ($cwd -eq $probe) { continue }
             if ($seen.ContainsKey($cwd)) { continue }
             if (-not (Test-Path $cwd)) { continue }     # project deleted or on a disconnected drive
+            $c = $cwd.TrimEnd('\')
+            if ($skipRoots | Where-Object { $c -eq $_ -or $c.StartsWith("$_\", 'OrdinalIgnoreCase') }) { continue }
             $seen[$cwd] = $true
 
             # Read the last chunk of the file by seeking, not with Get-Content -Tail. -Tail streams
@@ -551,6 +557,15 @@ function Get-ClaudeSessions([switch]$Refresh) {
                 if ($ct) { $title = ($ct | ConvertFrom-Json).customTitle }
             } catch { }
             if (-not $title) { $title = $opening }
+            # A session opened with a slash command has the raw invocation as its first user
+            # message - "<command-message>init</command-message><command-name>/init</command-name>"
+            # - which is markup, not a title. Unwrap it to the command that was actually run.
+            if ($title -match '<command-name>\s*([^<]+?)\s*</command-name>') {
+                $cmdName = $Matches[1]
+                $cmdArgs = if ($title -match '<command-args>\s*([^<]*?)\s*</command-args>') { $Matches[1] } else { '' }
+                $title = ("$cmdName $cmdArgs").Trim()
+            }
+            if ($title) { $title = ($title -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim() }
             $rows += @{
                 id = $f.BaseName; cwd = $cwd
                 title = $(if ($title) { $title.Substring(0, [Math]::Min(110, $title.Length)) } else { '(no prompt yet)' })

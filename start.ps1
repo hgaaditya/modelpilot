@@ -248,7 +248,10 @@ function Start-Tray {
 # 'swap' covers llama-swap and the llama-server processes it spawns - they're its children and
 # are meaningless without it. 'webui' is the open-webui backend. 'all' is both.
 function Test-ComponentRunning($component = 'all') {
-    if ($component -ne 'webui' -and @(Get-Process -Name 'llama-swap' -ErrorAction SilentlyContinue).Count) { return $true }
+    # Scoped to this install, matching Stop-Stack - otherwise a second copy of the repo reports
+    # "already running" because of the first copy's services, and refuses to start.
+    if ($component -ne 'webui' -and @(Get-Process -Name 'llama-swap' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($root, 'OrdinalIgnoreCase') }).Count) { return $true }
     if ($component -ne 'swap' -and @(Get-WebuiProcess).Count) { return $true }
     $false
 }
@@ -257,8 +260,16 @@ function Test-ComponentRunning($component = 'all') {
 function Stop-Stack($component = 'all') {
     $stopped = 0
     if ($component -ne 'webui') {
+        # Match on where the binary lives, not just its name. Matching by name alone meant a second
+        # copy of this repo could stop the first one's services - verified: running -Action
+        # uninstall in a throwaway clone killed the main install's llama-swap. The webui half
+        # already scoped itself this way; this brings the llama half in line.
+        #
+        # Path matching still covers the PrismML fork, since llama.cpp-prism lives under the same
+        # root, and still covers llama-server processes because llama-swap spawns them from there.
         foreach ($n in 'llama-swap', 'llama-server') {
-            $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue)
+            $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Path -and $_.Path.StartsWith($root, 'OrdinalIgnoreCase') })
             $stopped += $procs.Count
             $procs | Stop-Process -Force -ErrorAction SilentlyContinue
         }
