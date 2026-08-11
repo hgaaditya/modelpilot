@@ -61,6 +61,30 @@ $ErrorActionPreference = 'Stop'
 $base = "http://127.0.0.1:$Port"
 $swapConfig = Join-Path $PSScriptRoot 'llamaswap\config.yaml'
 
+# Which models have actually been shown to work with Claude Code, as opposed to merely answering
+# a request. The distinction is not academic: bonsai-27b answers every synthetic payload thrown at
+# it - plain, system-as-blocks, tools, a full tool_use/tool_result round trip - and then fails
+# Claude Code itself with 'Jinja Exception: System message must be at the beginning'. So the only
+# probe that tells the truth is running Claude Code, and the only way not to re-run it every time
+# is to remember the answer. Per machine, hence gitignored: it depends on the local build.
+$compatFile = Join-Path $PSScriptRoot '.agent-compat.json'
+
+function Get-Compat {
+    if (-not (Test-Path $compatFile)) { return @{} }
+    try {
+        $h = @{}
+        (Get-Content $compatFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
+        $h
+    } catch { @{} }
+}
+
+function Set-Compat($id, $ok, $reason) {
+    $h = Get-Compat
+    $h[$id] = [pscustomobject]@{ ok = [bool]$ok; reason = "$reason"
+                                 at = (Get-Date -Format 'yyyy-MM-dd HH:mm') }
+    $h | ConvertTo-Json -Depth 5 | Set-Content $compatFile -Encoding utf8
+}
+
 # Claude Code sends its system prompt and every tool definition before your first word - 15-25k
 # tokens of it. A model configured with -c 16384 cannot hold that, so the session fails on the
 # first message with a context error that looks like the model's fault rather than the config's.
@@ -173,18 +197,46 @@ if (-not $report.problem -and $Model) {
     }
 }
 
+# 5. The only probe that tells the truth: Claude Code itself, one shot, no tools needed. It costs
+#    a model load and about half a minute, and it is the step that separates "the endpoint
+#    answers" from "a session will hold together". Both known failures showed up here and nowhere
+#    else - one in 29 seconds with a 400 from the chat template, one by never converging.
+if ($Check -and -not $report.problem) {
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        $report.problem = "Claude Code isn't on PATH, so the handoff can't be tested. Install it first."
+    } else {
+        Write-Host "Running Claude Code against '$Model' - this loads the model, so give it a minute..."
+        $env:ANTHROPIC_BASE_URL = $base
+        $env:ANTHROPIC_AUTH_TOKEN = 'local'
+        $env:ANTHROPIC_MODEL = $Model
+        $env:ANTHROPIC_SMALL_FAST_MODEL = $SmallModel
+        $env:API_TIMEOUT_MS = '600000'
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "$($report.context)"
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $out = try { & claude -p 'Reply with the single word: ok' 2>&1 | ForEach-Object { "$_" } }
+               finally { $ErrorActionPreference = $old }
+        $text = ($out -join ' ').Trim()
+        if ($text -match 'API Error|Jinja|error:') {
+            # Keep the model's own words - "System message must be at the beginning" is the whole
+            # diagnosis, and a generic "the test failed" would throw it away.
+            $report.problem = "Claude Code failed against '$Model': " +
+                              (($text -replace '\s+', ' ') -replace '^.*?(API Error.*|Jinja.*|error:.*)$', '$1').Substring(0, [Math]::Min(220, $text.Length))
+        } elseif (-not $text) {
+            $report.problem = "Claude Code returned nothing against '$Model'."
+        }
+    }
+}
+
 $report.ok = -not $report.problem
+if ($Check -and $Model) { Set-Compat $Model $report.ok $report.problem }
 
 if ($Json) { $report | ConvertTo-Json -Depth 5 -Compress; exit $(if ($report.ok) { 0 } else { 1 }) }
 
 if ($Check) {
     if ($report.ok) {
-        Write-Host "Ready. Claude Code can run against $base right now."
+        Write-Host "Ready. Claude Code ran against '$($report.model)' and answered."
         Write-Host "  model:       $($report.model)  (-c $($report.context))"
         Write-Host "  small model: $($report.smallModel)"
-        Write-Host ""
-        Write-Host "To hand a project over:"
-        Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Directory <your project> -Resume"
     } else {
         Write-Warning $report.problem
         if ($report.candidates.Count) {

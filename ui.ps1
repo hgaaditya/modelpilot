@@ -427,6 +427,11 @@ function Get-Agents {
     # definitions before your first message, so a model at -c 16384 fails on the first turn.
     $min = 32768
     $models = @(Get-ConfiguredModels)
+    $compat = @{}
+    $cf = Join-Path $root '.agent-compat.json'
+    if (Test-Path $cf) {
+        try { (Get-Content $cf -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $compat[$_.Name] = $_.Value } } catch { }
+    }
     @{
         minContext = $min
         claude   = [bool](Get-Command claude -ErrorAction SilentlyContinue)
@@ -437,8 +442,19 @@ function Get-Agents {
         projectDir = (Get-Settings).projectDir
         # Ready = it would run right now. Short = the only thing wrong is context, which the Models
         # tab can fix in two clicks, so it is worth naming separately from "not usable".
+        #
+        # 'tested' comes from .agent-compat.json, written by claude-local.ps1 -Check after it runs
+        # Claude Code for real. Enough context is necessary but nowhere near sufficient - the
+        # largest-context model configured here fails Claude Code outright on its chat template -
+        # so a model that has been shown to fail is dropped from the list rather than offered with
+        # a warning nobody reads.
         ready = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -ge $min } |
-                  ForEach-Object { @{ id = $_.id; ctx = $_.ctx } } | Sort-Object { -$_.ctx })
+                  ForEach-Object {
+                      $c = $compat[$_.id]
+                      @{ id = $_.id; ctx = $_.ctx
+                         tested = $(if ($null -eq $c) { 'untested' } elseif ($c.ok) { 'ok' } else { 'bad' })
+                         reason = $(if ($c -and -not $c.ok) { "$($c.reason)" } else { '' }) }
+                  } | Sort-Object { -$_.ctx })
         short = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -lt $min } |
                   ForEach-Object { @{ id = $_.id; ctx = $_.ctx } } | Sort-Object { -$_.ctx })
     }
@@ -766,21 +782,30 @@ async function agents(){
  // Which model backs the agent is a choice, not an automatic pick: models differ in whether they
  // can drive an agent loop at all, and the auto-pick only knows about context. Rebuilt only when
  // the option list actually changes, so the poll doesn't reset a selection mid-use.
+ // Only models that could work are offered: one already shown to fail Claude Code is dropped
+ // outright rather than listed with a caveat. Untested ones stay, marked - otherwise a fresh
+ // install would offer nothing at all until you happened to run a test.
+ const usable=AG.ready.filter(m=>m.tested!=='bad'), rejected=AG.ready.filter(m=>m.tested==='bad');
  const sel=document.getElementById('agmodel');
- const want=AG.ready.map(m=>m.id).join('|');
+ const want=usable.map(m=>m.id+':'+m.tested).join('|');
  if(sel.dataset.ids!==want){
   const keep=sel.value;
-  sel.innerHTML=AG.ready.map(m=>`<option value="${m.id}">${m.id} (-c ${m.ctx})</option>`).join('')||'<option value="">no usable model</option>';
+  sel.innerHTML=usable.map(m=>`<option value="${m.id}">${m.id} (-c ${m.ctx})${m.tested==='ok'?' - verified':' - untested'}</option>`).join('')
+                ||'<option value="">no usable model</option>';
   sel.dataset.ids=want;
-  if(keep&&AG.ready.some(m=>m.id===keep))sel.value=keep;
+  if(keep&&usable.some(m=>m.id===keep))sel.value=keep;
+  else{const v=usable.find(m=>m.tested==='ok');if(v)sel.value=v.id;}   // prefer a verified one
  }
  // One status line rather than a table: what matters is whether it can run, and if not, why.
  const bad=[];
  if(!AG.claude)bad.push('claude not on PATH');
- if(!AG.ready.length)bad.push(AG.short.length?('no model has -c '+AG.minContext+'+ (raise one in Models > Edit)'):'no model downloaded yet');
- document.getElementById('agstat').innerHTML=bad.length
-  ? '<span class="miss">'+bad.join(' - ')+'</span>'
-  : 'Not every model can drive an agent loop - press <b>Test it</b> on one before trusting it with a session.';
+ if(!usable.length)bad.push(AG.short.length?('no model has -c '+AG.minContext+'+ (raise one in Models > Edit)')
+   :(rejected.length?'every model here has failed Claude Code':'no model downloaded yet'));
+ let st=bad.length?'<span class="miss">'+bad.join(' - ')+'</span>'
+   :(usable.some(m=>m.tested==='ok')?'':'Untested - press <b>Test it</b> before trusting one with a session.');
+ if(rejected.length)st+=(st?'<br>':'')+'<span class="miss">Hidden as incompatible: '+
+   rejected.map(m=>m.id+' ('+(m.reason||'failed').replace(/</g,'&lt;').slice(0,80)+')').join('; ')+'</span>';
+ document.getElementById('agstat').innerHTML=st;
  const off=!AG.claude||!AG.ready.length;
  document.getElementById('agbtn1').innerHTML=
   B('act','claudelaunch',"launchClaude(false)",'Start a session')+' '+
