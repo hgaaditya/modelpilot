@@ -179,11 +179,20 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
 - **Models → Edit** changes `-c` and `-ctk`/`-ctv` through `start.ps1 -Action set-tuning`, the same
   `Set-ModelTuning` that `autotune -Apply` writes with. Weight quantisation (Q4_K_M vs Q6_K) is
   deliberately *not* editable here: that's a different file and means a download, not a flag.
-- **Coding agents tab** — the handoff surface (see the next section). `/api/agents` is cheap enough
-  to poll: CLIs on PATH, and which models could back an agent. The end-to-end probe is *not* on
-  that path — it loads a multi-GB model and calls `/v1/messages`, so it's a job behind the **Test
-  the handoff now** button, and its verdict is shown next to that button rather than only in the
-  Activity log on another tab.
+- **Coding agents tab** — the handoff surface (see the next section). One project directory and one
+  model dropdown at the top, then the three modes, each a single line of behaviour and its buttons.
+  The model is a **choice, not an auto-pick**: the auto-pick sorts on `-c` and cannot know whether a
+  model can drive an agent loop at all (`bonsai-27b` has the largest context here and fails
+  outright), so the tab says as much and offers **Test it** per model.
+  - `/api/agents` is cheap enough to poll: CLIs on PATH, which models qualify, last project.
+  - `/api/launch-claude` is the one thing that is **not** a job. Claude Code is a terminal UI, so it
+    opens a console and hands over; a job is hidden with its output redirected, which is exactly
+    wrong for something you are about to type into. opencode and `local-llm.ps1` do run to
+    completion, so those stay jobs and read out in Activity.
+  - Arguments are passed as an array, never a concatenated string, so a project path containing a
+    space or a quote cannot become extra arguments.
+  - The dropdown is rebuilt only when the set of options actually changes, or the 3s poll would
+    reset a selection mid-use.
 
 ## Using the local models from Claude Code
 
@@ -208,15 +217,21 @@ The use case that shapes it: you are mid-project, your quota is gone, and you wa
 
 ### What a local model can and can't do as an agent — measured
 
-Against `gemma4-v2` (Q4_K_M, `-c 65536`) on this box, after the context fix:
+On this box, after the context fix:
 
-| task | result |
-| --- | --- |
-| `-Prompt "Reply with the single word: ok"` | **33s, 4 requests, correct** |
-| A single `/v1/messages` call with one tool defined | **correct** — `stop_reason: tool_use`, right tool, right input |
-| `-Prompt "read hello.py and name the function"` (full Claude Code toolset) | **did not converge** — 14+ turns, killed at 10 minutes |
+| model | task | result |
+| --- | --- | --- |
+| `gemma4-v2` | `-Prompt "Reply with the single word: ok"` | **33s, 4 requests, correct** |
+| `gemma4-v2` | one `/v1/messages` call with a tool defined | **correct** — `stop_reason: tool_use`, right tool and input |
+| `gemma4-v2` | a full `tool_use` → `tool_result` round trip | **correct** — answered `add` |
+| `gemma4-v2` | `-Prompt "read hello.py and name the function"`, full Claude Code toolset | **did not converge** — 14+ turns, killed at 10 minutes |
+| `bonsai-27b` | the same, via Claude Code | **hard failure in 29s** — `API Error: 400 ... Jinja Exception: System message must be at the beginning` |
 
-So the plumbing is sound and tool-calling is correctly formatted; what fails is a multi-step agent loop with the whole toolset in play. Treat the handoff as **usable for direct questions and one-shot work, not yet for unattended multi-step editing** — and don't read a long run as a wiring bug, because it isn't one. If a run stalls, `logs\llama-swap.log` shows a line per `/v1/messages` with its duration and response size; a turn count climbing past ~10 on a trivial task is the loop failing to converge, not a hang.
+So **model choice is not just about context**, which is why the panel offers a dropdown rather than silently auto-picking: the auto-pick sorts on `-c` and cannot know any of the above.
+
+`bonsai-27b` is worth understanding before trusting `-Check`. Its chat template rejects Claude Code's real payload, but **every synthetic shape passes** — plain user, system as string, system as a block array, tools, content as a block array, a prior assistant turn, and a complete `tool_use`/`tool_result` round trip were all tried and all returned 200. So whatever ordering llama-swap produces from Claude Code's actual request isn't reproducible from the obvious payloads, and `-Check` reports Ready for a model that then fails. **`-Check` is necessary, not sufficient** — it proves the endpoint and the model answer, not that a session will hold together.
+
+The plumbing is sound and tool-calling is correctly formatted; what fails is a multi-step agent loop with the whole toolset in play. Treat the handoff as **usable for direct questions and one-shot work, not yet for unattended multi-step editing** — and don't read a long run as a wiring bug, because it isn't one. If a run stalls, `logs\llama-swap.log` shows a line per `/v1/messages` with its duration and response size; a turn count climbing past ~10 on a trivial task is the loop failing to converge, not a hang.
 
 **Local agent — `local-agent.ps1`.** opencode driving a local model, with Anthropic not involved at all. See its own notes for what a local 27B does and doesn't get right about editing files.
 

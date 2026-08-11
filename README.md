@@ -54,9 +54,11 @@ what's missing rather than failing later inside the session.
 
 **What to expect.** Direct questions and one-shot work land in seconds. Long multi-step editing
 sessions, where the model has to drive a dozen tools to a conclusion, are where a local model
-currently struggles — measured here, a 27B-class model answered a plain question in 33 seconds but
-would not converge on "read this file and name its function" inside ten minutes. Good enough to
-keep moving; not yet a replacement for unattended agentic work.
+currently struggles — measured here, one model answered a plain question in 33 seconds but would
+not converge on "read this file and name its function" inside ten minutes, and another failed
+outright on Claude Code's message format. Which model you pick matters as much as its size, so the
+tab lets you choose one and test it. Good enough to keep moving; not yet a replacement for
+unattended agentic work.
 
 The other direction also works: keep Claude Code on the cloud model and hand only the token-heavy
 reading to a local one with `local-llm.ps1`, so a 200k-token log costs nothing against your quota.

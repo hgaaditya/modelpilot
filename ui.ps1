@@ -217,7 +217,7 @@ function Get-Settings {
     # and nothing else, so someone who only wants the router doesn't get open-webui started, and
     # doesn't get told the stack is half-down because a service they deselected isn't running.
     $d = @{ modelsDir = (Join-Path $llamaCpp 'models'); swapPort = $swapPort; webuiPort = $webuiPort
-            useSwap = $true; useWebui = $true }
+            useSwap = $true; useWebui = $true; projectDir = '' }
     if (Test-Path $settingsFile) {
         $s = Get-Content $settingsFile -Raw | ConvertFrom-Json
         foreach ($k in $d.Keys.Clone()) { if ($s.PSObject.Properties.Name -contains $k) { $d[$k] = $s.$k } }
@@ -434,6 +434,7 @@ function Get-Agents {
         script   = (Join-Path $root 'claude-local.ps1')
         delegate = (Join-Path $root 'local-llm.ps1')
         agentScript = (Join-Path $root 'local-agent.ps1')
+        projectDir = (Get-Settings).projectDir
         # Ready = it would run right now. Short = the only thing wrong is context, which the Models
         # tab can fix in two clicks, so it is worth naming separately from "not usable".
         ready = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -ge $min } |
@@ -589,6 +590,9 @@ input{width:100%}
 .tag{font-size:10px;padding:1px 5px;border-radius:9px;border:1px solid var(--line);color:var(--dim);background:var(--soft)}
 .miss{color:var(--bad)}.on2{color:var(--ok)}
 .hint{background:#eaf1fb;border:1px solid #c3d6f2;border-radius:4px;padding:7px 9px;color:#28425f;font-size:12px;margin-bottom:9px}
+/* One line saying how a mode behaves, above its controls. Plain text rather than a .hint box:
+   three stacked callouts read as three warnings. */
+.mode{color:var(--dim);font-size:11.5px;margin:0 0 7px}
 .row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 pre{background:#f7f8fa;border:1px solid var(--line);border-radius:3px;padding:6px;font-size:11px;margin:5px 0 0;white-space:pre-wrap;max-height:100px;overflow:auto;user-select:text;color:#3a4250}
 code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
@@ -658,16 +662,31 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 </div>
 
 <div class="pane" id="p3">
- <div class="hint">Your Claude quota running out mid-project doesn't have to end the session. These hand the same repo to a model running here - your files, your history, no upload.</div>
- <fieldset><legend>Claude Code, against a local model</legend>
-  <div id="ag1"></div>
-  <div class="row" style="margin-top:7px">
-   <button class="gh" id="agtest" onclick="agCheck()">Test the handoff now</button>
-   <span id="agmsg" style="color:var(--dim);font-size:11px"></span>
-  </div>
-  <div class="hint" style="margin-top:8px">The test loads a model and calls the same endpoint Claude Code uses, so it takes up to a minute the first time. Output appears under Models &gt; Activity. Worth doing <b>before</b> you need it.</div>
+ <fieldset><legend>Project</legend>
+  <div class="row"><input id="pdir" placeholder="C:\path\to\your\project" style="flex:1">
+   <select id="agmodel" style="width:auto"></select></div>
+  <div id="agstat" style="color:var(--dim);font-size:11px;margin-top:5px"></div>
  </fieldset>
- <fieldset><legend>Other ways round</legend><div id="ag2"></div></fieldset>
+
+ <fieldset><legend>Claude Code, on a local model</legend>
+  <div class="mode">Claude Code works exactly as normal, but every request goes to a model here instead of Anthropic - so it costs you nothing.</div>
+  <div class="row" id="agbtn1"></div>
+  <div id="agwarn"></div>
+ </fieldset>
+
+ <fieldset><legend>opencode, on a local model</legend>
+  <div class="mode">A local agent does the whole task itself, start to finish. Nothing reaches Anthropic at any point.</div>
+  <div class="row"><input id="agtask" placeholder="what it should do, e.g. add a guard clause to divide()" style="flex:1">
+   <button class="gh" onclick="runLocal('agent')">Run</button></div>
+ </fieldset>
+
+ <fieldset><legend>Delegate the reading</legend>
+  <div class="mode">Claude Code stays on the cloud model and keeps its judgement; only the bulk reading happens here, so a huge file costs you almost no quota.</div>
+  <div class="row"><input id="dgfile" placeholder="file to read (optional)" style="flex:1.2">
+   <input id="dgtask" placeholder="what to extract" style="flex:1.4">
+   <button class="gh" onclick="runLocal('delegate')">Run</button></div>
+ </fieldset>
+ <div class="hint">Results from the two Run buttons appear under Models &gt; Activity.</div>
 </div>
 
 <div class="pane" id="p4">
@@ -739,57 +758,67 @@ function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.
  if(i===3)agents();}
 // ---- coding agents
 let AG={};
-function cmdbox(cmd,note){
- // The command is the deliverable here - it has to be copyable, because retyping an absolute
- // path from a screenshot is exactly the friction this tab exists to remove.
- const id='c'+Math.random().toString(36).slice(2,8);
- return `<div style="margin:6px 0"><pre id="${id}" style="margin:0">${cmd.replace(/</g,'&lt;')}</pre>
-  <div class="row" style="margin-top:3px"><button class="gh" onclick="cp('${id}',this)">Copy</button>
-  <span style="color:var(--dim);font-size:11px">${note}</span></div></div>`;
-}
-async function cp(id,btn){
- try{await navigator.clipboard.writeText(document.getElementById(id).textContent);
-  const t=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=t,1200)}
- catch(e){btn.textContent='copy failed'}
-}
+function pdir(){return document.getElementById('pdir').value.trim()}
 async function agents(){
  try{AG=await (await fetch('/api/agents')).json()}catch(e){return}
- const ok=s=>s?'<span class="on2">installed</span>':'<span class="miss">not found on PATH</span>';
- const best=(AG.ready&&AG.ready[0])?AG.ready[0]:null;
- let h=`<div class="kv"><span>claude CLI</span><div>${ok(AG.claude)}</div>
-  <span>Usable models</span><div>${AG.ready.length?AG.ready.map(m=>m.id+' <span class="tag">-c '+m.ctx+'</span>').join(' '):'<span class="miss">none</span>'}</div></div>`;
- if(!AG.claude) h+='<div class="hint miss" style="margin-top:7px">Claude Code isn\'t on PATH. Install it first - this only redirects it, it doesn\'t replace it.</div>';
- if(!AG.ready.length){
-  h+=`<div class="hint miss" style="margin-top:7px">No model here can back a coding agent yet.${
-   AG.short.length?' These have weights but too little context: '+AG.short.map(m=>m.id+' (-c '+m.ctx+')').join(', ')+
-   '. Claude Code sends 15-25k tokens of system prompt and tool definitions before your first message, so it needs at least -c '+AG.minContext+
-   ' - raise one with Models &gt; Edit.':' Download one from the Models tab.'}</div>`;
- }else{
-  h+=cmdbox(`powershell -ExecutionPolicy Bypass -File "${AG.script}" -Directory "C:\\path\\to\\your\\project" -Resume`,
-            `Run in any terminal. Uses ${best.id} unless you pass -Model. Drop -Resume to start a fresh session instead of picking the project's up.`);
-  h+='<div class="hint" style="margin-top:0">Only this process is redirected - your normal <code>claude</code> sessions still go to Anthropic.</div>';
+ const dir=document.getElementById('pdir');
+ if(document.activeElement!==dir&&!dir.value&&AG.projectDir)dir.value=AG.projectDir;
+ // Which model backs the agent is a choice, not an automatic pick: models differ in whether they
+ // can drive an agent loop at all, and the auto-pick only knows about context. Rebuilt only when
+ // the option list actually changes, so the poll doesn't reset a selection mid-use.
+ const sel=document.getElementById('agmodel');
+ const want=AG.ready.map(m=>m.id).join('|');
+ if(sel.dataset.ids!==want){
+  const keep=sel.value;
+  sel.innerHTML=AG.ready.map(m=>`<option value="${m.id}">${m.id} (-c ${m.ctx})</option>`).join('')||'<option value="">no usable model</option>';
+  sel.dataset.ids=want;
+  if(keep&&AG.ready.some(m=>m.id===keep))sel.value=keep;
  }
- document.getElementById('ag1').innerHTML=h;
- document.getElementById('ag2').innerHTML=
-  `<div class="kv"><span>opencode CLI</span><div>${ok(AG.opencode)}</div></div>`+
-  '<div class="hint" style="margin:7px 0 0">A local coding agent that never involves Anthropic at all.</div>'+
-  cmdbox(`powershell -ExecutionPolicy Bypass -File "${AG.agentScript}" -Directory "C:\\path\\to\\your\\project" -Prompt "your task"`,'opencode driving a local model.')+
-  '<div class="hint" style="margin:9px 0 0">Or keep Claude Code on the cloud model and hand it only the token-heavy grinding - reading a huge log, extracting fields. Only the answer comes back, so the input never enters your Claude context.</div>'+
-  cmdbox(`powershell -ExecutionPolicy Bypass -File "${AG.delegate}" -Prompt "List every distinct error and its frequency" -File "app.log"`,'Local model does the reading; you keep your quota.');
- const b=document.getElementById('agtest'),bz=busy('agentcheck');
- b.classList.toggle('busy',bz);b.disabled=bz;
- // The verdict belongs next to the button that asked for it, not only in the Activity log on
- // another tab - "is this ready" is the whole question this tab answers.
- const j=JOBS.find(x=>x.name==='agentcheck');
- const el=document.getElementById('agmsg');
- if(bz)el.textContent='loading a model and calling /v1/messages...';
- else if(j)el.innerHTML=(j.tail||'').replace(/</g,'&lt;')||'ran, no output';
- else el.textContent='';
+ // One status line rather than a table: what matters is whether it can run, and if not, why.
+ const bad=[];
+ if(!AG.claude)bad.push('claude not on PATH');
+ if(!AG.ready.length)bad.push(AG.short.length?('no model has -c '+AG.minContext+'+ (raise one in Models > Edit)'):'no model downloaded yet');
+ document.getElementById('agstat').innerHTML=bad.length
+  ? '<span class="miss">'+bad.join(' - ')+'</span>'
+  : 'Not every model can drive an agent loop - press <b>Test it</b> on one before trusting it with a session.';
+ const off=!AG.claude||!AG.ready.length;
+ document.getElementById('agbtn1').innerHTML=
+  B('act','claudelaunch',"launchClaude(false)",'Start a session')+' '+
+  B('gh','claudelaunch',"launchClaude(true)",'Resume last session')+' '+
+  B('gh','agentcheck','agCheck()','Test it')+
+  ' <span id="agmsg" style="color:var(--dim);font-size:11px"></span>';
+ if(off)document.querySelectorAll('#agbtn1 button').forEach(b=>b.disabled=true);
+ document.getElementById('agwarn').innerHTML=off?'':
+  '<div class="hint" style="margin:7px 0 0">Opens a terminal. Only that window is redirected - your normal <code>claude</code> still goes to Anthropic.</div>';
+ // The verdict belongs next to the button that asked for it, not only in the Activity log.
+ const j=JOBS.find(x=>x.name==='agentcheck'),el=document.getElementById('agmsg');
+ if(busy('agentcheck'))el.textContent='loading a model, calling /v1/messages...';
+ else if(j){
+  // The verdict is the Ready/WARNING line, not necessarily the first line of the tail.
+  const v=(j.tail||'').split('\n').find(l=>/^(Ready|WARNING)/.test(l.trim()));
+  el.innerHTML=v?(v.startsWith('Ready')?'<span class="on2">'+v+'</span>':'<span class="miss">'+v.replace(/</g,'&lt;').slice(0,110)+'</span>'):'';
+ }
+}
+async function launchClaude(resume){
+ if(!pdir()){alert('Type your project directory in the Project box first.');return}
+ spin('claudelaunch',6000);
+ const r=await (await fetch('/api/launch-claude',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({dir:pdir(),resume,model:document.getElementById('agmodel').value})})).json();
+ if(r.error)alert(r.error);
+ setTimeout(tick,700);
+}
+async function runLocal(kind){
+ const prompt=document.getElementById(kind==='agent'?'agtask':'dgtask').value.trim();
+ if(!prompt){alert('Say what it should do.');return}
+ spin(kind==='agent'?'opencode':'delegate',1800000);
+ const r=await (await fetch('/api/run-local',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({kind,prompt,dir:pdir(),file:document.getElementById('dgfile').value.trim()})})).json();
+ if(r.error)alert(r.error);
+ setTimeout(tick,700);
 }
 async function agCheck(){
  spin('agentcheck',900000);
- document.getElementById('agmsg').textContent='loading a model and calling /v1/messages...';
- await post('/api/agent-check',{});setTimeout(tick,900);
+ await post('/api/agent-check',{model:document.getElementById('agmodel').value});setTimeout(tick,900);
 }
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
@@ -1091,11 +1120,50 @@ try {
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/agents$'  { $body = Get-Agents | ConvertTo-Json -Depth 5 -Compress }
+                '^/api/launch-claude$' {
+                    # Claude Code is a terminal UI, so this is the one thing the panel cannot run
+                    # for you - it opens a console window and hands over. Not a job: a job is
+                    # hidden with its output redirected, which is exactly wrong for something you
+                    # are about to type into.
+                    $p = Read-Body $req
+                    if (-not $p.dir) { throw "Pick a project directory first." }
+                    if (-not (Test-Path $p.dir)) { throw "'$($p.dir)' does not exist." }
+                    Set-Settings ([pscustomobject]@{ projectDir = $p.dir }) | Out-Null
+                    # Arguments go as an array, never a concatenated string, so a path with a
+                    # space or a quote in it cannot turn into extra arguments.
+                    $a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                           (Join-Path $root 'claude-local.ps1'), '-Directory', $p.dir)
+                    if ($p.model)  { $a += @('-Model', $p.model) }
+                    if ($p.resume) { $a += '-Resume' }
+                    Start-Process powershell -ArgumentList $a
+                    $body = '{"ok":true}'
+                }
+                '^/api/run-local$' {
+                    # opencode and local-llm both run to completion and print an answer, so they
+                    # are jobs like everything else and read out in Activity.
+                    $p = Read-Body $req
+                    if (-not $p.prompt) { throw "Give it something to do." }
+                    if ($p.kind -eq 'agent') {
+                        if (-not $p.dir) { throw "Pick a project directory first." }
+                        if (-not (Test-Path $p.dir)) { throw "'$($p.dir)' does not exist." }
+                        Set-Settings ([pscustomobject]@{ projectDir = $p.dir }) | Out-Null
+                        Start-Job2 'opencode' @('-Directory', $p.dir, '-Prompt', $p.prompt) (Join-Path $root 'local-agent.ps1') | Out-Null
+                    } else {
+                        if ($p.file -and -not (Test-Path $p.file)) { throw "'$($p.file)' does not exist." }
+                        $a = @('-Prompt', $p.prompt)
+                        if ($p.file) { $a += @('-File', $p.file) }
+                        Start-Job2 'delegate' $a (Join-Path $root 'local-llm.ps1') | Out-Null
+                    }
+                    $body = '{"ok":true}'
+                }
                 '^/api/agent-check$' {
                     # A real end-to-end probe: it swaps a model in and calls /v1/messages, so it can
                     # take a minute. A job, therefore - the result reads out in Activity, and the
                     # button spins off the same job list as everything else.
-                    Start-Job2 'agentcheck' @('-Check') (Join-Path $root 'claude-local.ps1') | Out-Null
+                    $p = Read-Body $req
+                    $a = @('-Check')
+                    if ($p -and $p.model) { $a += @('-Model', $p.model) }
+                    Start-Job2 'agentcheck' $a (Join-Path $root 'claude-local.ps1') | Out-Null
                     $body = '{"ok":true}'
                 }
                 '^/api/models$' {
