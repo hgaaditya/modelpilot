@@ -221,7 +221,7 @@ The use case that shapes it: you are mid-project, your quota is gone, and you wa
 .\claude-local.ps1 -Prompt "what does build.ps1 do?"        # one-shot, prints and exits
 ```
 
-- **Context is the gate, not model size.** Claude Code sends 15–25k tokens of system prompt and tool definitions before your first message, so a model at `-c 16384` fails on the first turn with an error that looks like the model's fault rather than the config's. `$MIN_AGENT_CTX` is 32768, and with no `-Model` the script picks the **largest context among runnable models** — deliberately not the biggest model. A 20B at `-c 16384` is useless here; a 14B at `-c 65536` is not.
+- **Context is a gate, but a softer one than this file used to claim.** Claude Code's own overhead measured **~1.1k tokens per request**, not the 15–25k asserted here before (see the measurement below). `$MIN_AGENT_CTX` is 32768 as a "you won't spend the session compacting" line — a coding session fills a window fast with file contents and tool output — not as a measured requirement; 32768 passes the probe directly. With no `-Model` the script picks the **largest context among runnable models**, deliberately not the biggest model.
 - **Runnable means weights on disk and an engine to run them**, not just "listed by `/v1/models`" — llama-swap lists every configured id whether or not it can start. Caught in testing: the first pick was a model with no `.gguf`, which fails as a 500 a minute later.
 - **`-Check` runs Claude Code itself and makes it use a tool**, after the cheap checks pass. The tool part is not optional: an earlier probe asked only *"reply with the word ok"*, which needs no tool, so it never reached the code that builds the tool-call grammar — and it stamped a model **verified** that then died instantly on real work. A false "verified" is worse than no check. The probe now writes a scratch file with a deliberately unguessable function name and requires Claude Code to read it and return that name, under a timeout, so all three failure modes are caught: template rejection, grammar failure, and never converging. It is also the only probe that tells the truth about *which* model works — `bonsai-27b` answers *every* synthetic payload (plain, system as string, system as two blocks, `cache_control`, tools, content as blocks, a prior assistant turn, echoed `thinking`, a full `tool_use`/`tool_result` round trip — all 200, and the round trip answers correctly) and then fails Claude Code with `400 ... Jinja Exception: System message must be at the beginning`. Whatever llama-swap produces from Claude Code's real request isn't reachable from the obvious shapes, so guessing was abandoned in favour of running the real thing. Costs a model load and ~30–75s; catches both known failures.
 - **The verdict is remembered** in `.agent-compat.json` (gitignored — it depends on the local build and installed models). The panel drops a model that has failed from its dropdown entirely rather than offering it with a caveat, keeps untested ones marked so a fresh install still offers something, and prefers a verified one when selecting a default.
@@ -241,17 +241,31 @@ On this box, with every fix above in place:
 | model | result |
 | --- | --- |
 | `qwen3-30b-moe` at `-c 40960` | **works** — real tool call, right answer, 74s. `--n-cpu-moe 14`, 40.3 tok/s, 10648 MiB. |
+| `qwen3-30b-moe` at `-c 32768` | **works** — 110s, `--n-cpu-moe 13`, 29.1 tok/s. |
 | `gemma4-v2` at `-c 65536` | **works** — 33s. |
 | `bonsai-27b` at `-c 65536` | **works.** |
-| `qwen3-30b-moe` at `-c 32768` | **`Prompt is too long`** — Claude Code's system prompt plus tool definitions doesn't fit in 32768 even with `Workflow` excluded. This one is about the number, not the model. |
 
-**Every model on this box works.** That is worth stating loudly, because during development each of the three was at some point confidently declared incapable — one for "not converging", one for a "wrong answer", one for a chat-template rejection that looked completely unambiguous. All three verdicts were harness bugs. `bonsai-27b`'s `Jinja Exception: System message must be at the beginning` was the most convincing of them and it disappeared once the probe stopped dragging the user's own `CLAUDE.md` and `SessionStart` hook output into the request.
+**Every model on this box works.** Worth stating loudly, because each of the three was at some point confidently declared incapable during development — one for "not converging", one for a "wrong answer", one for a chat-template rejection that looked completely unambiguous. All three verdicts were harness bugs. `bonsai-27b`'s `Jinja Exception: System message must be at the beginning` was the most convincing of them, and it disappeared once the probe stopped dragging the user's own `CLAUDE.md` and `SessionStart` hook output into the request.
+
+### How much context Claude Code actually costs — measured
+
+Counted with llama-swap's own `/v1/messages/count_tokens` against payloads captured from a real session through a recording proxy:
+
+| request | tokens |
+| --- | --- |
+| background/housekeeping (to the small model) | **379** |
+| main model, first real request (3 tools, 1 message) | **1,091** |
+
+**~1.1k of fixed overhead per request, not the 15–25k this file used to claim.** The API is stateless so it *is* re-sent every turn, but at that size it's noise: `-c 40960` leaves ~39k for conversation history and file contents, which is what actually consumes a window.
+
+"32K is the floor" is widely repeated and **is not supported by anything measured here** — 32768 was tested directly and passed. This file previously asserted the opposite on the strength of a `Prompt is too long` that came from the word-split-prompt bug below: the model looped, history piled up, and the overflow was read as a property of Claude Code.
+
+Not measured: the overhead with a user's own `CLAUDE.md`, plugins and MCP servers loaded. The probe passes `--bare` to stay reproducible across machines, so these numbers are a floor, not a typical session. Measure it before relying on a small window for long sessions.
 
 Three lessons, all of them about the harness rather than the models:
 
-1. **"32K is the floor" is optimistic.** Repeated everywhere, and not enough for real Claude Code with tools — `Prompt is too long` at exactly 32768 is the evidence. `$MIN_AGENT_CTX` is a pre-filter only; the probe decides.
-2. **Model choice is not just about context**, which is why the panel offers a dropdown rather than auto-picking: the auto-pick sorts on `-c` and cannot know any of the above.
-3. **Three separate harness bugs each produced a confident, wrong "this model can't do agentic work" verdict**, and all three failed in the direction of blaming the model:
+1. **Model choice is not just about context**, which is why the panel offers a dropdown rather than auto-picking: the auto-pick sorts on `-c` and cannot know any of the above.
+2. **Three separate harness bugs each produced a confident, wrong "this model can't do agentic work" verdict**, and all three failed in the direction of blaming the model:
    - the probe asked a question needing no tool, so it never reached the code that breaks — and stamped a model *verified* that failed instantly on real work;
    - the probe inherited the user's own `CLAUDE.md`, plugins and hooks, so a `SessionStart` hook's output came back as the model's answer (fixed with `--bare`);
    - `Start-Process -ArgumentList` does **not** quote elements containing spaces, so the prompt arrived word-split — Claude Code got `-p "Read"` plus five stray arguments, and models sensibly replied "which file did you mean?". Proved by passing the same array to a script that prints `$args`.

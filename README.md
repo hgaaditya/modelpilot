@@ -47,10 +47,13 @@ real endpoint — worth pressing *before* you need it.
 powershell -ExecutionPolicy Bypass -File .\claude-local.ps1 -Directory C:\your\project -Resume
 ```
 
-Only that process is redirected; your normal `claude` sessions still go to Anthropic. It needs a
-model with at least 32k of context — Claude Code sends 15–25k tokens of system prompt and tool
-definitions before your first message — so check with `.\claude-local.ps1 -Check`, which names
-what's missing rather than failing later inside the session.
+Only that process is redirected; your normal `claude` sessions still go to Anthropic. Check it
+first with `.\claude-local.ps1 -Check`, which runs Claude Code for real against the model and
+names what's wrong rather than failing later inside a session.
+
+Claude Code's own overhead is small — measured at about 1,100 tokens per request — so a 32k model
+is fine to start with. What fills a window is file contents and tool output, so more context means
+fewer interruptions to compact, not a different capability.
 
 **What to expect.** Measured here, a 30B sparse-MoE model read a file with a tool and answered
 correctly in 74 seconds, at about 40 tokens/sec. It is slower than the hosted model and it will not

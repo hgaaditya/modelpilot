@@ -148,10 +148,18 @@ function Set-Compat($id, $ok, $reason) {
     $h | ConvertTo-Json -Depth 5 | Set-Content $compatFile -Encoding utf8
 }
 
-# Claude Code sends its system prompt and every tool definition before your first word - 15-25k
-# tokens of it. A model configured with -c 16384 cannot hold that, so the session fails on the
-# first message with a context error that looks like the model's fault rather than the config's.
-# 32768 is the smallest -c that leaves usable room for an actual conversation on top.
+# A floor for the model list, not a measured requirement. Claude Code's own fixed overhead was
+# measured here at ~1.1k tokens per request (379 for the background model, 1091 for the main one
+# with 3 tools), counted through llama-swap's /v1/messages/count_tokens on payloads captured from
+# a real session - nowhere near the 15-25k this script used to claim, and 32768 passes the probe
+# directly. What actually eats a window is conversation history, file contents and tool output.
+#
+# So this is a "will not be miserable" line rather than a hard limit: a coding session accumulates
+# fast, and 16384 leaves almost nothing after a couple of file reads. The probe is what decides
+# whether a model works; this only keeps obviously cramped ones out of the list.
+#
+# It is also a floor rather than a typical case: the probe runs --bare, so a session carrying a
+# user's own CLAUDE.md, plugins and MCP servers costs more than the numbers above.
 $MIN_AGENT_CTX = 32768
 
 # Context and runnability per model, out of config.yaml. llama-swap's /v1/models lists every
@@ -242,9 +250,9 @@ $report.smallModel = $SmallModel
 
 # 3. A context warning that is not fatal: the model exists and will run, it just won't get far.
 if (-not $report.problem -and $Model -and $facts[$Model].ctx -lt $MIN_AGENT_CTX) {
-    Write-Warning ("'$Model' is configured with -c $($facts[$Model].ctx). Claude Code sends 15-25k tokens of system " +
-                   "prompt and tool definitions before your first message, so expect it to fail immediately. " +
-                   "Raise it to at least $MIN_AGENT_CTX.")
+    Write-Warning ("'$Model' is configured with -c $($facts[$Model].ctx). Claude Code's own overhead is small " +
+                   "(~1.1k tokens), but a coding session fills a window fast with file contents and tool output, " +
+                   "so expect to be compacting constantly. Raise it to at least $MIN_AGENT_CTX.")
 }
 
 # 4. The endpoint Claude Code actually uses. /health being up says nothing about /v1/messages
