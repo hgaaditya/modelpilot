@@ -235,9 +235,14 @@ function Set-Settings($patch) {
 
 function Test-Endpoint($url) {
     # 1 second, not 2. This server handles requests serially, and a down service burns the whole
-    # timeout - two of them made /api/status block for four seconds, long enough to time out
-    # unrelated requests queued behind it. On loopback a live service answers in milliseconds, so
-    # a longer wait only buys latency when something is already down.
+    # timeout - measured at 1015 ms against a stopped open-webui, on every poll. With the tick at
+    # 3s that is a third of this server's only thread spent waiting on a service known to be down,
+    # and everything else queues behind it.
+    #
+    # A TCP pre-check was tried to avoid that and made it decisively worse: a closed loopback port
+    # here does not refuse promptly (the connect sits until the timeout), so every poll left a
+    # pending socket behind, and /api/ping - which does no work at all - degraded from 1s to 8s as
+    # they accumulated. Reverted. The real fix is a concurrent listener, not a cleverer probe.
     try { (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop).StatusCode -eq 200 }
     catch { $false }
 }
@@ -482,29 +487,70 @@ function Get-ClaudeSessions([switch]$Refresh) {
         $probe = Join-Path $env:TEMP 'localllm-agent-probe'
         # One row per PROJECT, not per session. Resuming means "the conversation I was having in
         # that repo", and a directory can hold dozens of sessions - eight identical one-shot runs
-        # crowding out eight real projects is the opposite of useful. Files are walked newest
-        # first, so the first hit for a cwd is its most recent session, which is what --continue
-        # would pick anyway. To reach an older one, run `claude --resume` inside that project.
+        # crowding out eight real projects is the opposite of useful.
+        #
+        # The grouping happens on the FILE SYSTEM, before anything is read: Claude Code already
+        # keeps one directory per project, so the newest .jsonl in each directory is that
+        # project's latest session - the same one --continue would pick. Reading 120 transcripts
+        # and then discarding 108 duplicates took twelve seconds; picking the newest per directory
+        # first means ~15 reads. (The directory NAME still can't be trusted as the path - it maps
+        # both ':' and '\' to '-' - so the cwd is still read from inside the file.)
+        # To reach an older session, run `claude --resume` inside that project.
         $seen = @{}
-        foreach ($f in (Get-ChildItem $root -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
-                        Sort-Object LastWriteTime -Descending | Select-Object -First 120)) {
-            $cwd = $null; $title = $null
+        $newestPerProject = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem $_.FullName -Filter *.jsonl -ErrorAction SilentlyContinue |
+                             Sort-Object LastWriteTime -Descending | Select-Object -First 1 } |
+            Sort-Object LastWriteTime -Descending
+        foreach ($f in $newestPerProject) {
+            # cwd and the opening prompt are near the start; the title is not. Claude Code writes
+            # {"type":"custom-title","customTitle":...} as the conversation develops and rewrites
+            # it as the subject changes, so the LAST one is the title its own sidebar shows -
+            # "Llama server setup script upgrades", not the first thing you happened to type.
+            # Head-read for the first, tail-read for the second.
+            # cwd is pulled with a regex rather than ConvertFrom-Json per line: these records carry
+            # whole tool outputs, and parsing sixty of them to read one string is the slow way.
+            $cwd = $null; $opening = $null
             foreach ($line in (Get-Content $f.FullName -TotalCount 60 -ErrorAction SilentlyContinue)) {
-                if (-not $line.StartsWith('{')) { continue }
-                try { $o = $line | ConvertFrom-Json } catch { continue }
-                if (-not $cwd -and $o.cwd) { $cwd = $o.cwd }
-                if (-not $title -and $o.type -eq 'user') {
-                    $c = $o.message.content
-                    $t = if ($c -is [string]) { $c } else { ($c | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text }
-                    if ($t) { $title = ($t -replace '\s+', ' ').Trim() }
+                if (-not $cwd -and $line -match '"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"') {
+                    $cwd = $Matches[1] -replace '\\\\', '\'
                 }
-                if ($cwd -and $title) { break }
+                if (-not $opening -and $line -like '*"type":"user"*') {
+                    try {
+                        $o = $line | ConvertFrom-Json
+                        $c = $o.message.content
+                        $t = if ($c -is [string]) { $c } else { ($c | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text }
+                        if ($t) { $opening = ($t -replace '\s+', ' ').Trim() }
+                    } catch { }
+                }
+                if ($cwd -and $opening) { break }
             }
+            # Every skip happens before the tail-read: most of the 120 candidates are duplicate
+            # projects or dead paths, and tail-reading a 9 MB transcript only to throw the result
+            # away is what made this tab take ten seconds to paint.
             if (-not $cwd) { continue }
             if ($cwd -eq $probe) { continue }
             if ($seen.ContainsKey($cwd)) { continue }
             if (-not (Test-Path $cwd)) { continue }     # project deleted or on a disconnected drive
             $seen[$cwd] = $true
+
+            # Read the last chunk of the file by seeking, not with Get-Content -Tail. -Tail streams
+            # the whole file to find the end: on these transcripts (9 MB and up) that alone was
+            # fourteen seconds for eleven rows. A 256 KB window is far more than enough to contain
+            # the final custom-title record.
+            $title = $null
+            try {
+                $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $take = [Math]::Min(262144, $fs.Length)
+                    [void]$fs.Seek(-$take, 'End')
+                    $buf = New-Object byte[] $take
+                    [void]$fs.Read($buf, 0, $take)
+                    $tail = [Text.Encoding]::UTF8.GetString($buf)
+                } finally { $fs.Dispose() }
+                $ct = $tail -split "`n" | Where-Object { $_ -like '*"type":"custom-title"*' } | Select-Object -Last 1
+                if ($ct) { $title = ($ct | ConvertFrom-Json).customTitle }
+            } catch { }
+            if (-not $title) { $title = $opening }
             $rows += @{
                 id = $f.BaseName; cwd = $cwd
                 title = $(if ($title) { $title.Substring(0, [Math]::Min(110, $title.Length)) } else { '(no prompt yet)' })
@@ -692,7 +738,8 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 <button onclick="tab(2,this)">Models</button>
 <button onclick="tab(3,this)">Coding agents</button>
 <button onclick="tab(4,this)">Monitoring</button>
-<button onclick="tab(5,this)">Settings</button>
+<button onclick="tab(5,this)">Activity</button>
+<button onclick="tab(6,this)">Settings</button>
 </nav>
 <main>
 <div id="guide"></div>
@@ -746,7 +793,6 @@ table.sens td.now{font-weight:600;color:var(--fg)}
   <div class="hint" style="margin:7px 0 0">Last used comes from the weight file's access time. Loads counts only what this panel has seen, so it is a floor rather than a lifetime total.</div>
  </fieldset>
  <fieldset><legend>Weights on disk with no config entry</legend><table><tbody id="orph"></tbody></table></fieldset>
- <fieldset><legend>Activity</legend><div id="jobs"></div></fieldset>
 </div>
 
 <div class="pane" id="p3">
@@ -795,6 +841,13 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 </div>
 
 <div class="pane" id="p5">
+ <fieldset><legend>Running and recent jobs</legend>
+  <div class="mode">Downloads, installs, autotune runs and stack restarts all run detached and write here. This is where their output goes.</div>
+  <div id="jobs"></div>
+ </fieldset>
+</div>
+
+<div class="pane" id="p6">
  <fieldset><legend>Storage</legend>
   <div class="row"><input id="mdir" style="flex:1"><button class="gh" onclick="saveDir()">Save</button></div>
   <div class="hint" style="margin-top:8px">Where new downloads are written. Existing entries in config.yaml keep their own paths.</div>
@@ -848,7 +901,7 @@ function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
  monRun(i===4);
- if(i===3){agents();sessions()}}
+ if(i===3){agents();sessions(true)}}
 // ---- coding agents
 let AG={},SESS=[];
 function pdir(){return document.getElementById('pdir').value.trim()}
@@ -857,8 +910,12 @@ function ago(m){
  if(m<1440)return Math.round(m/60)+'h ago';
  return Math.round(m/1440)+'d ago';
 }
-async function sessions(){
- try{SESS=await (await fetch('/api/sessions')).json()}catch(e){return}
+let sessAt=0;
+// force=true on a tab click so it paints immediately; otherwise at most once every 30s.
+async function sessions(force){
+ if(!force&&Date.now()-sessAt<30000)return;
+ sessAt=Date.now();
+ try{SESS=await (await fetch('/api/sessions')).json()}catch(e){sessAt=0;return}
  document.getElementById('sess').innerHTML=SESS.length?SESS.map(s=>`<tr>
   <td style="max-width:0;overflow:hidden;text-overflow:ellipsis"><div>${s.title.replace(/</g,'&lt;')}</div>
    <div style="color:var(--dim);font-size:11px">${s.cwd.replace(/</g,'&lt;')}</div></td>
@@ -1107,7 +1164,7 @@ async function tick(){
   <td>${s.url&&s.up?`<a href="${s.url}" target="_blank"><button class="gh">Open</button></a>`:''}</td></tr>`).join('');
  document.getElementById('hw').innerHTML=`<span>GPU</span><div>${S.gpu.name}</div>
   <span>VRAM</span><div>${fmt(S.gpu.used)} / ${fmt(S.gpu.total)}<div class="bar"><i style="width:${100*S.gpu.used/S.gpu.total}%"></i></div></div>
-  <span>GPU load</span><div>${S.gpu.util}% &nbsp; ${S.gpu.temp} °C</div>
+  <span>GPU load</span><div>${S.gpu.util}% &nbsp; ${S.gpu.temp} &deg;C</div>
   <span>System RAM</span><div>${S.ramUsed} / ${S.ramTot} GB<div class="bar"><i style="width:${100*S.ramUsed/S.ramTot}%"></i></div></div>
   <span>Loaded model</span><div>${S.loaded||'<span style="color:var(--dim)">idle</span>'}</div>`;
  // First-run walkthrough. Someone who just unzipped this has three things to do in order -
@@ -1182,9 +1239,11 @@ async function tick(){
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
  if(!VER.rows){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
  document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
- // The agents tab is derived from the same job list, so it refreshes on the normal poll while
- // it is in front rather than only when it is clicked into. The session list is server-cached
- // for 30s, so re-rendering it on the 3s poll costs a hashtable lookup, not 40 file reads.
+ // The agents tab refreshes on the normal poll while it is in front. The session list does NOT:
+ // it is server-cached for 30s, but the *request* still queues on a single-threaded listener,
+ // and adding a seventh call to a 3s tick was enough to saturate it - /api/ping, which does no
+ // work at all, was taking a second. Sessions change on the timescale of starting a project, so
+ // once every 30s is plenty.
  if(document.getElementById('p3').classList.contains('on')){agents();sessions()}
  const md=document.getElementById('mdir');
  if(M.settings&&document.activeElement!==md){md.value=M.settings.modelsDir;
