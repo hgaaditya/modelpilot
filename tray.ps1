@@ -71,12 +71,26 @@ function Start-Detached($argList) {
     Start-Process powershell -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $argList)
 }
 
+# The control panel is the app's main window; the tray is what it minimises to. Closing the
+# window leaves the panel server running, so this is how you get back to it - and ui.ps1 is
+# single-instance, so it focuses the existing window rather than opening a second.
+function Open-Panel {
+    $ui = Join-Path $script:root 'ui.ps1'
+    if (-not (Test-Path $ui)) { return }
+    Start-Process powershell -WindowStyle Hidden `
+        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $ui
+}
+
 # The configured models, straight from config.yaml so the list is right whether or not the stack
 # is up. Each entry carries the weight path so a model whose .gguf went missing can be greyed out
 # instead of silently failing the moment it's selected.
 function Get-ConfiguredModels {
     if (-not (Test-Path $script:swapConfig)) { return @() }
-    $parts = [regex]::Split((Get-Content $script:swapConfig -Raw), '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
+    # Drop whole-line comments before parsing: config.yaml documents its own tuning in prose, and
+    # a comment quoting a flag or a path would otherwise be read as configuration for whichever
+    # model it happens to sit under.
+    $text = ((Get-Content $script:swapConfig) | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    $parts = [regex]::Split($text, '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
     $out = @()
     for ($i = 1; $i -lt $parts.Count; $i += 2) {
         $m = [regex]::Match($parts[$i + 1], '-m\s+"?([^"\r\n]+?\.gguf)"?')
@@ -116,6 +130,9 @@ $notify.Text = 'LocalLLM: checking...'
 $notify.ContextMenuStrip = $menu
 $notify.Visible = $true
 
+$miPanel = Add-MenuItem 'Open LocalLLM'        { Open-Panel }
+$miPanel.Font = New-Object System.Drawing.Font($miPanel.Font, [System.Drawing.FontStyle]::Bold)
+[void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $miChat = Add-MenuItem 'Open chat UI'          { Start-Process "http://127.0.0.1:$script:WebuiPort" }
 $miDash = Add-MenuItem 'Open llama-swap dashboard' { Start-Process "http://127.0.0.1:$script:SwapPort/ui" }
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
@@ -175,7 +192,9 @@ $miStop = New-Object System.Windows.Forms.ToolStripMenuItem 'Stop'
     [System.Windows.Forms.Application]::Exit()
 })
 
-$notify.Add_DoubleClick({ Start-Process "http://127.0.0.1:$script:WebuiPort" })
+# Double-click opens the control panel, not the chat UI: the panel is this app's main window,
+# and restoring it is what a user expects from double-clicking a tray icon.
+$notify.Add_DoubleClick({ Open-Panel })
 
 $script:lastState = $null
 

@@ -105,7 +105,11 @@ function Set-Settings($patch) {
 # ---------------------------------------------------------------- probes
 
 function Test-Endpoint($url) {
-    try { (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop).StatusCode -eq 200 }
+    # 1 second, not 2. This server handles requests serially, and a down service burns the whole
+    # timeout - two of them made /api/status block for four seconds, long enough to time out
+    # unrelated requests queued behind it. On loopback a live service answers in milliseconds, so
+    # a longer wait only buys latency when something is already down.
+    try { (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop).StatusCode -eq 200 }
     catch { $false }
 }
 
@@ -582,6 +586,16 @@ $listener = New-Object Net.HttpListener
 $listener.Prefixes.Add("http://127.0.0.1:$Port/")
 try { $listener.Start() } catch { throw "Could not bind 127.0.0.1:$Port - is the panel already running? ($($_.Exception.Message))" }
 Write-Host "LocalLLM panel -> http://127.0.0.1:$Port  (Ctrl-C to stop)"
+
+# Closing the window leaves this server running, which is the behaviour we want - it is a
+# minimise, not a quit. That only works if there is something to restore it from, so make sure
+# the tray exists. tray.ps1 holds a named mutex, so launching it when it is already up is a
+# no-op rather than a second icon.
+$trayPs = Join-Path $root 'tray.ps1'
+if (Test-Path $trayPs) {
+    Start-Process powershell -WindowStyle Hidden `
+        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $trayPs
+}
 
 if (-not $NoWindow) {
     $browser = Find-AppBrowser
