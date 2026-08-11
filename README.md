@@ -36,6 +36,25 @@ serving. Right-click the tray icon to stop the stack for real.
 - Everything else — Python, Node — is fetched into the install folder. Nothing is installed
   system-wide, and your existing Python and Node are never touched.
 
+## Running out of Claude quota mid-project
+
+Claude Code can be pointed at a model running here instead of at Anthropic, on the same repo, with
+your files and session history intact and nothing uploaded. The panel's **Coding agents** tab has
+the command ready to copy, and a **Test the handoff now** button that loads a model and calls the
+real endpoint — worth pressing *before* you need it.
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\claude-local.ps1 -Directory C:\your\project -Resume
+```
+
+Only that process is redirected; your normal `claude` sessions still go to Anthropic. It needs a
+model with at least 32k of context — Claude Code sends 15–25k tokens of system prompt and tool
+definitions before your first message — so check with `.\claude-local.ps1 -Check`, which names
+what's missing rather than failing later inside the session.
+
+The other direction also works: keep Claude Code on the cloud model and hand only the token-heavy
+reading to a local one with `local-llm.ps1`, so a 200k-token log costs nothing against your quota.
+
 ## If you prefer a terminal
 
 The panel is a face on `start.ps1`, which does everything the panel does and more:

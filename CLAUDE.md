@@ -169,19 +169,33 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
 - **Models → Edit** changes `-c` and `-ctk`/`-ctv` through `start.ps1 -Action set-tuning`, the same
   `Set-ModelTuning` that `autotune -Apply` writes with. Weight quantisation (Q4_K_M vs Q6_K) is
   deliberately *not* editable here: that's a different file and means a download, not a flag.
+- **Coding agents tab** — the handoff surface (see the next section). `/api/agents` is cheap enough
+  to poll: CLIs on PATH, and which models could back an agent. The end-to-end probe is *not* on
+  that path — it loads a multi-GB model and calls `/v1/messages`, so it's a job behind the **Test
+  the handoff now** button, and its verdict is shown next to that button rather than only in the
+  Activity log on another tab.
 
 ## Using the local models from Claude Code
 
-Two different things, often confused:
+Three different things, often confused. The panel's **Coding agents** tab is the front end for all of them.
 
-**Full local mode — `claude-local.ps1`.** Runs Claude Code entirely against llama-swap instead of Anthropic. llama-swap implements the Anthropic endpoints Claude Code needs (`v1/messages`, `v1/messages/count_tokens`), so it's just three environment variables. The script sets them **for its own process only** — putting `ANTHROPIC_BASE_URL` in the user environment would silently redirect *every* Claude Code session on the machine, which is almost never wanted. It validates that llama-swap is up and that the model ids exist before launching, so a typo fails immediately rather than as a connection error inside Claude Code.
+**Full local mode — `claude-local.ps1`.** Runs Claude Code entirely against llama-swap instead of Anthropic. llama-swap implements the Anthropic endpoints Claude Code needs (`v1/messages`, `v1/messages/count_tokens`), so it's just three environment variables. The script sets them **for its own process only** — putting `ANTHROPIC_BASE_URL` in the user environment would silently redirect *every* Claude Code session on the machine, which is almost never wanted.
+
+The use case that shapes it: you are mid-project, your quota is gone, and you want to keep going on the same repo. So it validates the whole path *before* handing over, and names the part that's wrong when one is:
 
 ```powershell
-.\claude-local.ps1                      # bonsai-27b
-.\claude-local.ps1 -Model qwen3-14b
+.\claude-local.ps1 -Check                                   # would a handoff work right now?
+.\claude-local.ps1 -Directory C:\work\api -Resume           # continue that project's session
+.\claude-local.ps1 -Prompt "what does build.ps1 do?"        # one-shot, prints and exits
 ```
 
-`-SmallModel` (default `qwen2.5-0.5b-instruct-q4_k_m`) backs `ANTHROPIC_SMALL_FAST_MODEL`, which Claude Code uses for background work like conversation titles. Pointing it at the main model makes every trivial call trigger a multi-GB swap.
+- **Context is the gate, not model size.** Claude Code sends 15–25k tokens of system prompt and tool definitions before your first message, so a model at `-c 16384` fails on the first turn with an error that looks like the model's fault rather than the config's. `$MIN_AGENT_CTX` is 32768, and with no `-Model` the script picks the **largest context among runnable models** — deliberately not the biggest model. A 20B at `-c 16384` is useless here; a 14B at `-c 65536` is not.
+- **Runnable means weights on disk and an engine to run them**, not just "listed by `/v1/models`" — llama-swap lists every configured id whether or not it can start. Caught in testing: the first pick was a model with no `.gguf`, which fails as a 500 a minute later.
+- **`-Check` really calls `/v1/messages`.** `/health` being up says nothing about the Anthropic-shaped surface working, and that's what the handoff depends on. `-Json` is the same thing for the panel.
+- **`-Resume` and `-Prompt` are switches, not passthrough**, and that's not stylistic. `powershell -File script.ps1 -- --continue` fails before the script runs — `--` parses as an empty parameter name — and PowerShell prefix-matches, so claude's own `-p` binds to this script's `-Port` and dies with a type error about `Int32`. Both were live bugs in the documented invocation. `-ClaudeArgs` still exists for anything else but is only reliable from a PowerShell session.
+- `-SmallModel` (default `qwen2.5-0.5b-instruct-q4_k_m`) backs `ANTHROPIC_SMALL_FAST_MODEL`, which Claude Code uses for background work like conversation titles. Pointing it at the main model makes every trivial call trigger a multi-GB swap. If it isn't configured the script warns and falls back to the main model rather than refusing to start — it's a convenience, not a requirement.
+
+**Local agent — `local-agent.ps1`.** opencode driving a local model, with Anthropic not involved at all. See its own notes for what a local 27B does and doesn't get right about editing files.
 
 **Hybrid delegation — `local-llm.ps1`.** Usually the better arrangement: keep Claude Code on the cloud model for reasoning, planning and orchestration, and hand off only the token-heavy grinding to a local model.
 

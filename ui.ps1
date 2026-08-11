@@ -340,6 +340,30 @@ function Get-Sensors {
     @{ sensors = @($out); loaded = $script:lastLoaded }
 }
 
+# What a coding agent needs to know, cheaply enough to poll: which CLIs are on PATH, and which
+# configured models could actually back one. Deliberately does NOT probe /v1/messages - that can
+# load a multi-GB model and take a minute, so it lives behind the Test button instead.
+function Get-Agents {
+    # Same threshold as claude-local.ps1: Claude Code sends 15-25k tokens of system prompt and tool
+    # definitions before your first message, so a model at -c 16384 fails on the first turn.
+    $min = 32768
+    $models = @(Get-ConfiguredModels)
+    @{
+        minContext = $min
+        claude   = [bool](Get-Command claude -ErrorAction SilentlyContinue)
+        opencode = [bool](Get-Command opencode -ErrorAction SilentlyContinue)
+        script   = (Join-Path $root 'claude-local.ps1')
+        delegate = (Join-Path $root 'local-llm.ps1')
+        agentScript = (Join-Path $root 'local-agent.ps1')
+        # Ready = it would run right now. Short = the only thing wrong is context, which the Models
+        # tab can fix in two clicks, so it is worth naming separately from "not usable".
+        ready = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -ge $min } |
+                  ForEach-Object { @{ id = $_.id; ctx = $_.ctx } } | Sort-Object { -$_.ctx })
+        short = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -lt $min } |
+                  ForEach-Object { @{ id = $_.id; ctx = $_.ctx } } | Sort-Object { -$_.ctx })
+    }
+}
+
 function Get-Engine {
     $swapExe = Join-Path $root 'llamaswap\llama-swap.exe'
     $servers = @(Get-Process -Name llama-server -ErrorAction SilentlyContinue |
@@ -360,10 +384,11 @@ function Get-Engine {
 # Downloads and autotune runs take minutes. They run detached with output to a log, and the UI
 # polls that log - so the HTTP thread never blocks and progress is visible while it happens.
 
-function Start-Job2($name, $argList) {
+function Start-Job2($name, $argList, $script) {
+    if (-not $script) { $script = $startPs }
     $id = "{0}-{1}" -f $name, (Get-Date -Format 'HHmmss')
     $log = Join-Path $jobDir "$id.log"
-    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $argList
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) + $argList
     $p = Start-Process powershell -WindowStyle Hidden -ArgumentList $a -PassThru `
              -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     # The pid is what makes "is this still running" answerable. Without it the page can only see
@@ -507,8 +532,9 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 <button class="on" onclick="tab(0,this)">Dashboard</button>
 <button onclick="tab(1,this)">Engine</button>
 <button onclick="tab(2,this)">Models</button>
-<button onclick="tab(3,this)">Monitoring</button>
-<button onclick="tab(4,this)">Settings</button>
+<button onclick="tab(3,this)">Coding agents</button>
+<button onclick="tab(4,this)">Monitoring</button>
+<button onclick="tab(5,this)">Settings</button>
 </nav>
 <main>
 <div id="guide"></div>
@@ -553,6 +579,19 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 </div>
 
 <div class="pane" id="p3">
+ <div class="hint">Your Claude quota running out mid-project doesn't have to end the session. These hand the same repo to a model running here - your files, your history, no upload.</div>
+ <fieldset><legend>Claude Code, against a local model</legend>
+  <div id="ag1"></div>
+  <div class="row" style="margin-top:7px">
+   <button class="gh" id="agtest" onclick="agCheck()">Test the handoff now</button>
+   <span id="agmsg" style="color:var(--dim);font-size:11px"></span>
+  </div>
+  <div class="hint" style="margin-top:8px">The test loads a model and calls the same endpoint Claude Code uses, so it takes up to a minute the first time. Output appears under Models &gt; Activity. Worth doing <b>before</b> you need it.</div>
+ </fieldset>
+ <fieldset><legend>Other ways round</legend><div id="ag2"></div></fieldset>
+</div>
+
+<div class="pane" id="p4">
  <fieldset><legend>Sensors</legend>
   <div class="row" style="margin-bottom:6px">
    <button class="gh" onclick="monReset()">Reset min/max</button>
@@ -564,7 +603,7 @@ table.sens td.now{font-weight:600;color:var(--fg)}
  </fieldset>
 </div>
 
-<div class="pane" id="p4">
+<div class="pane" id="p5">
  <fieldset><legend>Storage</legend>
   <div class="row"><input id="mdir" style="flex:1"><button class="gh" onclick="saveDir()">Save</button></div>
   <div class="hint" style="margin-top:8px">Where new downloads are written. Existing entries in config.yaml keep their own paths.</div>
@@ -617,7 +656,62 @@ function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.
  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
- monRun(i===3);}
+ monRun(i===4);
+ if(i===3)agents();}
+// ---- coding agents
+let AG={};
+function cmdbox(cmd,note){
+ // The command is the deliverable here - it has to be copyable, because retyping an absolute
+ // path from a screenshot is exactly the friction this tab exists to remove.
+ const id='c'+Math.random().toString(36).slice(2,8);
+ return `<div style="margin:6px 0"><pre id="${id}" style="margin:0">${cmd.replace(/</g,'&lt;')}</pre>
+  <div class="row" style="margin-top:3px"><button class="gh" onclick="cp('${id}',this)">Copy</button>
+  <span style="color:var(--dim);font-size:11px">${note}</span></div></div>`;
+}
+async function cp(id,btn){
+ try{await navigator.clipboard.writeText(document.getElementById(id).textContent);
+  const t=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=t,1200)}
+ catch(e){btn.textContent='copy failed'}
+}
+async function agents(){
+ try{AG=await (await fetch('/api/agents')).json()}catch(e){return}
+ const ok=s=>s?'<span class="on2">installed</span>':'<span class="miss">not found on PATH</span>';
+ const best=(AG.ready&&AG.ready[0])?AG.ready[0]:null;
+ let h=`<div class="kv"><span>claude CLI</span><div>${ok(AG.claude)}</div>
+  <span>Usable models</span><div>${AG.ready.length?AG.ready.map(m=>m.id+' <span class="tag">-c '+m.ctx+'</span>').join(' '):'<span class="miss">none</span>'}</div></div>`;
+ if(!AG.claude) h+='<div class="hint miss" style="margin-top:7px">Claude Code isn\'t on PATH. Install it first - this only redirects it, it doesn\'t replace it.</div>';
+ if(!AG.ready.length){
+  h+=`<div class="hint miss" style="margin-top:7px">No model here can back a coding agent yet.${
+   AG.short.length?' These have weights but too little context: '+AG.short.map(m=>m.id+' (-c '+m.ctx+')').join(', ')+
+   '. Claude Code sends 15-25k tokens of system prompt and tool definitions before your first message, so it needs at least -c '+AG.minContext+
+   ' - raise one with Models &gt; Edit.':' Download one from the Models tab.'}</div>`;
+ }else{
+  h+=cmdbox(`powershell -ExecutionPolicy Bypass -File "${AG.script}" -Directory "C:\\path\\to\\your\\project" -Resume`,
+            `Run in any terminal. Uses ${best.id} unless you pass -Model. Drop -Resume to start a fresh session instead of picking the project's up.`);
+  h+='<div class="hint" style="margin-top:0">Only this process is redirected - your normal <code>claude</code> sessions still go to Anthropic.</div>';
+ }
+ document.getElementById('ag1').innerHTML=h;
+ document.getElementById('ag2').innerHTML=
+  `<div class="kv"><span>opencode CLI</span><div>${ok(AG.opencode)}</div></div>`+
+  '<div class="hint" style="margin:7px 0 0">A local coding agent that never involves Anthropic at all.</div>'+
+  cmdbox(`powershell -ExecutionPolicy Bypass -File "${AG.agentScript}" -Directory "C:\\path\\to\\your\\project" -Prompt "your task"`,'opencode driving a local model.')+
+  '<div class="hint" style="margin:9px 0 0">Or keep Claude Code on the cloud model and hand it only the token-heavy grinding - reading a huge log, extracting fields. Only the answer comes back, so the input never enters your Claude context.</div>'+
+  cmdbox(`powershell -ExecutionPolicy Bypass -File "${AG.delegate}" -Prompt "List every distinct error and its frequency" -File "app.log"`,'Local model does the reading; you keep your quota.');
+ const b=document.getElementById('agtest'),bz=busy('agentcheck');
+ b.classList.toggle('busy',bz);b.disabled=bz;
+ // The verdict belongs next to the button that asked for it, not only in the Activity log on
+ // another tab - "is this ready" is the whole question this tab answers.
+ const j=JOBS.find(x=>x.name==='agentcheck');
+ const el=document.getElementById('agmsg');
+ if(bz)el.textContent='loading a model and calling /v1/messages...';
+ else if(j)el.innerHTML=(j.tail||'').replace(/</g,'&lt;')||'ran, no output';
+ else el.textContent='';
+}
+async function agCheck(){
+ spin('agentcheck',900000);
+ document.getElementById('agmsg').textContent='loading a model and calling /v1/messages...';
+ await post('/api/agent-check',{});setTimeout(tick,900);
+}
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
 function monReset(){MON={};monN=0;document.getElementById('sens').innerHTML=''}
@@ -835,6 +929,9 @@ async function tick(){
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
  if(!VER.rows){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
  document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
+ // The agents tab is derived from the same job list, so it refreshes on the normal poll while
+ // it is in front rather than only when it is clicked into.
+ if(document.getElementById('p3').classList.contains('on'))agents();
  const md=document.getElementById('mdir');
  if(M.settings&&document.activeElement!==md){md.value=M.settings.modelsDir;
   document.getElementById('st').innerHTML=`<span>llama-swap</span><div>127.0.0.1:${M.settings.swapPort}</div><span>Chat UI</span><div>127.0.0.1:${M.settings.webuiPort}</div><span>This panel</span><div>127.0.0.1:${location.port}</div>`;}
@@ -931,6 +1028,14 @@ try {
                 '^/api/status$' { $body = Get-Dashboard | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
+                '^/api/agents$'  { $body = Get-Agents | ConvertTo-Json -Depth 5 -Compress }
+                '^/api/agent-check$' {
+                    # A real end-to-end probe: it swaps a model in and calls /v1/messages, so it can
+                    # take a minute. A job, therefore - the result reads out in Activity, and the
+                    # button spins off the same job list as everything else.
+                    Start-Job2 'agentcheck' @('-Check') (Join-Path $root 'claude-local.ps1') | Out-Null
+                    $body = '{"ok":true}'
+                }
                 '^/api/models$' {
                     $body = @{ models = @(Get-ConfiguredModels); orphans = @(Get-OrphanModels); settings = (Get-Settings) } | ConvertTo-Json -Depth 6 -Compress
                 }
