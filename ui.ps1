@@ -31,9 +31,13 @@ $llamaPrism = Join-Path $root 'llama.cpp-prism'
 $logDir     = Join-Path $root 'logs'
 $jobDir     = Join-Path $logDir 'jobs'
 $settingsFile = Join-Path $root '.ui-settings.json'
+$usageFile  = Join-Path $root '.ui-usage.json'
 $swapPort   = 9292
 $webuiPort  = 8080
 New-Item -ItemType Directory -Force -Path $jobDir | Out-Null
+
+# Version lookups hit the GitHub API, so they are fetched on demand and kept until refreshed.
+$script:verInfo = $null
 
 # Version strings cost a process launch each, so they're read once and kept.
 $script:versionCache = @{}
@@ -133,6 +137,8 @@ function Get-ConfiguredModels {
         $m = [regex]::Match($body, '-m\s+"?([^"\r\n]+?\.gguf)"?')
         $path = if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
         $present = $path -and (Test-Path $path)
+        $usage = Get-Usage
+        $u = $usage[$parts[$i]]
         $out += [pscustomobject]@{
             id      = $parts[$i]
             path    = $path
@@ -142,9 +148,35 @@ function Get-ConfiguredModels {
             kv      = if ($body -match '-ctk\s+(\S+)') { $Matches[1] } else { '' }
             moe     = if ($body -match '--n-cpu-moe\s+(\d+)') { [int]$Matches[1] } else { $null }
             prism   = [bool]($body -match 'llama-server-prism')
+            # NTFS last-access is enabled on this machine and updates when llama-server opens the
+            # weights, so it gives a true "last used" with nothing to track. The load count has to
+            # be counted here, and only advances while this panel is running - so it is a floor,
+            # not a total.
+            lastUsed = if ($present) { (Get-Item $path).LastAccessTime.ToString('yyyy-MM-dd HH:mm') } else { '' }
+            loads    = if ($u) { [int]$u.loads } else { 0 }
         }
     }
     $out
+}
+
+function Get-Usage {
+    if (-not (Test-Path $usageFile)) { return @{} }
+    try {
+        $h = @{}
+        (Get-Content $usageFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
+        $h
+    } catch { @{} }
+}
+
+# Called on every dashboard poll: when the loaded model changes, that is one load.
+function Update-Usage($loaded) {
+    if (-not $loaded) { return }
+    if ($script:lastSeenModel -eq $loaded) { return }
+    $script:lastSeenModel = $loaded
+    $u = Get-Usage
+    $entry = if ($u[$loaded]) { $u[$loaded] } else { [pscustomobject]@{ loads = 0 } }
+    $u[$loaded] = [pscustomobject]@{ loads = [int]$entry.loads + 1 }
+    try { $u | ConvertTo-Json | Set-Content $usageFile -Encoding utf8 } catch { }
 }
 
 # Weights on disk that no config entry points at - downloaded but not registered, which is
@@ -167,6 +199,7 @@ function Get-Dashboard {
     $loaded = $null
     try { $loaded = ((Invoke-RestMethod "http://127.0.0.1:$swapPort/running" -TimeoutSec 2).running |
                      Where-Object { $_.state -ne 'stopped' } | Select-Object -First 1).model } catch { }
+    Update-Usage $loaded
     $os = Get-CimInstance Win32_OperatingSystem
     @{
         services = @(
@@ -210,6 +243,51 @@ function Start-Job2($name, $argList) {
     $id
 }
 
+# Installed / pinned / newest-upstream, straight from `start.ps1 -Action status`. The -Latest
+# form queries GitHub and nodejs.org, so it is only run when the user asks for it.
+function Get-Versions([switch]$Refresh) {
+    if ($script:verInfo -and -not $Refresh) { return $script:verInfo }
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs, '-Action', 'status')
+    if ($Refresh) { $a += '-Latest' }
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = try { & powershell @a 2>&1 | ForEach-Object { "$_" } } catch { @() } finally { $ErrorActionPreference = $old }
+    $rows = @()
+    foreach ($l in $out) {
+        if ($l -match '^\s*(llamaCpp|llamaSwap|openWebUI|node|prism fork)\s+(\S+)\s+(\S+)\s+(\S+)\s*$') {
+            $rows += @{ component = $Matches[1]; installed = $Matches[2]; pinned = $Matches[3]
+                        latest = $(if ($Matches[4] -eq '-') { '' } else { $Matches[4] }) }
+        }
+    }
+    $script:verInfo = @{ rows = $rows; checked = (Get-Date -Format 'HH:mm:ss'); hasLatest = [bool]$Refresh }
+    $script:verInfo
+}
+
+function Remove-ModelFiles($id, [bool]$alsoConfig) {
+    $m = Get-ConfiguredModels | Where-Object { $_.id -eq $id } | Select-Object -First 1
+    if (-not $m) { throw "no model '$id' in config.yaml" }
+    $freed = 0
+    if ($m.path -and (Test-Path $m.path)) {
+        $freed = [math]::Round((Get-Item $m.path).Length / 1GB, 1)
+        # Split models are published as -00001-of-000NN; remove the whole set or the remainder is
+        # dead weight that no entry points at.
+        $stem = [regex]::Replace((Split-Path $m.path -Leaf), '-\d{5}-of-\d{5}\.gguf$', '')
+        $dir = Split-Path $m.path -Parent
+        Get-ChildItem $dir -Filter "$stem*.gguf" -ErrorAction SilentlyContinue | Remove-Item -Force
+        Remove-Item $m.path -Force -ErrorAction SilentlyContinue
+    }
+    if ($alsoConfig -and (Test-Path $swapCfg)) {
+        $text = Get-Content $swapCfg -Raw
+        # Take the entry from its id line up to the next id line or end of file.
+        $pat = "(?ms)^\s{2,}""$([regex]::Escape($id))""\s*:\s*$.*?(?=^\s{2}""|\z)"
+        $new = [regex]::Replace($text, $pat, '')
+        if ($new -ne $text) {
+            Copy-Item $swapCfg "$swapCfg.bak" -Force
+            Set-Content $swapCfg -Value $new -Encoding utf8 -NoNewline
+        }
+    }
+    @{ ok = $true; freedGb = $freed }
+}
+
 function Get-Jobs {
     Get-ChildItem (Join-Path $jobDir '*.log') -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 5 | ForEach-Object {
@@ -229,38 +307,40 @@ function Get-Jobs {
 $html = @'
 <!doctype html><html><head><meta charset="utf-8"><title>LocalLLM</title>
 <style>
-:root{--bg:#1b1d22;--panel:#23262d;--line:#333842;--fg:#e8ebf0;--dim:#939cab;--ok:#43c98b;--warn:#e0ae3c;--bad:#e0574d;--acc:#4d8bf0}
+:root{--bg:#f3f4f6;--panel:#fff;--line:#d6dae1;--fg:#1b2027;--dim:#5f6875;--ok:#127a45;--warn:#8a6100;--bad:#c1362b;--acc:#2360c4;--soft:#eef1f5}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 "Segoe UI",system-ui,sans-serif;user-select:none}
-header{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+body{margin:0;background:var(--bg);color:var(--fg);font:12.5px/1.4 "Segoe UI",system-ui,sans-serif;user-select:none}
+header{display:flex;align-items:center;gap:9px;padding:7px 11px;background:var(--panel);border-bottom:1px solid var(--line)}
 header b{font-size:13px;font-weight:600}
 .dot{width:9px;height:9px;border-radius:50%}.up{background:var(--ok)}.down{background:var(--bad)}.part{background:var(--warn)}
-nav{display:flex;gap:1px;background:var(--line);padding:0 8px;border-bottom:1px solid var(--line)}
-nav button{background:var(--bg);border:0;border-bottom:2px solid transparent;color:var(--dim);padding:7px 16px;font-size:12px;cursor:pointer}
-nav button.on{color:var(--fg);border-bottom-color:var(--acc);background:var(--panel)}
-main{padding:12px}
+nav{display:flex;background:var(--soft);padding:0 8px;border-bottom:1px solid var(--line)}
+nav button{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:6px 15px;font-size:12px;cursor:pointer}
+nav button.on{color:var(--acc);border-bottom-color:var(--acc);background:var(--panel);font-weight:600}
+main{padding:10px}
 .pane{display:none}.pane.on{display:block}
-fieldset{border:1px solid var(--line);border-radius:4px;margin:0 0 10px;padding:8px 10px 10px}
-legend{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:0 5px}
+fieldset{border:1px solid var(--line);border-radius:4px;margin:0 0 9px;padding:6px 9px 8px;background:var(--panel)}
+legend{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;padding:0 4px;font-weight:600}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:var(--dim);font-weight:500;padding:4px 8px;border-bottom:1px solid var(--line)}
-td{padding:4px 8px;border-bottom:1px solid #2a2e37}
+th{text-align:left;color:var(--dim);font-weight:600;padding:3px 7px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:3px 7px;border-bottom:1px solid #eceff3;white-space:nowrap}
 tr:last-child td{border-bottom:0}
-.kv{display:grid;grid-template-columns:130px 1fr;gap:2px 10px;font-size:12px}
+.kv{display:grid;grid-template-columns:118px 1fr;gap:1px 10px;font-size:12px}
 .kv span{color:var(--dim)}
-button.act{background:var(--acc);color:#fff;border:0;border-radius:3px;padding:4px 11px;font-size:12px;cursor:pointer}
-button.gh{background:#2b2f38;color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:4px 11px;font-size:12px;cursor:pointer}
-button:disabled{opacity:.35;cursor:default}
-input,select{background:#171a1f;border:1px solid var(--line);color:var(--fg);border-radius:3px;padding:4px 7px;font-size:12px;user-select:text}
+button.act{background:var(--acc);color:#fff;border:0;border-radius:3px;padding:3px 10px;font-size:11.5px;cursor:pointer}
+button.gh{background:var(--soft);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:3px 10px;font-size:11.5px;cursor:pointer}
+button.gh:hover{background:#e3e8ef}
+button.dz{background:#fff;color:var(--bad);border:1px solid #e4b7b2;border-radius:3px;padding:3px 9px;font-size:11.5px;cursor:pointer}
+button:disabled{opacity:.4;cursor:default}
+input,select{background:#fff;border:1px solid var(--line);color:var(--fg);border-radius:3px;padding:3px 6px;font-size:12px;user-select:text}
 input{width:100%}
-.bar{height:5px;background:#131519;border-radius:3px;overflow:hidden;margin-top:3px}
+.bar{height:5px;background:#e2e6ec;border-radius:3px;overflow:hidden;margin-top:3px}
 .bar i{display:block;height:100%;background:var(--acc)}
-.tag{font-size:10px;padding:1px 6px;border-radius:9px;border:1px solid var(--line);color:var(--dim)}
+.tag{font-size:10px;padding:1px 5px;border-radius:9px;border:1px solid var(--line);color:var(--dim);background:var(--soft)}
 .miss{color:var(--bad)}.on2{color:var(--ok)}
-.hint{background:#1d2634;border:1px solid #2b3purple;border-color:#2b3a52;border-radius:4px;padding:8px 10px;color:#aebbd0;font-size:12px;margin-bottom:10px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-pre{background:#131519;border:1px solid var(--line);border-radius:3px;padding:7px;font-size:11px;margin:6px 0 0;white-space:pre-wrap;max-height:110px;overflow:auto;user-select:text}
-code{background:#131519;padding:1px 5px;border-radius:3px;font-size:11px}
+.hint{background:#eaf1fb;border:1px solid #c3d6f2;border-radius:4px;padding:7px 9px;color:#28425f;font-size:12px;margin-bottom:9px}
+.row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+pre{background:#f7f8fa;border:1px solid var(--line);border-radius:3px;padding:6px;font-size:11px;margin:5px 0 0;white-space:pre-wrap;max-height:100px;overflow:auto;user-select:text;color:#3a4250}
+code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 </style></head><body>
 <header><span id="d" class="dot down"></span><b>LocalLLM</b><span id="sub" style="color:var(--dim);font-size:11px"></span>
 <span style="flex:1"></span>
@@ -295,6 +375,17 @@ code{background:#131519;padding:1px 5px;border-radius:3px;font-size:11px}
   <div class="hint" style="margin:8px 0 0">llama-server is not started directly - llama-swap spawns one per model on demand and stops it after the model's idle timeout.</div>
  </fieldset>
  <fieldset><legend>Running llama-server processes</legend><table><thead><tr><th>PID</th><th>Memory</th></tr></thead><tbody id="e4"></tbody></table></fieldset>
+ <fieldset><legend>Install &amp; upgrade</legend>
+  <table><thead><tr><th>Component</th><th>Installed</th><th>Pinned</th><th>Latest upstream</th></tr></thead><tbody id="ver"></tbody></table>
+  <div class="row" style="margin-top:7px">
+   <button class="gh" onclick="chk()">Check for updates</button>
+   <button class="gh" onclick="inst('components')">Install / repair</button>
+   <button class="gh" onclick="inst('upgrade')">Upgrade to pinned</button>
+   <button class="gh" onclick="inst('upgrade-latest')">Upgrade to latest</button>
+   <button class="gh" onclick="inst('prism')">Install PrismML fork</button>
+  </div>
+  <div class="hint" style="margin:7px 0 0">Install / repair fetches anything missing and leaves what is already correct alone. Upgrades stop the stack, replace only components whose version changed, and never touch model weights or config.yaml.</div>
+ </fieldset>
 </div>
 
 <div class="pane" id="p2">
@@ -306,7 +397,8 @@ code{background:#131519;padding:1px 5px;border-radius:3px;font-size:11px}
   <div id="insp"></div>
  </fieldset>
  <fieldset><legend>Configured models</legend>
-  <table><thead><tr><th>Model</th><th>Size</th><th>Context</th><th>KV</th><th>MoE offload</th><th>State</th><th></th></tr></thead><tbody id="mt"></tbody></table>
+  <table><thead><tr><th>Model</th><th>Size</th><th>Context</th><th>KV</th><th>MoE</th><th>Last used</th><th>Loads</th><th>State</th><th></th></tr></thead><tbody id="mt"></tbody></table>
+  <div class="hint" style="margin:7px 0 0">Last used comes from the weight file's access time. Loads counts only what this panel has seen, so it is a floor rather than a lifetime total.</div>
  </fieldset>
  <fieldset><legend>Weights on disk with no config entry</legend><table><tbody id="orph"></tbody></table></fieldset>
  <fieldset><legend>Activity</legend><div id="jobs"></div></fieldset>
@@ -333,6 +425,32 @@ async function load(id){await post('/api/load',{id});setTimeout(tick,700)}
 async function unloadAll(){await post('/api/unload',{});setTimeout(tick,700)}
 async function tune(id){await post('/api/autotune',{id});setTimeout(tick,700)}
 async function saveDir(){await post('/api/settings',{modelsDir:document.getElementById('mdir').value});tick()}
+async function inst(what){
+ const names={components:'install or repair all components',upgrade:'upgrade to the pinned versions',
+  'upgrade-latest':'upgrade to the newest upstream releases','prism':'install the PrismML fork (~620 MB)'};
+ if(!confirm('This will '+names[what]+'.\n\nThe stack will be stopped and restarted. Model weights and config.yaml are not touched.\n\nContinue?'))return;
+ await post('/api/install',{what});setTimeout(tick,900);
+}
+async function chk(){
+ document.getElementById('ver').innerHTML='<tr><td colspan=4 style="color:var(--dim)">querying GitHub and nodejs.org...</td></tr>';
+ try{const v=await (await fetch('/api/versions?refresh=1')).json();renderVer(v)}catch(e){}
+}
+function renderVer(v){
+ if(!v||!v.rows)return;
+ document.getElementById('ver').innerHTML=v.rows.map(r=>{
+  const behind=r.latest&&r.latest!==r.installed;
+  return `<tr><td>${r.component}</td><td>${r.installed}</td><td>${r.pinned}</td>
+   <td>${r.latest?(behind?'<span class="miss">'+r.latest+'</span>':'<span class="on2">'+r.latest+'</span>'):'<span style="color:var(--dim)">not checked</span>'}</td></tr>`}).join('');
+}
+// Deleting weights is multi-GB and irreversible, so it asks twice: once for the files, then
+// separately about the config entry, which is a different decision.
+async function del(id,gb){
+ if(!confirm('Delete the weight files for "'+id+'"?\n\nThis frees about '+gb+' GB and cannot be undone - the model would have to be downloaded again.'))return;
+ const alsoConfig=confirm('Also remove the "'+id+'" entry from config.yaml?\n\nOK  = remove the entry too\nCancel = keep the entry (it will show as "no weights")');
+ const r=await (await fetch('/api/delete-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,alsoConfig})})).json();
+ if(r.error)alert('Delete failed: '+r.error); else if(alsoConfig)await post('/api/action',{action:'restart',component:'swap'});
+ setTimeout(tick,700);
+}
 function fmt(mb){return (mb/1024).toFixed(1)+' GB'}
 async function inspect(){
  const r=document.getElementById('repo').value.trim(); if(!r)return;
@@ -377,10 +495,13 @@ async function tick(){
    <td>${m.id} ${m.prism?'<span class="tag">prism</span>':''}</td>
    <td>${m.present?m.sizeGb+' GB':'<span class="miss">no weights</span>'}</td>
    <td>${m.ctx||'-'}</td><td>${m.kv||'-'}</td><td>${m.moe!==null?m.moe:'-'}</td>
+   <td style="color:var(--dim)">${m.lastUsed||'-'}</td><td>${m.loads||0}</td>
    <td>${S.loaded===m.id?'<span class="on2">loaded</span>':(m.present?'ready':'-')}</td>
-   <td>${m.present?`<button class="gh" onclick="load('${m.id}')">Load</button> <button class="gh" onclick="tune('${m.id}')">Tune</button>`:''}</td></tr>`).join('');
+   <td>${m.present?`<button class="gh" onclick="load('${m.id}')">Load</button> <button class="gh" onclick="tune('${m.id}')">Tune</button> `:''}<button class="dz" onclick="del('${m.id}',${m.sizeGb})">Delete</button></td></tr>`).join('');
   document.getElementById('orph').innerHTML=M.orphans.length?M.orphans.map(o=>`<tr><td>${o.file}</td><td>${o.sizeGb} GB</td><td style="color:var(--dim)">downloaded, not in config.yaml</td></tr>`).join(''):'<tr><td style="color:var(--dim)">none</td></tr>';
  }
+ // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
+ if(!document.getElementById('ver').innerHTML){try{renderVer(await (await fetch('/api/versions')).json())}catch(e){}}
  try{const j=await (await fetch('/api/jobs')).json();
   document.getElementById('jobs').innerHTML=j.length?j.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
  }catch(e){}
@@ -401,7 +522,9 @@ Write-Host "LocalLLM panel -> http://127.0.0.1:$Port  (Ctrl-C to stop)"
 
 if (-not $NoWindow) {
     $browser = Find-AppBrowser
-    if ($browser) { Start-Process $browser "--app=http://127.0.0.1:$Port" }
+    # Size the window to the content. Without this the browser opens at its own last-used
+    # geometry, which is a large mostly-empty frame around a compact panel.
+    if ($browser) { Start-Process $browser @("--app=http://127.0.0.1:$Port", '--window-size=1040,720') }
     else { Start-Process "http://127.0.0.1:$Port" }
 }
 
@@ -482,6 +605,26 @@ try {
                 '^/api/settings$' {
                     $p = Read-Body $req
                     $body = (Set-Settings $p) | ConvertTo-Json -Compress
+                }
+                '^/api/versions$' {
+                    $refresh = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['refresh'] -eq '1'
+                    $body = (Get-Versions -Refresh:$refresh) | ConvertTo-Json -Depth 5 -Compress
+                }
+                '^/api/install$' {
+                    $p = Read-Body $req
+                    switch ($p.what) {
+                        'components' { Start-Job2 'install'  @('-Action', 'deploy', '-NoTray') | Out-Null }
+                        'upgrade'    { Start-Job2 'upgrade'  @('-Action', 'upgrade', '-NoTray') | Out-Null }
+                        'upgrade-latest' { Start-Job2 'upgrade' @('-Action', 'upgrade', '-Latest', '-NoTray') | Out-Null }
+                        'prism'      { Start-Job2 'prism'    @('-Action', 'install-prism') | Out-Null }
+                        default      { throw "unknown install target '$($p.what)'" }
+                    }
+                    $script:verInfo = $null      # versions will have moved
+                    $body = '{"ok":true}'
+                }
+                '^/api/delete-model$' {
+                    $p = Read-Body $req
+                    $body = (Remove-ModelFiles $p.id ([bool]$p.alsoConfig)) | ConvertTo-Json -Compress
                 }
                 default { $type = 'text/html; charset=utf-8'; $body = $html }
             }
