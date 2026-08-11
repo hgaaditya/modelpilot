@@ -63,11 +63,55 @@ param(
     # right trade: a tool this misses is silently unavailable, while a tool that doesn't exist
     # costs nothing.
     #
+    # NOTE: --tools only filters Claude Code's BUILT-IN tools. Tools contributed by plugins and
+    # MCP servers bypass it entirely - measured, a session with 12 built-ins allowed still sent 24
+    # tools, the other 14 being one plugin's MCP server. See -NoMcp below.
+    #
     # Pass -Tools '' to send everything, i.e. to check whether upstream has fixed the grammar bug.
     # See github.com/ggml-org/llama.cpp issues 25746 / 25923 / 25895.
     [string]$Tools = 'Bash,PowerShell,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,' +
                      'BashOutput,KillShell,Task,Agent,Skill,SlashCommand,TodoWrite,TaskCreate,' +
                      'TaskUpdate,TaskList,TaskGet,TaskOutput,TaskStop,AskUserQuestion,ExitPlanMode',
+
+    # Leave your MCP servers out of this session. Default ON for local models, because the cost is
+    # not small and it is invisible: measured on this machine, the first request of an identical
+    # task was 4,989 bytes with plugins off and 65,472 bytes with them on - 16,182 tokens, or
+    # ~40% of a 40960-token window consumed before you type anything. 33.8 KB of that was tool
+    # schemas, 24 tools of which 14 came from a single plugin's MCP server.
+    #
+    # That is affordable against a 200k cloud window and ruinous against a local one, which is why
+    # the default differs from what you would want on the hosted model. --strict-mcp-config with no
+    # --mcp-config means "use only the MCP servers I named", i.e. none - and unlike --bare it keeps
+    # your hooks, CLAUDE.md and plugin skills, so style plugins still work.
+    #
+    # -NoMcp:$false restores them if a session genuinely needs an MCP server.
+    [bool]$NoMcp = $true,
+
+    # Plugins to disable for local sessions only. These inject instructions into every request, so
+    # they cost window on every turn while buying behaviour a small quantised model follows less
+    # reliably than a frontier one does. Disabled here rather than in the user's own settings, so
+    # their normal cloud sessions are unaffected.
+    #
+    # Measured on this machine, same task and model, first request to the main model:
+    #
+    #   everything on                     65,472 bytes   16,182 tokens   40% of a 40960 window
+    #   MCP excluded (-NoMcp)             57,164 bytes   13,856 tokens   34%
+    #   + these plugins off               46,821 bytes   11,392 tokens   28%
+    #
+    # These plugins inject through the MESSAGES, not the system block - the system block is
+    # Claude Code's own prompt and is 6,200 characters either way. Turning them off took the
+    # message content from 25,536 to 15,063 characters, about 10.5 KB per request, re-sent every
+    # turn because the API is stateless. The best output saving observed in return was 7.6% -
+    # roughly 50 tokens on a 700-token answer. To break even a style instruction would have to cut
+    # ~2,400 tokens per turn, which means 5,000-token responses; agentic turns are nowhere near it.
+    #
+    # The same plugins are a good deal on the hosted model, which is why this default differs from
+    # what you would want there: 2,400 tokens against a 200k window is noise and the output saving
+    # is real money. Against 40960 it is 6% of the window per turn, spent in the currency you are
+    # short of - and a small quantised model follows sustained style rules less reliably anyway.
+    #
+    # Pass -NoStylePlugins @() to keep them, or name your own list.
+    [string[]]$NoStylePlugins = @('ponytail@ponytail', 'caveman@caveman'),
 
     # Resume one specific conversation by its id. Claude Code keeps every session as
     # ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, and -r/--resume takes that id, so the
@@ -136,8 +180,18 @@ function Set-LocalEnv($ctx) {
 
 function New-SessionSettings {
     $f = Join-Path $env:TEMP 'localllm-claude-settings.json'
-    @{ env = @{ CLAUDE_CODE_ATTRIBUTION_HEADER = '0' } } | ConvertTo-Json -Depth 4 |
-        Set-Content $f -Encoding utf8
+    $s = @{ env = @{ CLAUDE_CODE_ATTRIBUTION_HEADER = '0' } }
+    # Style plugins are re-sent in full on every request, because the API is stateless - they are a
+    # per-turn tax on the context window, not a one-off. Measured here, the injected style blocks
+    # were 6,200 characters. Against a 200k cloud window that is nothing; against 40960 it is real.
+    # -NoStylePlugins names the ones to switch off for local sessions only, leaving the user's own
+    # ~/.claude/settings.json untouched - the same principle as setting ANTHROPIC_BASE_URL for one
+    # process rather than the machine.
+    if ($NoStylePlugins.Count) {
+        $s.enabledPlugins = @{}
+        foreach ($p in $NoStylePlugins) { $s.enabledPlugins[$p] = $false }
+    }
+    $s | ConvertTo-Json -Depth 4 | Set-Content $f -Encoding utf8
     $f
 }
 
@@ -396,6 +450,7 @@ Write-Host ""
 if (-not $Resume) { Write-Host "Picking up an existing session in this directory? Add -Resume." ; Write-Host "" }
 
 $a = @('--settings', "`"$(New-SessionSettings)`"")
+if ($NoMcp) { $a += '--strict-mcp-config' }   # see -NoMcp: MCP tool schemas are ~40% of a local window
 # A specific session wins over "the most recent one" - if you picked it, you meant it.
 if ($SessionId) { $a += @('--resume', $SessionId) }
 elseif ($Resume) { $a += '--continue' }
