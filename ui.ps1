@@ -515,6 +515,27 @@ tick();setInterval(tick,3000);
 
 # ---------------------------------------------------------------- server
 
+# Single instance. Launching again - double-clicking the icon, or clicking it while the panel is
+# already up - should surface the existing panel, not start a second server or stack up windows.
+$alreadyUp = $false
+try { $alreadyUp = (Invoke-WebRequest "http://127.0.0.1:$Port/api/ping" -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 } catch { }
+if ($alreadyUp) {
+    Write-Host "Panel already running on $Port."
+    if (-not $NoWindow) {
+        # Focus the window that exists rather than opening another one.
+        $existing = Get-Process -Name chrome, msedge, brave -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MainWindowTitle -eq 'LocalLLM' } | Select-Object -First 1
+        if ($existing) {
+            Add-Type -Namespace Win -Name N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);' -ErrorAction SilentlyContinue
+            [void][Win.N]::SetForegroundWindow($existing.MainWindowHandle)
+        } else {
+            $b = Find-AppBrowser
+            if ($b) { Start-Process $b @("--app=http://127.0.0.1:$Port", '--window-size=1040,720') }
+        }
+    }
+    return
+}
+
 $listener = New-Object Net.HttpListener
 $listener.Prefixes.Add("http://127.0.0.1:$Port/")
 try { $listener.Start() } catch { throw "Could not bind 127.0.0.1:$Port - is the panel already running? ($($_.Exception.Message))" }
@@ -540,6 +561,10 @@ try {
         $body = ''; $type = 'application/json'
         try {
             switch -Regex ($req.Url.AbsolutePath) {
+                # Deliberately does no work: the single-instance check needs an answer that can
+                # never be slower than its timeout. /api/status shells out to nvidia-smi, queries
+                # WMI and probes two health endpoints, so it is far too slow to test liveness with.
+                '^/api/ping$'   { $body = '{"ok":true}' }
                 '^/api/status$' { $body = Get-Dashboard | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/models$' {
