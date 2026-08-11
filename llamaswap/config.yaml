@@ -9,10 +9,15 @@ macros:
   #              once a conversation exceeds -c instead of dropping the oldest tokens.
   #              Safety net only - the client should prune first (see contextLength in
   #              continue.dev / open-webui), because shifting silently drops the system prompt.
+  # -ngl is deliberately NOT set here. It used to be pinned at 99, which forces every layer onto
+  # the GPU; for a model that doesn't fit that is an impossible placement rather than a useful
+  # instruction. This build defaults to 'auto', which fits as many layers as the card holds.
+  # A model that wants a specific split sets -ngl or --n-cpu-moe in its own cmd (see -Action
+  # autotune, which measures and writes those numbers).
   llama-server: >
     "C:\LocalLLM\llama.cpp\llama-server.exe"
     --host 127.0.0.1 --port ${PORT}
-    -fa on -ngl 99
+    -fa on
     -np 1 --context-shift
 
   # PrismML's llama.cpp fork, installed by '-Action install-prism'. Use this macro instead of the
@@ -22,7 +27,7 @@ macros:
   llama-server-prism: >
     "C:\LocalLLM\llama.cpp-prism\llama-server.exe"
     --host 127.0.0.1 --port ${PORT}
-    -fa on -ngl 99
+    -fa on
     -np 1 --context-shift
 
 models:

@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -712,6 +712,118 @@ function Add-ModelToConfig($id, $ggufPath, $context) {
 }
 
 # ==========================================================================
+#  autotune: find the offload split that actually fits this machine
+# ==========================================================================
+
+# Boot llama-server with one candidate configuration and report whether it came up, what it
+# cost in VRAM, and how fast it generates. Estimating this from parameter counts is guesswork -
+# compute buffers and the KV cache move the answer around - so it is measured.
+function Test-ModelLoad {
+    param($Exe, $Gguf, [int]$Ctx, $Kv = 'q4_0', $NCpuMoe = $null, [int]$Port = 9418, [int]$TimeoutSec = 240)
+
+    $log = Join-Path $env:TEMP "autotune-$Port.log"
+    Remove-Item $log, "$log.out" -ErrorAction SilentlyContinue
+    $baseline = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "`n")[0]
+
+    $a = @('-m', $Gguf, '-c', "$Ctx", '-ctk', $Kv, '-ctv', $Kv, '-fa', 'on', '-np', '1',
+           '--host', '127.0.0.1', '--port', "$Port")
+    if ($null -ne $NCpuMoe) { $a += @('--n-cpu-moe', "$NCpuMoe") }
+
+    $p = Start-Process -FilePath $Exe -PassThru -NoNewWindow -ArgumentList $a `
+        -RedirectStandardError $log -RedirectStandardOutput "$log.out"
+
+    $ok = $false
+    for ($i = 0; $i -lt $TimeoutSec; $i++) {
+        Start-Sleep -Seconds 1
+        if ($p.HasExited) { break }
+        if (Select-String -Path $log -Pattern 'listening on' -Quiet -ErrorAction SilentlyContinue) { $ok = $true; break }
+    }
+
+    $res = @{ Ok = $false; VramMib = 0; GenTps = 0; Why = '' }
+    if ($ok) {
+        Start-Sleep -Seconds 2
+        $res.VramMib = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "`n")[0]
+        $res.FreeMib = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits) -split "`n")[0]
+        try {
+            $body = @{ model = 'x'; messages = @(@{ role = 'user'; content = 'Count to five.' }); max_tokens = 64 } | ConvertTo-Json -Depth 5
+            $r = Invoke-RestMethod "http://127.0.0.1:$Port/v1/chat/completions" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 180
+            $res.GenTps = [math]::Round($r.timings.predicted_per_second, 1)
+        } catch { }
+        $res.Ok = $true
+    } else {
+        $tail = Get-Content $log -Tail 40 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error|failed|out of memory|unable' } | Select-Object -Last 1
+        $res.Why = if ($p.HasExited) { "exited ($tail)" } else { 'timed out' }
+    }
+    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    Start-Sleep -Seconds 4          # let the driver actually release the VRAM before the next probe
+    [pscustomobject]$res
+}
+
+function Invoke-Autotune {
+    param($Gguf, [int]$Ctx = 0, $Kv = 'q4_0', [int]$MarginMib = 1200)
+
+    if (-not (Test-Path $Gguf)) { throw "No such file: $Gguf" }
+    $info = Get-GgufInfo -Path $Gguf
+    $sizeGb = (Get-Item $Gguf).Length / 1GB
+
+    # A low-bit model only loads on the fork, so probe with whichever binary can open it.
+    $exe = Join-Path $llamaCpp 'llama-server.exe'
+    if ($info.Arch -in 'qwen35' -or (Test-Path (Join-Path $llamaPrism 'llama-server.exe')) -and $info.FileType -ge 41) {
+        $prism = Join-Path $llamaPrism 'llama-server.exe'
+        if (Test-Path $prism) { $exe = $prism }
+    }
+
+    $total = [int]((nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits) -split "`n")[0]
+    Write-Host ""
+    Write-Host "model : $(Split-Path $Gguf -Leaf)  ($('{0:N1}' -f $sizeGb) GB)"
+    Write-Host "arch  : $($info.Arch), $($info.Blocks) blocks, $(if ($info.Experts -gt 0) { "MoE $($info.Experts)e/$($info.ExpertsUsed)a" } else { 'dense' })"
+    Write-Host "card  : $total MiB total, keeping $MarginMib MiB spare for the desktop"
+
+    if (-not $Ctx) {
+        $Ctx = Get-FittedContext $Gguf $Kv
+        if (-not $Ctx) { $Ctx = 16384 }
+        # llama-fit-params sizes to VRAM free at this instant, which is optimistic if a browser
+        # later wakes up. Hold some back rather than tuning to a number that OOMs tomorrow.
+        $Ctx = [int]([math]::Floor($Ctx * 0.75 / 1024) * 1024)
+        Write-Host "ctx   : $Ctx (llama-fit-params, less 25% for headroom)"
+    }
+    Write-Host ""
+
+    if ($info.Experts -le 0) {
+        # Dense: nothing to split. -ngl auto already fits what it can, so just confirm it loads.
+        Write-Host "dense model - no expert split to tune; checking it loads at -c $Ctx ..."
+        $r = Test-ModelLoad -Exe $exe -Gguf $Gguf -Ctx $Ctx -Kv $Kv
+        if (-not $r.Ok) { throw "failed to load even with -ngl auto: $($r.Why)" }
+        Write-Host ("  loaded: {0} MiB used, {1} MiB free, {2} tok/s" -f $r.VramMib, $r.FreeMib, $r.GenTps)
+        return [pscustomobject]@{ Ctx = $Ctx; NCpuMoe = $null; Kv = $Kv; VramMib = $r.VramMib; GenTps = $r.GenTps }
+    }
+
+    # MoE: --n-cpu-moe N keeps the experts of the first N layers on the CPU. More N means less
+    # VRAM and less speed, so the best setting is the SMALLEST N that still fits with headroom.
+    # Fit is monotonic in N, so binary search it instead of walking every layer.
+    $lo = 0; $hi = $info.Blocks; $best = $null
+    Write-Host "searching smallest --n-cpu-moe that fits (0..$($info.Blocks)) ..."
+    while ($lo -le $hi) {
+        $mid = [int](($lo + $hi) / 2)
+        Write-Host ("  trying --n-cpu-moe {0,-3} ... " -f $mid) -NoNewline
+        $r = Test-ModelLoad -Exe $exe -Gguf $Gguf -Ctx $Ctx -Kv $Kv -NCpuMoe $mid
+        if ($r.Ok -and $r.FreeMib -ge $MarginMib) {
+            Write-Host ("ok  {0} MiB used, {1} MiB free, {2} tok/s" -f $r.VramMib, $r.FreeMib, $r.GenTps)
+            $best = [pscustomobject]@{ Ctx = $Ctx; NCpuMoe = $mid; Kv = $Kv; VramMib = $r.VramMib; FreeMib = $r.FreeMib; GenTps = $r.GenTps }
+            $hi = $mid - 1          # fits: try offloading fewer layers, which is faster
+        } elseif ($r.Ok) {
+            Write-Host ("tight ({0} MiB free < {1}) - treating as no fit" -f $r.FreeMib, $MarginMib)
+            $lo = $mid + 1
+        } else {
+            Write-Host "no  ($($r.Why))"
+            $lo = $mid + 1
+        }
+    }
+    if (-not $best) { throw "no --n-cpu-moe value fits this card at -c $Ctx. Try a smaller quant or a smaller -Context." }
+    $best
+}
+
+# ==========================================================================
 #  main
 # ==========================================================================
 
@@ -798,6 +910,51 @@ if ($Action -eq 'restart') {
     if (-not $webui) { throw "Nothing deployed - run '.\start.ps1' with no arguments first." }
     Stop-Stack $Component
     Start-Stack $webui $Component
+    return
+}
+
+if ($Action -eq 'autotune') {
+    # Accepts a model id already in config.yaml, or a path/filename under models\.
+    $gguf = $null
+    if ($Model) {
+        $gguf = if (Test-Path $Model) { (Resolve-Path $Model).Path } else { Join-Path $modelsDir $Model }
+    } elseif ($Id) {
+        $text = Get-Content $swapConfig -Raw
+        $parts = [regex]::Split($text, '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
+        for ($i = 1; $i -lt $parts.Count; $i += 2) {
+            if ($parts[$i] -eq $Id) {
+                $m = [regex]::Match($parts[$i + 1], '-m\s+"?([^"\r\n]+?\.gguf)"?')
+                if ($m.Success) { $gguf = $m.Groups[1].Value.Trim() }
+            }
+        }
+        if (-not $gguf) { throw "No model '$Id' in $swapConfig." }
+    } else {
+        throw "-Action autotune needs -Id <config model id> or -Model <path to .gguf>."
+    }
+    if (-not (Test-Path $gguf)) { throw "Weights not found: $gguf" }
+
+    if (Test-ComponentRunning 'swap') {
+        Write-Warning "llama-swap is running and may hold VRAM. Stop it first for accurate numbers: -Action stop -Component swap"
+    }
+
+    # -Context carries a default for add-model, so its mere presence says nothing. Only an
+    # explicitly passed value should pin the context; otherwise autotune computes one.
+    $ctxArg = if ($PSBoundParameters.ContainsKey('Context')) { $Context } else { 0 }
+    $best = Invoke-Autotune -Gguf $gguf -Ctx $ctxArg -Kv $(if ($PSBoundParameters.ContainsKey('Quant')) { $Quant } else { 'q4_0' })
+
+    $id = if ($Id) { $Id } else { [IO.Path]::GetFileNameWithoutExtension($gguf).ToLower() }
+    $moeLine = if ($null -ne $best.NCpuMoe) { "`n      --n-cpu-moe $($best.NCpuMoe)" } else { '' }
+    Write-Host ""
+    Write-Host "tuned: -c $($best.Ctx) -ctk $($best.Kv) -ctv $($best.Kv)$(if ($null -ne $best.NCpuMoe) { " --n-cpu-moe $($best.NCpuMoe)" })  ->  $($best.GenTps) tok/s, $($best.VramMib) MiB used"
+    Write-Host ""
+    Write-Host "config.yaml entry:"
+    Write-Host ""
+    Write-Host "  `"$id`":"
+    Write-Host "    cmd: >"
+    Write-Host "      `${llama-server}"
+    Write-Host "      -m `"$gguf`""
+    Write-Host "      -c $($best.Ctx) -ctk $($best.Kv) -ctv $($best.Kv)$moeLine"
+    Write-Host "    ttl: 600"
     return
 }
 
