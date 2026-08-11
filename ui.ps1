@@ -378,27 +378,17 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 </div>
 
 <div class="pane" id="p1">
- <fieldset><legend>llama.cpp (stock)</legend><div class="kv" id="e1"></div></fieldset>
- <fieldset><legend>llama.cpp (PrismML fork - low-bit kernels)</legend><div class="kv" id="e2"></div></fieldset>
- <fieldset><legend>llama-swap (router)</legend><div class="kv" id="e3"></div>
-  <div class="row" style="margin-top:8px">
-   <button class="gh" onclick="act('restart','swap')">Restart router</button>
-   <button class="gh" onclick="act('stop','swap')">Stop router</button>
-   <button class="gh" onclick="unloadAll()">Unload models</button>
-  </div>
-  <div class="hint" style="margin:8px 0 0">llama-server is not started directly - llama-swap spawns one per model on demand and stops it after the model's idle timeout.</div>
- </fieldset>
- <fieldset><legend>Running llama-server processes</legend><table><thead><tr><th>PID</th><th>Memory</th></tr></thead><tbody id="e4"></tbody></table></fieldset>
- <fieldset><legend>Install &amp; upgrade</legend>
-  <table><thead><tr><th>Component</th><th>Installed</th><th>Pinned</th><th>Latest upstream</th></tr></thead><tbody id="ver"></tbody></table>
-  <div class="row" style="margin-top:7px">
-   <button class="gh" onclick="chk()">Check for updates</button>
-   <button class="gh" onclick="inst('components')">Install / repair</button>
-   <button class="gh" onclick="inst('upgrade')">Upgrade to pinned</button>
-   <button class="gh" onclick="inst('upgrade-latest')">Upgrade to latest</button>
-   <button class="gh" onclick="inst('prism')">Install PrismML fork</button>
-  </div>
-  <div class="hint" style="margin:7px 0 0">Install / repair fetches anything missing and leaves what is already correct alone. Upgrades stop the stack, replace only components whose version changed, and never touch model weights or config.yaml.</div>
+ <div class="row" style="margin-bottom:9px">
+  <button class="gh" onclick="chk()">Check for updates</button>
+  <button class="gh" onclick="inst('components')">Install / repair all</button>
+  <button class="gh" onclick="inst('upgrade')">Upgrade to pinned</button>
+  <button class="gh" onclick="inst('upgrade-latest')">Upgrade to latest</button>
+  <span id="vchk" style="color:var(--dim);font-size:11px"></span>
+ </div>
+ <div id="comps"></div>
+ <fieldset><legend>Running llama-server processes</legend>
+  <table><thead><tr><th>PID</th><th>Memory</th></tr></thead><tbody id="e4"></tbody></table>
+  <div class="hint" style="margin:7px 0 0">llama-server is not started directly - llama-swap spawns one per model on demand and stops it after the model's idle timeout.</div>
  </fieldset>
 </div>
 
@@ -430,7 +420,7 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 </div>
 </main>
 <script>
-let S={},E={},M={};
+let S={},E={},M={},VER={};
 function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on')}
 async function post(u,o){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})})}
@@ -458,15 +448,10 @@ async function inst(what){
  await post('/api/install',{what});setTimeout(tick,900);
 }
 async function chk(){
- document.getElementById('ver').innerHTML='<tr><td colspan=4 style="color:var(--dim)">querying GitHub and nodejs.org...</td></tr>';
- try{const v=await (await fetch('/api/versions?refresh=1')).json();renderVer(v)}catch(e){}
-}
-function renderVer(v){
- if(!v||!v.rows)return;
- document.getElementById('ver').innerHTML=v.rows.map(r=>{
-  const behind=r.latest&&r.latest!==r.installed;
-  return `<tr><td>${r.component}</td><td>${r.installed}</td><td>${r.pinned}</td>
-   <td>${r.latest?(behind?'<span class="miss">'+r.latest+'</span>':'<span class="on2">'+r.latest+'</span>'):'<span style="color:var(--dim)">not checked</span>'}</td></tr>`}).join('');
+ document.getElementById('vchk').textContent='querying GitHub and nodejs.org...';
+ try{VER=await (await fetch('/api/versions?refresh=1')).json();
+  document.getElementById('vchk').textContent='checked '+VER.checked;tick()}
+ catch(e){document.getElementById('vchk').textContent='check failed'}
 }
 // Deleting weights is multi-GB and irreversible, so it asks twice: once for the files, then
 // separately about the config entry, which is a different decision.
@@ -515,9 +500,35 @@ async function tick(){
 
  try{E=await (await fetch('/api/engine')).json()}catch(e){}
  if(E.llamacpp){
-  document.getElementById('e1').innerHTML=`<span>Status</span><div>${E.llamacpp.installed?'<span class="on2">installed</span>':'<span class="miss">not installed</span>'}</div><span>Build</span><div>${E.llamacpp.version||'-'}</div><span>Path</span><div style="color:var(--dim)">${E.llamacpp.path}</div>`;
-  document.getElementById('e2').innerHTML=`<span>Status</span><div>${E.prism.installed?'<span class="on2">installed</span>':'<span class="tag">not installed</span>'}</div><span>Build</span><div>${E.prism.version||'-'}</div><span>Path</span><div style="color:var(--dim)">${E.prism.path}</div>`;
-  document.getElementById('e3').innerHTML=`<span>Status</span><div>${E.swap.up?'<span class="on2">running</span>':'<span class="miss">stopped</span>'}</div><span>Processes</span><div>${E.swap.procs.map(p=>'pid '+p.pid+' ('+p.mb+' MB)').join(', ')||'-'}</div>`;
+  // One panel per component, with its own versions and its own actions - the version table that
+  // used to sit at the bottom repeated the Build line already shown here.
+  const V=(VER.rows||[]).reduce((a,r)=>(a[r.component]=r,a),{});
+  const verLine=k=>{const r=V[k];if(!r)return '';
+   const behind=r.latest&&r.latest!==r.installed;
+   return `<span>Pinned</span><div>${r.pinned}</div><span>Latest upstream</span><div>${r.latest?(behind?'<span class="miss">'+r.latest+' available</span>':'<span class="on2">'+r.latest+' (current)</span>'):'<span style="color:var(--dim)">not checked</span>'}</div>`};
+  const panel=(title,body,btns)=>`<fieldset><legend>${title}</legend><div class="kv">${body}</div>${btns?`<div class="row" style="margin-top:7px">${btns}</div>`:''}</fieldset>`;
+  let h='';
+  h+=panel('llama.cpp (stock) - inference engine',
+    `<span>Status</span><div>${E.llamacpp.installed?'<span class="on2">installed</span>':'<span class="miss">not installed</span>'}</div>
+     <span>Build</span><div>${E.llamacpp.version||'-'}</div>${verLine('llamaCpp')}
+     <span>Path</span><div style="color:var(--dim)">${E.llamacpp.path}</div>`,
+    E.llamacpp.installed?'':'<button class="gh" onclick="inst(\'components\')">Install</button>');
+  h+=panel('llama.cpp (PrismML fork) - low-bit kernels',
+    `<span>Status</span><div>${E.prism.installed?'<span class="on2">installed</span>':'<span class="tag">not installed</span>'}</div>
+     <span>Build</span><div>${E.prism.version||'-'}</div>${verLine('prism fork')}
+     <span>Path</span><div style="color:var(--dim)">${E.prism.path}</div>`,
+    `<button class="gh" onclick="inst('prism')">${E.prism.installed?'Reinstall / update':'Install'}</button>`);
+  h+=panel('llama-swap - model router',
+    `<span>Status</span><div>${E.swap.up?'<span class="on2">running</span>':'<span class="miss">stopped</span>'}</div>
+     <span>Processes</span><div>${E.swap.procs.map(p=>'pid '+p.pid+' ('+p.mb+' MB)').join(', ')||'-'}</div>${verLine('llamaSwap')}`,
+    `<button class="gh" onclick="act('restart','swap')">Restart</button>
+     <button class="gh" onclick="act('stop','swap')">Stop</button>
+     <button class="gh" onclick="unloadAll()">Unload models</button>`);
+  h+=panel('open-webui - chat interface',
+    `<span>Status</span><div>${E.webui.up?'<span class="on2">running</span>':'<span class="miss">stopped</span>'}</div>${verLine('openWebUI')}${verLine('node')?'':''}`,
+    `<button class="gh" onclick="act('restart','webui')">Restart</button>
+     <button class="gh" onclick="act('stop','webui')">Stop</button>`);
+  document.getElementById('comps').innerHTML=h;
   document.getElementById('e4').innerHTML=E.servers.length?E.servers.map(s=>`<tr><td>${s.pid}</td><td>${s.mb} MB</td></tr>`).join(''):'<tr><td colspan=2 style="color:var(--dim)">none - no model loaded</td></tr>';
  }
  try{M=await (await fetch('/api/models')).json()}catch(e){}
@@ -532,7 +543,7 @@ async function tick(){
   document.getElementById('orph').innerHTML=M.orphans.length?M.orphans.map(o=>`<tr><td>${o.file}</td><td>${o.sizeGb} GB</td><td style="color:var(--dim)">downloaded, not in config.yaml</td></tr>`).join(''):'<tr><td style="color:var(--dim)">none</td></tr>';
  }
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
- if(!document.getElementById('ver').innerHTML){try{renderVer(await (await fetch('/api/versions')).json())}catch(e){}}
+ if(!VER.rows){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
  try{const j=await (await fetch('/api/jobs')).json();
   document.getElementById('jobs').innerHTML=j.length?j.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
  }catch(e){}
