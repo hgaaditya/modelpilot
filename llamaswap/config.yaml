@@ -77,8 +77,8 @@ models:
   "qwen3-14b":
     cmd: >
       ${llama-server}
-      -m "C:\LocalLLM\llama.cpp\models\Qwen3-14B-Q4_K_M.gguf"
-      -c 20480 -ctk q4_0 -ctv q4_0
+      -m "C:\LocalLLM\llama.cpp\models\Qwen3-14B-Q4_K_M.gguf"
+      -c 16384 -ctk q4_0 -ctv q4_0
     ttl: 600          # unload after 10 min idle
 
   "qwen3-8b-longctx":
@@ -109,6 +109,19 @@ models:
       ${llama-server-prism}
       -m "C:\LocalLLM\llama.cpp\models\Ternary-Bonsai-27B-Q2_0.gguf"
       -c 65536 -ctk q4_0 -ctv q4_0
+    ttl: 600
+
+  # gpt-oss 20B: MoE, 32 experts with 4 active per token, so it generates like a much smaller
+  # model - 78.9 tok/s here, the fastest thing on this box - while holding 20B of weights.
+  # --n-cpu-moe 3 is measured, not guessed (-Action autotune): it is the smallest number of
+  # layers whose experts can sit on the CPU while still leaving ~1.2 GB of VRAM spare. The
+  # setting matters enormously - 12 gives 33 tok/s, 6 gives 52, 3 gives 79, and 2 will not load.
+  "gpt-oss-20b":
+    cmd: >
+      ${llama-server}
+      -m "C:\LocalLLM\llama.cpp\models\gpt-oss-20b-Q5_K_M.gguf"
+      -c 16384 -ctk q4_0 -ctv q4_0
+      --n-cpu-moe 3
     ttl: 600
 
   "qwen2.5-0.5b-instruct-q4_k_m":

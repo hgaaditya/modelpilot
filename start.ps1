@@ -68,6 +68,9 @@ param(
     # add-model: download only, don't touch llamaswap\config.yaml.
     [switch]$NoConfig,
 
+    # autotune: write the measured settings straight into config.yaml instead of printing them.
+    [switch]$Apply,
+
     # uninstall: also delete the multi-GB .gguf weights (kept by default - they're slow to re-fetch).
     [switch]$IncludeModels,
 
@@ -687,6 +690,26 @@ function Get-FittedContext($ggufPath, $kvType = 'q4_0') {
 
 # Appends a model entry to config.yaml, matching the style already in the file. The file is
 # hand-maintained and git-tracked, so it gets a .bak first and is never rewritten wholesale.
+# Replace the cmd flags of an existing entry in place, leaving its id, macro, model path, ttl and
+# every other entry untouched. Only the tuning flags are rewritten, so hand-written comments and
+# per-model options elsewhere in the file survive.
+function Set-ModelTuning($id, $ctx, $kv, $nCpuMoe) {
+    if (-not (Test-Path $swapConfig)) { throw "$swapConfig not found." }
+    $text = Get-Content $swapConfig -Raw
+    $pattern = "(?ms)(^\s{2,}""$([regex]::Escape($id))""\s*:\s*$.*?-m\s+""[^""]+""\s*$)(.*?)(?=^\s*ttl:|^\s{2}""|\z)"
+    $m = [regex]::Match($text, $pattern)
+    if (-not $m.Success) { return $false }
+
+    $flags = "`r`n      -c $ctx -ctk $kv -ctv $kv"
+    if ($null -ne $nCpuMoe) { $flags += "`r`n      --n-cpu-moe $nCpuMoe" }
+    $flags += "`r`n"
+
+    Copy-Item $swapConfig "$swapConfig.bak" -Force
+    $updated = $text.Remove($m.Groups[2].Index, $m.Groups[2].Length).Insert($m.Groups[2].Index, $flags)
+    Set-Content -Path $swapConfig -Value $updated -Encoding utf8 -NoNewline
+    $true
+}
+
 function Add-ModelToConfig($id, $ggufPath, $context) {
     if (-not (Test-Path $swapConfig)) { Write-Warning "$swapConfig not found - skipping registration."; return $false }
     $text = Get-Content $swapConfig -Raw
@@ -779,24 +802,34 @@ function Invoke-Autotune {
     Write-Host "arch  : $($info.Arch), $($info.Blocks) blocks, $(if ($info.Experts -gt 0) { "MoE $($info.Experts)e/$($info.ExpertsUsed)a" } else { 'dense' })"
     Write-Host "card  : $total MiB total, keeping $MarginMib MiB spare for the desktop"
 
-    if (-not $Ctx) {
-        $Ctx = Get-FittedContext $Gguf $Kv
-        if (-not $Ctx) { $Ctx = 16384 }
-        # llama-fit-params sizes to VRAM free at this instant, which is optimistic if a browser
-        # later wakes up. Hold some back rather than tuning to a number that OOMs tomorrow.
-        $Ctx = [int]([math]::Floor($Ctx * 0.75 / 1024) * 1024)
-        Write-Host "ctx   : $Ctx (llama-fit-params, less 25% for headroom)"
+    # Context candidates, largest first. llama-fit-params sizes to VRAM free at the instant it
+    # runs, so its answer can be optimistic; rather than discounting it by a made-up factor, try
+    # it and step down only if the measured headroom is short. An earlier version cut a blanket
+    # 25% and turned a hand-measured 20480 into 12288 for no reason a measurement supported.
+    $ctxLadder = if ($Ctx) { @($Ctx) } else {
+        $fit = Get-FittedContext $Gguf $Kv
+        if (-not $fit) { $fit = 16384 }
+        Write-Host "ctx   : llama-fit-params suggests $fit; trying that first, stepping down if headroom is short"
+        @(1.0, 0.75, 0.5, 0.35) | ForEach-Object { [int]([math]::Floor($fit * $_ / 1024) * 1024) } |
+            Where-Object { $_ -ge 2048 } | Select-Object -Unique
     }
     Write-Host ""
 
     if ($info.Experts -le 0) {
-        # Dense: nothing to split. -ngl auto already fits what it can, so just confirm it loads.
-        Write-Host "dense model - no expert split to tune; checking it loads at -c $Ctx ..."
-        $r = Test-ModelLoad -Exe $exe -Gguf $Gguf -Ctx $Ctx -Kv $Kv
-        if (-not $r.Ok) { throw "failed to load even with -ngl auto: $($r.Why)" }
-        Write-Host ("  loaded: {0} MiB used, {1} MiB free, {2} tok/s" -f $r.VramMib, $r.FreeMib, $r.GenTps)
-        return [pscustomobject]@{ Ctx = $Ctx; NCpuMoe = $null; Kv = $Kv; VramMib = $r.VramMib; GenTps = $r.GenTps }
+        # Dense: nothing to split, so the only question is how much context fits.
+        Write-Host "dense model - no expert split to tune; finding the largest context that fits ..."
+        foreach ($c in $ctxLadder) {
+            Write-Host ("  trying -c {0,-7} ... " -f $c) -NoNewline
+            $r = Test-ModelLoad -Exe $exe -Gguf $Gguf -Ctx $c -Kv $Kv
+            if ($r.Ok -and $r.FreeMib -ge $MarginMib) {
+                Write-Host ("ok  {0} MiB used, {1} MiB free, {2} tok/s" -f $r.VramMib, $r.FreeMib, $r.GenTps)
+                return [pscustomobject]@{ Ctx = $c; NCpuMoe = $null; Kv = $Kv; VramMib = $r.VramMib; FreeMib = $r.FreeMib; GenTps = $r.GenTps }
+            }
+            Write-Host $(if ($r.Ok) { "tight ({0} MiB free < {1})" -f $r.FreeMib, $MarginMib } else { "no ($($r.Why))" })
+        }
+        throw "no context in the ladder fits with $MarginMib MiB spare. Pass -Context explicitly, or use a smaller quant."
     }
+    $Ctx = $ctxLadder[0]
 
     # MoE: --n-cpu-moe N keeps the experts of the first N layers on the CPU. More N means less
     # VRAM and less speed, so the best setting is the SMALLEST N that still fits with headroom.
@@ -946,15 +979,28 @@ if ($Action -eq 'autotune') {
     $moeLine = if ($null -ne $best.NCpuMoe) { "`n      --n-cpu-moe $($best.NCpuMoe)" } else { '' }
     Write-Host ""
     Write-Host "tuned: -c $($best.Ctx) -ctk $($best.Kv) -ctv $($best.Kv)$(if ($null -ne $best.NCpuMoe) { " --n-cpu-moe $($best.NCpuMoe)" })  ->  $($best.GenTps) tok/s, $($best.VramMib) MiB used"
-    Write-Host ""
-    Write-Host "config.yaml entry:"
-    Write-Host ""
-    Write-Host "  `"$id`":"
-    Write-Host "    cmd: >"
-    Write-Host "      `${llama-server}"
-    Write-Host "      -m `"$gguf`""
-    Write-Host "      -c $($best.Ctx) -ctk $($best.Kv) -ctv $($best.Kv)$moeLine"
-    Write-Host "    ttl: 600"
+    if ($Apply) {
+        if (Set-ModelTuning $id $best.Ctx $best.Kv $best.NCpuMoe) {
+            Write-Host "written to $swapConfig (previous kept as config.yaml.bak)."
+            Write-Host "Run '.\start.ps1 -Action restart -Component swap' to pick it up."
+        } else {
+            # No entry to rewrite - autotune doesn't invent one, since it can't know which macro
+            # the model needs (a low-bit model has to use llama-server-prism).
+            Write-Warning "No entry called '$id' in config.yaml, so there was nothing to update. Add it with the block below, then re-run with -Apply."
+            $Apply = $false
+        }
+    }
+    if (-not $Apply) {
+        Write-Host ""
+        Write-Host "config.yaml entry (or re-run with -Apply to write it):"
+        Write-Host ""
+        Write-Host "  `"$id`":"
+        Write-Host "    cmd: >"
+        Write-Host "      `${llama-server}"
+        Write-Host "      -m `"$gguf`""
+        Write-Host "      -c $($best.Ctx) -ctk $($best.Kv) -ctv $($best.Kv)$moeLine"
+        Write-Host "    ttl: 600"
+    }
     return
 }
 
