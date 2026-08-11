@@ -183,9 +183,23 @@ def run_one(base, model, task, timeout):
 
     raw = resp["choices"][0]["message"]["content"] or ""
     text = strip_reasoning(raw)
+    t = resp.get("timings") or {}
+    used = (resp.get("usage") or {}).get("completion_tokens", 0)
+    budget = task.get("max_tokens", 512)
+
+    # A reasoning model that spends its whole budget inside <think> leaves nothing behind once
+    # the reasoning is stripped. That is the harness cutting it off mid-thought, not a wrong
+    # answer, and scoring it as failure measures the token budget rather than the model. Every
+    # bonsai-27b and qwen3-14b "failure" in the first full run was exactly this.
+    if not text.strip() and used >= budget:
+        return {"skipped": True, "ok": False,
+                "note": "ran out of tokens while reasoning (raise max_tokens)",
+                "gen_tps": round(t.get("predicted_per_second", 0), 1),
+                "prompt_tps": round(t.get("prompt_per_second", 0), 1),
+                "completion_tokens": used, "empty": True}
+
     ok, note = GRADERS[task["type"] if task["type"] in GRADERS else "contains"](task, text)
 
-    t = resp.get("timings") or {}
     return {
         "ok": ok, "note": note, "wall_s": round(wall, 2),
         # Keep what a failing model actually said: a red cell you can't inspect tells you
