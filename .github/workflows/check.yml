@@ -55,11 +55,10 @@ jobs:
       # output IS the interface) and intentionally has functions that change state without
       # ShouldProcess, so those rules would be noise rather than signal.
       #
-      # It starts advisory because the analyzer has never been run against this code - shipping a
-      # gate whose baseline is unknown means the first push goes red for reasons nobody has read.
-      # Once the first run shows what it actually finds, fix those and drop continue-on-error.
+      # The first run established the baseline: 36 findings, none of them at Error severity. So
+      # this is a real gate now - a new Error fails the build, while the existing warnings are
+      # printed for whoever wants to work through them.
       - name: Lint
-        continue-on-error: true
         shell: powershell
         run: |
           $skip = @(
