@@ -262,6 +262,8 @@ function Get-Dashboard {
     try { $loaded = ((Invoke-RestMethod "http://127.0.0.1:$swapPort/running" -TimeoutSec 2).running |
                      Where-Object { $_.state -ne 'stopped' } | Select-Object -First 1).model } catch { }
     Update-Usage $loaded
+    # Cached for Get-Sensors, which is polled every second and must not add a second HTTP probe.
+    $script:lastLoaded = $loaded
     $cfg = Get-Settings
     $os = Get-CimInstance Win32_OperatingSystem
     @{
@@ -284,6 +286,58 @@ function Get-Dashboard {
         ramUsed = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
         ramTot  = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
     }
+}
+
+# One nvidia-smi call plus one WMI read, flattened into GPU-Z's sensor shape: a name, a number
+# and a unit. Min/max/avg are accumulated in the page rather than here - the server would have to
+# hold per-session history for a window that can be closed and reopened, and the browser already
+# has the samples.
+#
+# ponytail: this is polled once a second while the Monitoring tab is open, on a single-threaded
+# listener. nvidia-smi is a process spawn (~70ms) and Win32_Processor another ~40ms, so the tab
+# costs roughly a tenth of a second per second. If that ever crowds out the other endpoints, the
+# fix is to sample on a timer into a variable rather than to poll faster.
+function Get-Sensors {
+    $out = [Collections.ArrayList]@()
+    # nvidia-smi prints [N/A] for anything the card or driver doesn't report - a fan curve on a
+    # passively cooled card, power draw on some laptop parts. Those stay null rather than becoming
+    # zero, which would be averaged in and read as a real measurement.
+    $n = @{}
+    try {
+        $f = 'clocks.current.graphics,clocks.current.memory,temperature.gpu,fan.speed,' +
+             'utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,' +
+             'pcie.link.gen.current,pcie.link.width.current'
+        $q = (nvidia-smi "--query-gpu=$f" --format=csv,noheader,nounits) -split ','
+        for ($i = 0; $i -lt $q.Count; $i++) {
+            $s = $q[$i].Trim()
+            $n[$i] = if ($s -match '^-?[\d.]+$') { [double]$s } else { $null }
+        }
+    } catch { }
+    if ($n.Count) {
+        $free = if ($null -ne $n[7] -and $null -ne $n[6]) { $n[7] - $n[6] } else { $null }
+        foreach ($row in @(
+            @('GPU Core Clock', $n[0], 'MHz'), @('GPU Memory Clock', $n[1], 'MHz'),
+            @('GPU Temperature', $n[2], 'C'),  @('GPU Fan Speed', $n[3], '%'),
+            @('GPU Load', $n[4], '%'),         @('Memory Controller Load', $n[5], '%'),
+            @('GPU Memory Used', $n[6], 'MB'), @('GPU Memory Free', $free, 'MB'),
+            @('Board Power Draw', $n[8], 'W'), @('Power Limit', $n[9], 'W'),
+            @('PCIe Link Gen', $n[10], ''),    @('PCIe Link Width', $n[11], 'x'))) {
+            [void]$out.Add(@{ name = $row[0]; value = $row[1]; unit = $row[2] })
+        }
+    }
+    try {
+        $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        [void]$out.Add(@{ name = 'CPU Load'; value = [math]::Round($cpu, 0); unit = '%' })
+        $os = Get-CimInstance Win32_OperatingSystem
+        [void]$out.Add(@{ name = 'System RAM Used'
+                          value = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1KB, 0); unit = 'MB' })
+    } catch { }
+    # The inference process itself, which is the number that explains the rest of the table.
+    $srv = @(Get-Process -Name llama-server -ErrorAction SilentlyContinue)
+    [void]$out.Add(@{ name = 'llama-server Processes'; value = $srv.Count; unit = '' })
+    [void]$out.Add(@{ name = 'llama-server Memory'
+                      value = [int](($srv | Measure-Object -Property WorkingSet64 -Sum).Sum / 1MB); unit = 'MB' })
+    @{ sensors = @($out); loaded = $script:lastLoaded }
 }
 
 function Get-Engine {
@@ -310,7 +364,11 @@ function Start-Job2($name, $argList) {
     $id = "{0}-{1}" -f $name, (Get-Date -Format 'HHmmss')
     $log = Join-Path $jobDir "$id.log"
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $argList
-    Start-Process powershell -WindowStyle Hidden -ArgumentList $a -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    $p = Start-Process powershell -WindowStyle Hidden -ArgumentList $a -PassThru `
+             -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    # The pid is what makes "is this still running" answerable. Without it the page can only see
+    # that a log file exists, which is true forever, so a button could never stop spinning.
+    Set-Content -Path (Join-Path $jobDir "$id.pid") -Value $p.Id -Encoding ascii
     $id
 }
 
@@ -369,7 +427,16 @@ function Get-Jobs {
                 $etail = (Get-Content $err -Tail 3 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() }) -join "`n"
                 if ($etail) { $tail = "$tail`n$etail" }
             }
-            @{ id = $_.BaseName; age = [int]((Get-Date) - $_.LastWriteTime).TotalSeconds; tail = $tail }
+            # name is the job id minus its -HHmmss stamp, and is what a button matches itself
+            # against to know it is the thing currently running.
+            $pidFile = Join-Path $jobDir "$($_.BaseName).pid"
+            $running = $false
+            if (Test-Path $pidFile) {
+                $jobPid = (Get-Content $pidFile -Raw).Trim()
+                $running = [bool](Get-Process -Id $jobPid -ErrorAction SilentlyContinue)
+            }
+            @{ id = $_.BaseName; name = ($_.BaseName -replace '-\d{6}$', '')
+               age = [int]((Get-Date) - $_.LastWriteTime).TotalSeconds; tail = $tail; running = $running }
         }
 }
 
@@ -383,7 +450,7 @@ $html = @'
 body{margin:0;background:var(--bg);color:var(--fg);font:12.5px/1.4 "Segoe UI",system-ui,sans-serif;user-select:none}
 header{display:flex;align-items:center;gap:9px;padding:7px 11px;background:var(--panel);border-bottom:1px solid var(--line)}
 header b{font-size:13px;font-weight:600}
-.dot{width:9px;height:9px;border-radius:50%}.up{background:var(--ok)}.down{background:var(--bad)}.part{background:var(--warn)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%}.up{background:var(--ok)}.down{background:var(--bad)}.part{background:var(--warn)}
 nav{display:flex;background:var(--soft);padding:0 8px;border-bottom:1px solid var(--line)}
 nav button{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:6px 15px;font-size:12px;cursor:pointer}
 nav button.on{color:var(--acc);border-bottom-color:var(--acc);background:var(--panel);font-weight:600}
@@ -402,6 +469,15 @@ button.gh{background:var(--soft);color:var(--fg);border:1px solid var(--line);bo
 button.gh:hover{background:#e3e8ef}
 button.dz{background:#fff;color:var(--bad);border:1px solid #e4b7b2;border-radius:3px;padding:3px 9px;font-size:11.5px;cursor:pointer}
 button:disabled{opacity:.4;cursor:default}
+/* A click that starts a background job has no other visible effect for up to three seconds -
+   the next poll - so the button says so itself. The label stays readable; only a spinner is
+   added, because a button whose text vanishes reads as broken rather than busy. */
+@keyframes spin{to{transform:rotate(360deg)}}
+button.busy{cursor:progress;opacity:1}
+button.busy::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:-1px;
+ border:2px solid var(--dim);border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite}
+button.act.busy::before{border-color:#fff;border-top-color:transparent}
+button.busy:disabled{opacity:.85}
 input,select{background:#fff;border:1px solid var(--line);color:var(--fg);border-radius:3px;padding:3px 6px;font-size:12px;user-select:text}
 input{width:100%}
 .bar{height:5px;background:#e2e6ec;border-radius:3px;overflow:hidden;margin-top:3px}
@@ -412,17 +488,27 @@ input{width:100%}
 .row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 pre{background:#f7f8fa;border:1px solid var(--line);border-radius:3px;padding:6px;font-size:11px;margin:5px 0 0;white-space:pre-wrap;max-height:100px;overflow:auto;user-select:text;color:#3a4250}
 code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
+/* Sensor readout, laid out the way GPU-Z does it: name on the left, four numeric columns
+   right-aligned in a tabular font so the digits line up and a changing value doesn't reflow
+   the column. Rows are banded because there are twenty of them and no other structure. */
+table.sens td,table.sens th{padding:2px 8px}
+table.sens td:not(:first-child),table.sens th:not(:first-child){text-align:right;
+ font-variant-numeric:tabular-nums;font-feature-settings:"tnum";width:15%}
+table.sens tbody tr:nth-child(odd){background:var(--soft)}
+table.sens td:first-child{color:var(--dim)}
+table.sens td.now{font-weight:600;color:var(--fg)}
 </style></head><body>
 <header><span id="d" class="dot down"></span><b>LocalLLM</b><span id="sub" style="color:var(--dim);font-size:11px"></span>
 <span style="flex:1"></span>
-<button class="gh" onclick="act('restart')">Restart</button>
-<button class="gh" onclick="act('stop')">Stop</button>
+<button class="gh" id="hre" onclick="act('restart')">Restart</button>
+<button class="gh" id="hst" onclick="act('stop')">Stop</button>
 <button class="act" id="go" onclick="act('deploy')">Start</button></header>
 <nav>
 <button class="on" onclick="tab(0,this)">Dashboard</button>
 <button onclick="tab(1,this)">Engine</button>
 <button onclick="tab(2,this)">Models</button>
-<button onclick="tab(3,this)">Settings</button>
+<button onclick="tab(3,this)">Monitoring</button>
+<button onclick="tab(4,this)">Settings</button>
 </nav>
 <main>
 <div id="guide"></div>
@@ -467,6 +553,18 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 </div>
 
 <div class="pane" id="p3">
+ <fieldset><legend>Sensors</legend>
+  <div class="row" style="margin-bottom:6px">
+   <button class="gh" onclick="monReset()">Reset min/max</button>
+   <span id="monmeta" style="color:var(--dim);font-size:11px"></span>
+  </div>
+  <table class="sens"><thead><tr><th>Sensor</th><th>Current</th><th>Minimum</th><th>Maximum</th><th>Average</th></tr></thead>
+   <tbody id="sens"><tr><td colspan="5" style="color:var(--dim)">waiting for the first sample...</td></tr></tbody></table>
+  <div class="hint" style="margin:7px 0 0">Sampled once a second while this tab is open, and not at all while it isn't. Min/max/average cover the samples since this window opened or since the last reset - they are not a lifetime record.</div>
+ </fieldset>
+</div>
+
+<div class="pane" id="p4">
  <fieldset><legend>Storage</legend>
   <div class="row"><input id="mdir" style="flex:1"><button class="gh" onclick="saveDir()">Save</button></div>
   <div class="hint" style="margin-top:8px">Where new downloads are written. Existing entries in config.yaml keep their own paths.</div>
@@ -480,14 +578,69 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
 </div>
 </main>
 <script>
-let S={},E={},M={},VER={};
+let S={},E={},M={},VER={},JOBS=[];
+// Every button here starts a detached job and returns immediately, so for up to one poll
+// interval a click had no visible effect whatsoever - which reads as the click not registering.
+// Busy state comes from two places: the server's job list, which is the truth and survives a
+// reload, and an optimistic local mark that covers the gap before the next poll sees the job.
+// A mark records when it was made as well as when to give up, because "has this job finished"
+// can only be answered against the click that started it - a log left over from the same action
+// ten minutes ago would otherwise clear a mark made a moment ago.
+let PEND={};
+function mark(k,ms){PEND[k]={t:Date.now(),d:Date.now()+(ms||10000)}}
+function busy(k){
+ if(JOBS.some(j=>j.running&&j.name===k))return true;
+ const p=PEND[k];
+ if(p&&Date.now()<p.d)return true;
+ delete PEND[k];return false;
+}
+// Called from the click handler, before the fetch. window.event is deprecated in general but
+// exact here: this page only ever runs in the Chromium window we launch, and it gives the
+// clicked button without threading an event argument through every call site.
+function spin(k,ms){
+ mark(k,ms);
+ const b=window.event&&window.event.target;
+ if(b&&b.tagName==='BUTTON'){b.classList.add('busy');b.disabled=true}
+}
+// Buttons inside panels are rebuilt from scratch on every poll, so their busy state has to be
+// re-derived at render time rather than set once on the element.
+function B(cls,key,onclick,label){
+ const b=busy(key);
+ return `<button class="${cls}${b?' busy':''}"${b?' disabled':''} onclick="${onclick}">${label}</button>`;
+}
 // Every API call carries the per-run token. Being a custom header, it also forces a CORS
 // preflight for anyone cross-origin, which this server does not answer.
 const TOK='@@TOKEN@@';
 const _f=window.fetch;
 window.fetch=(u,o)=>{o=o||{};o.headers=Object.assign({},o.headers,{'X-LocalLLM-Token':TOK});return _f(u,o)};
 function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
- document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on')}
+ document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+ // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
+ // while the tab that shows it is actually in front.
+ monRun(i===3);}
+// ---- sensors (Monitoring tab)
+let MON={},monTimer=null,monN=0;
+function monReset(){MON={};monN=0;document.getElementById('sens').innerHTML=''}
+function monRun(on){
+ if(on&&!monTimer){mon();monTimer=setInterval(mon,1000)}
+ if(!on&&monTimer){clearInterval(monTimer);monTimer=null}
+}
+async function mon(){
+ let d;try{d=await (await fetch('/api/sensors')).json()}catch(e){return}
+ monN++;
+ const rows=(d.sensors||[]).map(s=>{
+  // A sensor the card doesn't report stays blank rather than counting as zero, which would drag
+  // an average toward a number that was never measured.
+  if(s.value===null||s.value===undefined)return `<tr><td>${s.name}</td><td colspan="4" style="color:var(--dim);text-align:right">not reported</td></tr>`;
+  const a=MON[s.name]||(MON[s.name]={min:s.value,max:s.value,sum:0,n:0});
+  a.min=Math.min(a.min,s.value);a.max=Math.max(a.max,s.value);a.sum+=s.value;a.n++;
+  const f=v=>(Math.round(v*10)/10).toLocaleString();
+  const u=s.unit?' '+s.unit:'';
+  return `<tr><td>${s.name}</td><td class="now">${f(s.value)}${u}</td><td>${f(a.min)}${u}</td><td>${f(a.max)}${u}</td><td>${f(a.sum/a.n)}${u}</td></tr>`;
+ }).join('');
+ document.getElementById('sens').innerHTML=rows||'<tr><td colspan="5" style="color:var(--dim)">no sensors available (no NVIDIA GPU detected)</td></tr>';
+ document.getElementById('monmeta').textContent=monN+' sample'+(monN===1?'':'s')+(d.loaded?'  -  model loaded: '+d.loaded:'  -  no model loaded');
+}
 async function post(u,o){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})})}
 // Map the ticked services onto start.ps1's -Component, which takes all|swap|webui.
 function selected(){
@@ -496,27 +649,57 @@ function selected(){
  if(s.length===1)return s[0];
  return null;   // nothing ticked - there is no action to take
 }
+// Job names carry the component, so restarting swap doesn't spin the webui button too.
+function jkey(a,comp){return (comp&&comp!=='all')?a+'-'+comp:a}
 async function act(a,c){
  const comp=(c!==undefined)?c:selected();
  if(comp===null){alert('No services are ticked, so Start/Stop have nothing to act on.\n\nTick at least one on the Dashboard.');return}
+ spin(jkey(a,comp),a==='deploy'?600000:60000);
  await post('/api/action',{action:a,component:comp});setTimeout(tick,1200);
 }
 async function toggleSvc(key,on){await post('/api/settings',key==='swap'?{useSwap:on}:{useWebui:on});tick()}
-async function load(id){await post('/api/load',{id});setTimeout(tick,700)}
-async function unloadAll(){await post('/api/unload',{});setTimeout(tick,700)}
-async function tune(id){await post('/api/autotune',{id});setTimeout(tick,700)}
+// Loading is the one action with no job behind it - llama-swap swaps the model in when the
+// one-token request lands. The mark clears when the model shows up as loaded, so the ceiling is
+// only a backstop for a load that fails outright.
+async function load(id){spin('load:'+id,300000);await post('/api/load',{id});setTimeout(tick,700)}
+async function unloadAll(){spin('unload',8000);await post('/api/unload',{});setTimeout(tick,700)}
+async function tune(id){spin('autotune-'+id,900000);await post('/api/autotune',{id});setTimeout(tick,700)}
 async function saveDir(){await post('/api/settings',{modelsDir:document.getElementById('mdir').value});tick()}
 async function inst(what){
  const names={components:'install or repair all components',upgrade:'upgrade to the pinned versions',
   'upgrade-latest':'upgrade to the newest upstream releases','prism':'install the PrismML fork (~620 MB)'};
  if(!confirm('This will '+names[what]+'.\n\nThe stack will be stopped and restarted. Model weights and config.yaml are not touched.\n\nContinue?'))return;
+ // Job names are set server-side: components->install, upgrade/upgrade-latest->upgrade, prism->prism.
+ mark({components:'install',upgrade:'upgrade','upgrade-latest':'upgrade',prism:'prism'}[what],1800000);
  await post('/api/install',{what});setTimeout(tick,900);
 }
 async function chk(){
+ spin('vercheck',120000);
  document.getElementById('vchk').textContent='querying GitHub and nodejs.org...';
  try{VER=await (await fetch('/api/versions?refresh=1')).json();
-  document.getElementById('vchk').textContent='checked '+VER.checked;tick()}
+  document.getElementById('vchk').textContent='checked '+VER.checked}
  catch(e){document.getElementById('vchk').textContent='check failed'}
+ delete PEND['vercheck'];tick();
+}
+// Context and KV quantisation are just flags on the model's cmd, so they can be changed here -
+// unlike the weight quantisation (Q4_K_M vs Q6_K), which is a different file and means a
+// download. Writing them is start.ps1's Set-ModelTuning, the same code -Action autotune applies.
+async function edit(id){
+ const m=(M.models||[]).find(x=>x.id===id); if(!m)return;
+ const ctx=prompt('Context size for "'+id+'" (-c), in tokens.\n\nLarger costs VRAM: every token has to fit alongside the weights.\nUse Tune to have it measured instead of guessed.',m.ctx||16384);
+ if(ctx===null)return;
+ if(!/^\d+$/.test(ctx.trim())||+ctx<256){alert('Context has to be a whole number of tokens, 256 or more.');return}
+ const kv=prompt('KV cache quantisation for "'+id+'" (-ctk/-ctv).\n\nq8_0 = better long-context recall\nq4_0 = half the cache size, so more context in the same VRAM\nf16  = no quantisation, largest',m.kv||'q8_0');
+ if(kv===null)return;
+ if(!['q8_0','q4_0','q4_1','q5_0','q5_1','f16','f32'].includes(kv.trim())){alert('Unknown KV type "'+kv.trim()+'".');return}
+ spin('edit:'+id,20000);
+ const r=await (await fetch('/api/tune',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({id,ctx:+ctx,kv:kv.trim()})})).json();
+ delete PEND['edit:'+id];
+ if(r.error){alert('Could not write the config: '+r.error);tick();return}
+ // llama-swap reads config.yaml only at startup, so the edit does nothing until it bounces.
+ if(confirm('Saved. llama-swap only reads config.yaml at startup, so this takes effect after a restart.\n\nRestart llama-swap now?')) act('restart','swap');
+ else tick();
 }
 // Deleting weights is multi-GB and irreversible, so it asks twice: once for the files, then
 // separately about the config entry, which is a different decision.
@@ -530,6 +713,7 @@ async function del(id,gb){
 function fmt(mb){return (mb/1024).toFixed(1)+' GB'}
 async function inspect(){
  const r=document.getElementById('repo').value.trim(); if(!r)return;
+ spin('inspect',120000);
  document.getElementById('insp').innerHTML='<div class="hint">Reading metadata over the network - a few MB, no weights. This takes ~40s.</div>';
  try{const d=await (await fetch('/api/inspect?model='+encodeURIComponent(r))).json();
   if(d.error){document.getElementById('insp').innerHTML='<div class="hint miss">'+d.error+'</div>';return}
@@ -537,6 +721,7 @@ async function inspect(){
    d.variants.map(v=>`<tr><td>${v.name}</td><td>${v.size}</td><td>${v.fits?'<span class="on2">'+v.verdict+'</span>':'<span class="miss">'+v.verdict+'</span>'}</td>
    <td><button class="gh" onclick="dl('${d.repo}','${v.quant}')">Download</button></td></tr>`).join('')+'</tbody></table>';
  }catch(e){document.getElementById('insp').innerHTML='<div class="hint miss">'+e+'</div>'}
+ delete PEND['inspect'];
 }
 async function mkLnk(){
  document.getElementById('lnk').textContent='working...';
@@ -544,15 +729,30 @@ async function mkLnk(){
   document.getElementById('lnk').textContent=d.error?d.error:'created: '+d.paths.join('  |  ');
  }catch(e){document.getElementById('lnk').textContent=''+e}
 }
-async function dl(repo,quant){await post('/api/download',{model:repo,quant});document.getElementById('insp').innerHTML='<div class="hint">Download started - watch Activity below.</div>';setTimeout(tick,800)}
+async function dl(repo,quant){spin('download',3600000);await post('/api/download',{model:repo,quant});document.getElementById('insp').innerHTML='<div class="hint">Download started - watch Activity below.</div>';setTimeout(tick,800)}
 async function tick(){
  try{S=await (await fetch('/api/status')).json()}catch(e){return}
+ // Jobs before anything renders: every button's busy state is derived from this list.
+ try{JOBS=await (await fetch('/api/jobs')).json()}catch(e){}
+ // A finished job clears its optimistic mark. Without this the mark would hold the button
+ // spinning for its whole ceiling - and the ceilings are generous, because they exist for the
+ // job that never starts. Restarting llama-swap takes about two seconds; the button should
+ // stop spinning then, not sixty seconds later.
+ JOBS.forEach(j=>{const p=PEND[j.name];
+  if(p&&!j.running&&(Date.now()-j.age*1000)>p.t)delete PEND[j.name]});
+ // A load has no job behind it, so its mark clears on the outcome instead - the model is loaded.
+ if(S.loaded)delete PEND['load:'+S.loaded];
  // Health is judged only against ticked services - a deselected one being down is not a fault.
  const mine=S.services.filter(s=>s.managed&&s.selected);
  const up=mine.filter(s=>s.up).length, need=mine.length;
+ // The header buttons are static markup rather than re-rendered, so they are synced by hand.
+ const sel=selected();
+ [['go','deploy'],['hre','restart'],['hst','stop']].forEach(([el,a])=>{
+  const e=document.getElementById(el),b=busy(jkey(a,sel));
+  e.classList.toggle('busy',b);e.disabled=b||(el==='go'&&need>0&&up===need);
+ });
  document.getElementById('d').className='dot '+(need===0?'down':up===need?'up':up?'part':'down');
  document.getElementById('sub').textContent=need===0?'nothing selected':up===need?'running':up?'partly running':'stopped';
- document.getElementById('go').disabled=(need>0&&up===need);
  document.getElementById('svc').innerHTML=S.services.map(s=>`<tr>
   <td>${s.managed?`<input type="checkbox" style="width:auto" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)">`:''}</td>
   <td>${s.name}</td><td style="color:var(--dim)">${s.role}</td>
@@ -594,41 +794,47 @@ async function tick(){
     `<span>Status</span><div>${E.llamacpp.installed?'<span class="on2">installed</span>':'<span class="miss">not installed</span>'}</div>
      <span>Build</span><div>${E.llamacpp.version||'-'}</div>${verLine('llamaCpp')}
      <span>Path</span><div style="color:var(--dim)">${E.llamacpp.path}</div>`,
-    E.llamacpp.installed?'':'<button class="gh" onclick="inst(\'components\')">Install</button>');
+    E.llamacpp.installed?'':B('gh','install',"inst('components')",'Install'));
   h+=panel('llama.cpp (PrismML fork) - low-bit kernels',
     `<span>Status</span><div>${E.prism.installed?'<span class="on2">installed</span>':'<span class="tag">not installed</span>'}</div>
      <span>Build</span><div>${E.prism.version||'-'}</div>${verLine('prism fork')}
      <span>Path</span><div style="color:var(--dim)">${E.prism.path}</div>`,
-    `<button class="gh" onclick="inst('prism')">${E.prism.installed?'Reinstall / update':'Install'}</button>`);
+    B('gh','prism',"inst('prism')",E.prism.installed?'Reinstall / update':'Install'));
   h+=panel('llama-swap - model router',
     `<span>Status</span><div>${E.swap.up?'<span class="on2">running</span>':'<span class="miss">stopped</span>'}</div>
      <span>Processes</span><div>${E.swap.procs.map(p=>'pid '+p.pid+' ('+p.mb+' MB)').join(', ')||'-'}</div>${verLine('llamaSwap')}`,
-    `<button class="gh" onclick="act('restart','swap')">Restart</button>
-     <button class="gh" onclick="act('stop','swap')">Stop</button>
-     <button class="gh" onclick="unloadAll()">Unload models</button>`);
+    B('gh','restart-swap',"act('restart','swap')",'Restart')+' '+
+    B('gh','stop-swap',"act('stop','swap')",'Stop')+' '+
+    B('gh','unload','unloadAll()','Unload models'));
   h+=panel('open-webui - chat interface',
     `<span>Status</span><div>${E.webui.up?'<span class="on2">running</span>':'<span class="miss">stopped</span>'}</div>${verLine('openWebUI')}${verLine('node')?'':''}`,
-    `<button class="gh" onclick="act('restart','webui')">Restart</button>
-     <button class="gh" onclick="act('stop','webui')">Stop</button>`);
+    B('gh','restart-webui',"act('restart','webui')",'Restart')+' '+
+    B('gh','stop-webui',"act('stop','webui')",'Stop'));
   document.getElementById('comps').innerHTML=h;
   document.getElementById('e4').innerHTML=E.servers.length?E.servers.map(s=>`<tr><td>${s.pid}</td><td>${s.mb} MB</td></tr>`).join(''):'<tr><td colspan=2 style="color:var(--dim)">none - no model loaded</td></tr>';
  }
  try{M=await (await fetch('/api/models')).json()}catch(e){}
  if(M.models){
-  document.getElementById('mt').innerHTML=M.models.map(m=>`<tr>
-   <td>${m.id} ${m.prism?'<span class="tag">prism</span>':''}</td>
+  document.getElementById('mt').innerHTML=M.models.map(m=>{
+   const on=S.loaded===m.id;
+   // A model that has been asked for but hasn't finished loading is neither idle nor loaded,
+   // and a multi-GB load takes long enough that the difference matters.
+   const loading=!on&&busy('load:'+m.id);
+   const dot=on?'<span class="dot up" title="loaded"></span> ':(loading?'<span class="dot part" title="loading"></span> ':'');
+   return `<tr>
+   <td>${dot}${m.id} ${m.prism?'<span class="tag">prism</span>':''}</td>
    <td>${m.present?m.sizeGb+' GB':'<span class="miss">no weights</span>'}</td>
    <td>${m.ctx||'-'}</td><td>${m.kv||'-'}</td><td>${m.moe!==null?m.moe:'-'}</td>
    <td style="color:var(--dim)">${m.lastUsed||'-'}</td><td>${m.loads||0}</td>
-   <td>${!m.engineOk?'<span class="miss">engine missing</span>':(S.loaded===m.id?'<span class="on2">loaded</span>':(m.present?'ready':'-'))}</td>
-   <td>${m.present?`<button class="gh" onclick="load('${m.id}')">Load</button> <button class="gh" onclick="tune('${m.id}')">Tune</button> `:''}<button class="dz" onclick="del('${m.id}',${m.sizeGb})">Delete</button></td></tr>`).join('');
+   <td>${!m.engineOk?'<span class="miss">engine missing</span>':(on?'<span class="on2">loaded</span>':(loading?'<span style="color:var(--warn)">loading</span>':(m.present?'ready':'-')))}</td>
+   <td>${m.present?B('gh','load:'+m.id,`load('${m.id}')`,'Load')+' '+
+                   B('gh','edit:'+m.id,`edit('${m.id}')`,'Edit')+' '+
+                   B('gh','autotune-'+m.id,`tune('${m.id}')`,'Tune')+' ':''}<button class="dz" onclick="del('${m.id}',${m.sizeGb})">Delete</button></td></tr>`}).join('');
   document.getElementById('orph').innerHTML=M.orphans.length?M.orphans.map(o=>`<tr><td>${o.file}</td><td>${o.sizeGb} GB</td><td style="color:var(--dim)">downloaded, not in config.yaml</td></tr>`).join(''):'<tr><td style="color:var(--dim)">none</td></tr>';
  }
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
  if(!VER.rows){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
- try{const j=await (await fetch('/api/jobs')).json();
-  document.getElementById('jobs').innerHTML=j.length?j.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
- }catch(e){}
+ document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
  const md=document.getElementById('mdir');
  if(M.settings&&document.activeElement!==md){md.value=M.settings.modelsDir;
   document.getElementById('st').innerHTML=`<span>llama-swap</span><div>127.0.0.1:${M.settings.swapPort}</div><span>Chat UI</span><div>127.0.0.1:${M.settings.webuiPort}</div><span>This panel</span><div>127.0.0.1:${location.port}</div>`;}
@@ -724,6 +930,7 @@ try {
                 '^/api/ping$'   { $body = '{"ok":true}' }
                 '^/api/status$' { $body = Get-Dashboard | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
+                '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/models$' {
                     $body = @{ models = @(Get-ConfiguredModels); orphans = @(Get-OrphanModels); settings = (Get-Settings) } | ConvertTo-Json -Depth 6 -Compress
                 }
@@ -735,7 +942,10 @@ try {
                     if ($p.action -in 'deploy', 'restart', 'stop') {
                         $a = @('-Action', $p.action, '-NoTray')
                         if ($p.component) { $a += @('-Component', $p.component) }
-                        Start-Job2 $p.action $a | Out-Null
+                        # The component is part of the job name so "restart swap" and "restart
+                        # webui" are distinguishable - otherwise both buttons would spin for either.
+                        $name = if ($p.component -and $p.component -ne 'all') { "$($p.action)-$($p.component)" } else { $p.action }
+                        Start-Job2 $name $a | Out-Null
                     }
                     $body = '{"ok":true}'
                 }
@@ -751,6 +961,24 @@ try {
                 '^/api/unload$' {
                     try { Invoke-RestMethod "http://127.0.0.1:$swapPort/api/models/unload" -Method Post -TimeoutSec 10 | Out-Null } catch { }
                     $body = '{"ok":true}'
+                }
+                '^/api/tune$' {
+                    # Inline, not a job: it rewrites two flags in a text file and the user is
+                    # waiting on the answer. Errors have to come back to the dialog, not a log.
+                    $p = Read-Body $req
+                    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs,
+                           '-Action', 'set-tuning', '-Id', $p.id, '-Context', $p.ctx, '-Kv', $p.kv)
+                    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+                    $out = try { & powershell @a 2>&1 | ForEach-Object { "$_" } } finally { $ErrorActionPreference = $old }
+                    if ($LASTEXITCODE -ne 0) {
+                        # A PowerShell error record is one useful line followed by carets, source
+                        # extracts and CategoryInfo. Surfacing the tail put the noise in the dialog
+                        # and left the message out; the first real line is the message.
+                        $msg = ($out | Where-Object { $_.Trim() -and $_ -notmatch '^\s*(\+|At line|At C:)' } | Select-Object -First 1)
+                        $res.StatusCode = 500
+                        $body = @{ error = ("$msg" -replace '^powershell(\.exe)?\s*:\s*', '').Trim() } | ConvertTo-Json -Compress
+                    }
+                    else { $body = @{ ok = $true } | ConvertTo-Json -Compress }
                 }
                 '^/api/autotune$' {
                     $p = Read-Body $req

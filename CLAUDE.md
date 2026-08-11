@@ -102,6 +102,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
   Nothing else in the stack needs to change to use it. llama-swap spawns whatever a model's `cmd` names, `Stop-Stack` matches `llama-server.exe` by process name regardless of which directory it came from, and the tray's model list is parsed out of `config.yaml` — so start/stop/restart and the tray menu all work for prism-backed models with no extra wiring.
 - **bench** — runs `bench\run.py` against the live llama-swap (see below). Anything after `-Action bench` is forwarded to the script verbatim, which is why the param block sets `PositionalBinding = $false`; without it PowerShell binds trailing values to whichever parameter is next in declaration order.
+- **set-tuning** — write `-c` and `-ctk`/`-ctv` for one model directly, without measuring: `-Id <model> -Context <n> -Kv <type>`. Same `Set-ModelTuning` that `autotune -Apply` uses, so a hand-picked number and a measured one land identically and neither disturbs the rest of the file. `-NCpuMoe` defaults to `-1` meaning *leave the entry's existing value alone*, which is not the same as `0` (offload nothing) — a plain `[int]` can't express "unset", and silently dropping the flag would change how an MoE model runs. Backs the panel's Models → Edit.
 - **check-config** — the launch preflight (`Test-SwapConfig`) on its own, so a `config.yaml` edit can be checked without bouncing llama-swap to read the warnings on the way past. Every failure it looks for is one that llama-swap starts happily with, and that only shows up as `connection refused` from the proxy the first time that model is picked, because `llama-server` died on spawn:
 
   | check | why it's invisible otherwise |
@@ -148,6 +149,26 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
 - `-Install`, and the **Settings → Desktop integration** button that calls the same
   `Install-Shortcuts`, write a desktop and start-menu `.lnk`. The panel exists so that nothing
   requires opening a terminal; a Settings tab that tells you to run a PowerShell command defeats it.
+- **Busy buttons.** Every action here starts a detached job and returns immediately, so a click had
+  no visible effect until the next 3s poll — which reads as the click not registering. State comes
+  from two places: `/api/jobs` reports `running` per job (from a `.pid` written next to the log,
+  which is what makes "still going?" answerable at all), and an optimistic local mark covers the
+  gap before the first poll sees it. A mark records *when* it was made, so a leftover log from the
+  same action ten minutes ago can't clear a mark made a moment ago, and it's dropped as soon as a
+  job that started after it finishes — a llama-swap restart takes ~2s and the spinner has to stop
+  then, not at the generous ceiling that exists for the job which never starts. Panels re-render
+  every poll, so per-button state is re-derived at render time via `B()` rather than set on the
+  element; the header buttons are static markup and are synced by hand in `tick()`.
+- **Monitoring tab** — GPU-Z's sensor layout (name, current, min, max, average) over one
+  `nvidia-smi` call plus a WMI read. Min/max/average are accumulated in the page, not the server:
+  the samples are already there and the server would otherwise hold per-session history for a
+  window that can be closed. It polls at 1 Hz **only while that tab is in front** — this listener
+  is single-threaded, and a process spawn every second in the background would crowd out
+  everything else. Unreported sensors (`[N/A]` from nvidia-smi — fan speed on some cards) render
+  as "not reported" rather than 0, which would drag an average toward a value never measured.
+- **Models → Edit** changes `-c` and `-ctk`/`-ctv` through `start.ps1 -Action set-tuning`, the same
+  `Set-ModelTuning` that `autotune -Apply` writes with. Weight quantisation (Q4_K_M vs Q6_K) is
+  deliberately *not* editable here: that's a different file and means a download, not a flag.
 
 ## Using the local models from Claude Code
 

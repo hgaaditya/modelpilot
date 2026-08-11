@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -70,6 +70,16 @@ param(
 
     # autotune: write the measured settings straight into config.yaml instead of printing them.
     [switch]$Apply,
+
+    # set-tuning: KV cache type for -ctk/-ctv. q4_0 halves the cache against q8_0, buying context
+    # at some cost to recall of tokens early in a long conversation.
+    [ValidateSet('q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'f16', 'f32')]
+    [string]$Kv = 'q8_0',
+
+    # set-tuning: expert layers to keep on the CPU (MoE models only). -1 means "leave the entry's
+    # existing value alone", which is not the same as 0 (offload nothing) - a plain [int] can't
+    # express "unset", and dropping the flag silently would change how the model runs.
+    [int]$NCpuMoe = -1,
 
     # uninstall: also delete the multi-GB .gguf weights (kept by default - they're slow to re-fetch).
     [switch]$IncludeModels,
@@ -1221,6 +1231,26 @@ if ($Latest) {
 }
 
 switch ($Action) {
+
+    'set-tuning' {
+        # autotune measures these numbers; this just writes ones you already decided on, through
+        # the same Set-ModelTuning so a hand edit and a measured one land identically.
+        if (-not $Id) { throw "-Id is required: which model in config.yaml to change." }
+        $moe = if ($NCpuMoe -ge 0) { $NCpuMoe } else { $null }
+        if ($NCpuMoe -lt 0) {
+            # Preserve whatever the entry already had rather than dropping the flag.
+            $cur = [regex]::Match((Get-Content $swapConfig -Raw),
+                   "(?ms)^\s{2,}""$([regex]::Escape($Id))""\s*:.*?(?=^\s{2}""|\z)")
+            if ($cur.Success -and $cur.Value -match '--n-cpu-moe\s+(\d+)') { $moe = [int]$Matches[1] }
+        }
+        if (Set-ModelTuning $Id $Context $Kv $moe) {
+            Write-Host "$Id -> -c $Context -ctk $Kv -ctv $Kv$(if ($null -ne $moe) { " --n-cpu-moe $moe" })"
+            Write-Host "written to $swapConfig (previous kept as config.yaml.bak)."
+            Write-Host "Run '.\start.ps1 -Action restart -Component swap' to pick it up."
+        } else {
+            throw "No entry called '$Id' in config.yaml."
+        }
+    }
 
     'check-config' {
         # The same preflight the launch runs, on its own - so a config edit can be checked before
