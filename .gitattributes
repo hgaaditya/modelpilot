@@ -1,0 +1,24 @@
+# Without this, every commit from Windows warns "LF will be replaced by CRLF" and a contributor on
+# Linux or macOS sees whole files as changed. Line endings are declared here once instead.
+* text=auto
+
+# Windows shells are the ones that actually care. cmd.exe in particular can mis-parse a .cmd file
+# with LF endings, and LocalLLM.cmd is the double-click entry point - it has to be right.
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# Everything cross-platform stays LF.
+*.py    text eol=lf
+*.sh    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.md    text eol=lf
+
+# Model weights and archives are never text, whatever heuristics think.
+*.gguf binary
+*.zip  binary
+*.exe  binary
+*.dll  binary

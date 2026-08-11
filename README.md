@@ -1,10 +1,28 @@
 # LocalLLM
 
-Run large language models on your own Windows machine, with a chat UI in the browser and nothing
-leaving the box. It glues together three things — [llama.cpp](https://github.com/ggml-org/llama.cpp)
-for inference, [llama-swap](https://github.com/mostlygeek/llama-swap) to load and unload models on
-demand, and [Open WebUI](https://github.com/open-webui/open-webui) for chat — and adds a control
-panel that installs, configures and monitors all of it.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078d4)
+
+**Run large language models on your own Windows machine — and hand your Claude Code sessions to
+them when your quota runs out.** Nothing leaves the box.
+
+It glues together three things — [llama.cpp](https://github.com/ggml-org/llama.cpp) for inference,
+[llama-swap](https://github.com/mostlygeek/llama-swap) to load and unload models on demand, and
+[Open WebUI](https://github.com/open-webui/open-webui) for chat — and adds a control panel that
+installs, configures and monitors all of it. One download, one double-click, no Docker, no WSL,
+and nothing installed system-wide.
+
+What you get that a manual setup doesn't give you:
+
+- **It sizes models to your actual hardware** and tells you which ones will run before you spend
+  an hour downloading one that won't.
+- **It measures rather than guesses.** `-Action autotune` finds the fastest expert-offload split
+  by loading the model and timing it — on this hardware that setting was the difference between
+  15 and 47 tokens/sec.
+- **It hands Claude Code over to a local model**, resuming the exact conversation you were in,
+  with four non-obvious client bugs already worked around (see [CLAUDE.md](CLAUDE.md)).
+- **It verifies instead of assuming.** Launches are health-checked, configs are validated against
+  disk, and a model is only offered to a coding agent after it has actually driven one.
 
 ## Getting started
 
@@ -110,3 +128,16 @@ ui.ps1              the control panel
 `llamaswap\config.yaml` is the one file you'd ever hand-edit — it defines each model's context
 size and how much of it goes on the GPU. It's generated on first run from `config.example.yaml`.
 See [CLAUDE.md](CLAUDE.md) for how the whole thing fits together in detail.
+
+## Licence and contributing
+
+MIT — see [LICENSE](LICENSE). The name is a separate matter: fork it freely, but give your fork
+its own name ([NAMING.md](NAMING.md)).
+
+Nothing third-party is redistributed here; every component is downloaded from its own release page
+at a pinned version. One of those licences has a clause people miss — see
+[THIRD-PARTY.md](THIRD-PARTY.md). Model weights carry their own separate terms.
+
+Two things worth reading before you rely on this: [SECURITY.md](SECURITY.md) (the control panel has
+no password, and the benchmark can run code a model wrote — both by design, both explained), and
+[CONTRIBUTING.md](CONTRIBUTING.md) if you want to change something.
