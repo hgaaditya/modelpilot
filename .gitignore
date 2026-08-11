@@ -10,8 +10,11 @@
 
 # downloaded binaries
 /llama.cpp/
+# config.yaml is generated from config.example.yaml on first deploy, with {{LOCALLLM_ROOT}}
+# replaced by wherever the repo was cloned - so it holds absolute paths and a per-machine
+# model list, and only the template is tracked.
 /llamaswap/*
-!/llamaswap/config.yaml
+!/llamaswap/config.example.yaml
 
 # model weights
 *.gguf

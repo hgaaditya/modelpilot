@@ -16,12 +16,14 @@ Chat UI (open-webui, :8080)
 ```
 
 - **llama.cpp/** — pre-built `llama-server.exe`, `llama-cli.exe`, etc. plus CUDA/CPU-variant DLLs (ggml-cpu-*.dll for different microarchitectures, ggml-cuda.dll). `llama.cpp/models/` holds the actual `.gguf` weight files (multi-GB). Nothing here is meant to be edited or rebuilt; treat it as a binary dependency.
-- **llamaswap/** — `llama-swap.exe` (pre-built) + `config.yaml`. This is the only file that normally needs editing in this repo. It defines named model entries, each with the exact `llama-server` command line to spawn, context size/quantization flags, and idle-unload `ttl`. llama-swap watches incoming OpenAI/Anthropic-style requests, reads the `model` field, and hot-swaps the backend `llama-server` process to match.
+- **llamaswap/** — `llama-swap.exe` (pre-built) + `config.yaml` (generated from the tracked `config.example.yaml` — see below). This is the only file that normally needs editing in this repo. It defines named model entries, each with the exact `llama-server` command line to spawn, context size/quantization flags, and idle-unload `ttl`. llama-swap watches incoming OpenAI/Anthropic-style requests, reads the `model` field, and hot-swaps the backend `llama-server` process to match.
 - **open-webui-0.11.0/** — full vendored source of the Open WebUI chat frontend/backend (SvelteKit + FastAPI), pointed at llama-swap as its OpenAI-compatible backend. Has its own build/lint/test tooling (see below) — treat it as an upstream project, not house code; avoid unrelated refactors inside it.
 
 ## Editing `llamaswap/config.yaml`
 
 This is the primary day-to-day file in this repo. Convention baked into the file's own header comment: **add new models here, nothing else changes**.
+
+`config.yaml` itself is **generated and gitignored**. The tracked file is `config.example.yaml`, which carries a `{{LOCALLLM_ROOT}}` placeholder wherever a path appears; `start.ps1` writes `config.yaml` from it on first use (deploy, launch, or `add-model`, whichever comes first) with the placeholder replaced by this clone's actual directory, and never overwrites an existing one. Every path in the file is absolute — `llama-server.exe` and each `.gguf` — so a checked-in `config.yaml` would point at directories that only exist on the machine that wrote it. Edit `config.yaml` for day-to-day model work; edit `config.example.yaml` only to change what a *fresh install* starts with (which is: the two macros, and no models at all).
 
 ```yaml
 models:
@@ -52,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 On a clean machine it bootstraps everything (skipping any step whose artifact already exists), pinned to exact versions so a wipe-and-reclone reproduces the same stack:
 
 1. Downloads llama.cpp `b10155` (CUDA build if `nvidia-smi` is found, else CPU) into `llama.cpp\`
-2. Downloads llama-swap `v244` into `llamaswap\`
+2. Downloads llama-swap `v244` into `llamaswap\`, and writes `llamaswap\config.yaml` from `config.example.yaml` if it isn't there yet, substituting this clone's path for `{{LOCALLLM_ROOT}}`
 3. Ensures `llama.cpp\models\` exists — weights are **not** bootstrapped, since GGUF quant sources vary by provider and can't be guessed; fetch them with `-Action add-model` (below)
 4. Installs Python 3.12 via winget if no 3.11/3.12 is found (open-webui pins `requires-python <3.13`), creates `open-webui-0.11.0\.venv`, installs `backend\requirements.txt`
 5. Downloads an isolated Node.js v22.23.1 into `open-webui-0.11.0\.node-runtime\` — open-webui's `.npmrc` has `engine-strict=true` pinning `<=22.x.x`, so this never touches or depends on a machine's global Node version

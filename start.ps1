@@ -102,6 +102,7 @@ $llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side
 $modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
 $llamaSwapDir = Join-Path $root 'llamaswap'
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
+$swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
 $logDir       = Join-Path $root 'logs'
 $stampFile    = Join-Path $root '.stack-versions.json'
 $dl           = Join-Path $env:TEMP 'localllm-dl'
@@ -111,6 +112,20 @@ $webuiPort    = 8080
 function Get-File($url, $out) {
     Write-Host "Downloading $url"
     Invoke-WebRequest -Uri $url -OutFile $out
+}
+
+# config.yaml carries absolute paths to llama-server.exe and to every .gguf, so it can't be
+# checked in as-is - a clone to any other directory would point at files that don't exist.
+# config.example.yaml is the tracked one, with {{LOCALLLM_ROOT}} where this repo's path goes;
+# the real config is generated here on first use and is gitignored thereafter, which also keeps
+# a user's own model list out of the repo. Never overwrites an existing config.
+function Initialize-SwapConfig {
+    if (Test-Path $swapConfig) { return }
+    if (-not (Test-Path $swapConfigTpl)) { throw "Neither $swapConfig nor $swapConfigTpl exists - the repo is incomplete." }
+    New-Item -ItemType Directory -Force -Path $llamaSwapDir | Out-Null
+    $text = (Get-Content $swapConfigTpl -Raw).Replace('{{LOCALLLM_ROOT}}', $root)
+    Set-Content -Path $swapConfig -Value $text -Encoding utf8 -NoNewline
+    Write-Host "Generated $swapConfig from config.example.yaml (paths rooted at $root)."
 }
 
 # Weights are multi-GB: Invoke-WebRequest has no resume and no progress, curl.exe (ships with
@@ -294,7 +309,8 @@ function Invoke-Deploy($ver) {
         Get-File "https://github.com/mostlygeek/llama-swap/releases/download/$($ver.llamaSwap)/llama-swap_${num}_windows_amd64.zip" $swapZip
         Expand-Archive -Path $swapZip -DestinationPath $llamaSwapDir -Force
     }
-    # config.yaml is checked-in project config, not a download artifact - must already exist alongside this script.
+    # config.yaml isn't downloaded - it's generated from the tracked template with this clone's path.
+    Initialize-SwapConfig
 
     # --- 3. model weights ---
     # Deliberately not bootstrapped: GGUF quant sources vary by provider and can't be guessed.
@@ -453,7 +469,7 @@ function Start-Stack($webui, $component = 'all') {
         return
     }
 
-    if ($component -ne 'webui') { Test-ModelFiles }
+    if ($component -ne 'webui') { Initialize-SwapConfig; Test-ModelFiles }
 
     # -NoNewWindow: Start-Process's default (a new console window) fails with
     # "operation was canceled by the user" when there's no window station to attach to
@@ -689,7 +705,7 @@ function Get-FittedContext($ggufPath, $kvType = 'q4_0') {
 }
 
 # Appends a model entry to config.yaml, matching the style already in the file. The file is
-# hand-maintained and git-tracked, so it gets a .bak first and is never rewritten wholesale.
+# hand-maintained, so it gets a .bak first and is never rewritten wholesale.
 # Replace the cmd flags of an existing entry in place, leaving its id, macro, model path, ttl and
 # every other entry untouched. Only the tuning flags are rewritten, so hand-written comments and
 # per-model options elsewhere in the file survive.
@@ -711,7 +727,7 @@ function Set-ModelTuning($id, $ctx, $kv, $nCpuMoe) {
 }
 
 function Add-ModelToConfig($id, $ggufPath, $context) {
-    if (-not (Test-Path $swapConfig)) { Write-Warning "$swapConfig not found - skipping registration."; return $false }
+    Initialize-SwapConfig   # add-model can be the first thing a fresh clone runs
     $text = Get-Content $swapConfig -Raw
     if ($text -match "(?m)^\s{2,}""$([regex]::Escape($id))""\s*:") {
         Write-Warning "config.yaml already has a model called '$id' - leaving it alone."
