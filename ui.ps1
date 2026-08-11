@@ -206,6 +206,10 @@ function Get-ConfiguredModels {
             kv      = if ($body -match '-ctk\s+(\S+)') { $Matches[1] } else { '' }
             moe     = if ($body -match '--n-cpu-moe\s+(\d+)') { [int]$Matches[1] } else { $null }
             prism   = [bool]($body -match 'llama-server-prism')
+            # A prism-backed model with the fork not installed can never spawn, and the only
+            # symptom is a connection-refused the first time you pick it. start.ps1's
+            # -Action check-config says the same thing from the CLI.
+            engineOk = Test-Path (Join-Path $(if ($body -match 'llama-server-prism') { $llamaPrism } else { $llamaCpp }) 'llama-server.exe')
             # NTFS last-access is enabled on this machine and updates when llama-server opens the
             # weights, so it gives a true "last used" with nothing to track. The load count has to
             # be counted here, and only advances while this panel is running - so it is a floor,
@@ -616,7 +620,7 @@ async function tick(){
    <td>${m.present?m.sizeGb+' GB':'<span class="miss">no weights</span>'}</td>
    <td>${m.ctx||'-'}</td><td>${m.kv||'-'}</td><td>${m.moe!==null?m.moe:'-'}</td>
    <td style="color:var(--dim)">${m.lastUsed||'-'}</td><td>${m.loads||0}</td>
-   <td>${S.loaded===m.id?'<span class="on2">loaded</span>':(m.present?'ready':'-')}</td>
+   <td>${!m.engineOk?'<span class="miss">engine missing</span>':(S.loaded===m.id?'<span class="on2">loaded</span>':(m.present?'ready':'-'))}</td>
    <td>${m.present?`<button class="gh" onclick="load('${m.id}')">Load</button> <button class="gh" onclick="tune('${m.id}')">Tune</button> `:''}<button class="dz" onclick="del('${m.id}',${m.sizeGb})">Delete</button></td></tr>`).join('');
   document.getElementById('orph').innerHTML=M.orphans.length?M.orphans.map(o=>`<tr><td>${o.file}</td><td>${o.sizeGb} GB</td><td style="color:var(--dim)">downloaded, not in config.yaml</td></tr>`).join(''):'<tr><td style="color:var(--dim)">none</td></tr>';
  }

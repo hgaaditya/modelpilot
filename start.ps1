@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -314,7 +314,7 @@ function Invoke-Deploy($ver) {
 
     # --- 3. model weights ---
     # Deliberately not bootstrapped: GGUF quant sources vary by provider and can't be guessed.
-    # Fetch them with '-Action add-model'; Test-ModelFiles reports any that config.yaml expects
+    # Fetch them with '-Action add-model'; Test-SwapConfig reports any that config.yaml expects
     # but that aren't on disk.
 
     # --- 4. Python 3.11/3.12 (open-webui pins requires-python <3.13) ---
@@ -387,30 +387,92 @@ function Find-CompatPython {
 # ==========================================================================
 #  launch
 # ==========================================================================
-# Every model entry in config.yaml names a .gguf that must already exist - if it doesn't,
-# llama-swap still starts and the only symptom is a "connection refused" proxy error when that
-# model is first selected, because its llama-server died on spawn. Report it up front instead.
-function Test-ModelFiles {
+# The macros: block, as name -> the .exe that macro runs. Model entries reference a macro rather
+# than naming a binary, so a model's engine can only be checked by resolving it back through here.
+function Get-SwapMacros($text) {
+    $map = @{}
+    $block = [regex]::Match($text, '(?ms)^macros:\s*\r?$(.*?)(?=^\S|\z)')
+    if (-not $block.Success) { return $map }
+    # Macro names sit at indent 2, their folded body below. Comment lines start with '#', which
+    # the name character class excludes, so the file's prose doesn't parse as a macro.
+    foreach ($m in [regex]::Matches($block.Groups[1].Value,
+                   '(?ms)^\s{2}([A-Za-z0-9_.-]+):\s*>\s*\r?$(.*?)(?=^\s{2}[A-Za-z0-9_.-]+:|\z)')) {
+        $exe = [regex]::Match($m.Groups[2].Value, '"([^"]+\.exe)"')
+        if ($exe.Success) { $map[$m.Groups[1].Value] = $exe.Groups[1].Value }
+    }
+    $map
+}
+
+# Everything about a model entry that can be checked without loading it. All of these fail the
+# same invisible way at runtime - llama-swap starts fine, llama-server dies on spawn, and the only
+# symptom is "connection refused" from the proxy the first time that model is selected. Report
+# them up front instead.
+#
+# Warn, never block. An entry whose weights or engine aren't installed yet is a legitimate state -
+# you might be about to fetch them - and refusing to start the whole stack over one bad entry
+# would take the other nine models down with it.
+function Test-SwapConfig {
     if (-not (Test-Path $swapConfig)) { Write-Warning "$swapConfig not found - llama-swap has no models to serve."; return }
     $text = Get-Content $swapConfig -Raw
+    $macros = Get-SwapMacros $text
     # Split on the model-id lines ("qwen3-14b":) so each chunk holds one model's cmd.
     $parts = [regex]::Split($text, '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
-    $missing = 0
+    $missingWeights = 0; $missingEngine = 0; $missingPrism = 0; $seen = @{}
+
     for ($i = 1; $i -lt $parts.Count; $i += 2) {
-        $id = $parts[$i]
-        $m = [regex]::Match($parts[$i + 1], '-m\s+"?([^"\r\n]+?\.gguf)"?')
-        if (-not $m.Success) { continue }
-        $path = $m.Groups[1].Value.Trim()
-        if (-not (Test-Path $path)) {
-            $missing++
-            Write-Warning "model '$id' references a file that does not exist: $path"
+        $id = $parts[$i]; $chunk = $parts[$i + 1]
+
+        # YAML keeps the last of a duplicated key, so the earlier entry silently does nothing -
+        # including one you just edited and are watching not take effect.
+        if ($seen.ContainsKey($id)) { Write-Warning "model '$id' is defined more than once - only the last one takes effect." }
+        $seen[$id] = $true
+
+        # Engine. A model naming a macro that isn't defined, or one whose binary isn't installed
+        # (the prism fork is a separate opt-in download), can never spawn.
+        $macro = [regex]::Match($chunk, '\$\{([A-Za-z0-9_.-]+)\}')
+        $exe = $null
+        if ($macro.Success -and $macro.Groups[1].Value -ne 'PORT') {
+            $name = $macro.Groups[1].Value
+            if (-not $macros.ContainsKey($name)) {
+                Write-Warning "model '$id' uses macro `${$name} which is not defined in the macros: block."
+                $missingEngine++
+            } else { $exe = $macros[$name] }
+        } else {
+            $lit = [regex]::Match($chunk, '"([^"]+\.exe)"')
+            if ($lit.Success) { $exe = $lit.Groups[1].Value }
         }
+        if ($exe -and -not (Test-Path $exe)) {
+            $missingEngine++
+            if ($exe -like "$llamaPrism*") { $missingPrism++ }
+            Write-Warning "model '$id' needs an engine that is not installed: $exe"
+        }
+
+        # Weights.
+        $m = [regex]::Match($chunk, '-m\s+"?([^"\r\n]+?\.gguf)"?')
+        if (-not $m.Success) {
+            Write-Warning "model '$id' has no -m <file>.gguf - llama-server has nothing to load."
+        } elseif (-not (Test-Path $m.Groups[1].Value.Trim())) {
+            $missingWeights++
+            Write-Warning "model '$id' references a file that does not exist: $($m.Groups[1].Value.Trim())"
+        }
+
+        # llama-swap assigns each instance a port and substitutes ${PORT}. A literal one means two
+        # models racing for the same port, and a proxy dialling a port nothing is listening on -
+        # which is exactly the "dial tcp [::1]:5800 refused" this stack has already produced once.
+        $port = [regex]::Match($chunk, '--port\s+(\d+)')
+        if ($port.Success) { Write-Warning "model '$id' hardcodes --port $($port.Groups[1].Value) - use `${PORT} so llama-swap can assign one." }
     }
-    if ($missing) {
-        Write-Host "  -> those $missing model(s) will fail on first use. Fetch weights with:"
+
+    if ($missingWeights) {
+        Write-Host "  -> those $missingWeights model(s) will fail on first use. Fetch weights with:"
         Write-Host "     .\start.ps1 -Action add-model -Model <hf repo, hf url, or .gguf url>"
-        Write-Host ""
     }
+    if ($missingEngine) {
+        Write-Host "  -> those $missingEngine model(s) have no engine to run on."
+        # Only the prism fork has a one-command fix; anything else is a hand-written path to correct.
+        if ($missingPrism) { Write-Host "     Install the PrismML fork with:  .\start.ps1 -Action install-prism" }
+    }
+    if ($missingWeights -or $missingEngine) { Write-Host "" }
 }
 
 # Last few lines of a component's logs, minus the sentence-transformers progress spam
@@ -469,7 +531,7 @@ function Start-Stack($webui, $component = 'all') {
         return
     }
 
-    if ($component -ne 'webui') { Initialize-SwapConfig; Test-ModelFiles }
+    if ($component -ne 'webui') { Initialize-SwapConfig; Test-SwapConfig }
 
     # -NoNewWindow: Start-Process's default (a new console window) fails with
     # "operation was canceled by the user" when there's no window station to attach to
@@ -1159,6 +1221,16 @@ if ($Latest) {
 }
 
 switch ($Action) {
+
+    'check-config' {
+        # The same preflight the launch runs, on its own - so a config edit can be checked before
+        # bouncing llama-swap, rather than by bouncing it and reading the warnings on the way past.
+        Initialize-SwapConfig
+        Write-Host "Checking $swapConfig ..."
+        Write-Host ""
+        Test-SwapConfig
+        Write-Host "done."
+    }
 
     'status' {
         $latestVer = if ($Latest) { $target } else { $null }

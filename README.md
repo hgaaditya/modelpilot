@@ -48,8 +48,9 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Model 'unsloth/gpt-oss-20b-GGUF:Q4_K_M'
 ```
 
-`-Action` also takes `stop`, `restart`, `status`, `upgrade`, `autotune`, `bench` and `uninstall`.
-Run `-Action status` to see what's installed against what's pinned.
+`-Action` also takes `stop`, `restart`, `status`, `upgrade`, `autotune`, `bench`, `check-config`
+and `uninstall`. `-Action status` shows what's installed against what's pinned; `-Action
+check-config` validates your model config before you restart anything.
 
 ## Things worth knowing before you run it
 

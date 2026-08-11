@@ -40,7 +40,7 @@ models:
 - `${PORT}` is assigned automatically by llama-swap per model instance — never hardcode a port in a model's `cmd`.
 - MoE models can use `--n-cpu-moe <N>` to offload N expert layers to CPU (see the `scout-moe` entry) when VRAM is tight.
 - Model `.gguf` files referenced in `config.yaml` must already exist under `llama.cpp\models\`.
-- **llama-swap only reads this file at startup.** After editing it, `-Action restart -Component swap` makes the change live without bouncing open-webui.
+- **llama-swap only reads this file at startup.** After editing it, `-Action restart -Component swap` makes the change live without bouncing open-webui. Check it first with `-Action check-config` — most config mistakes don't fail at startup, they fail as a connection error the first time you pick that model.
 - Context costs VRAM. On a 12 GB card, weights plus KV cache plus compute buffers have to fit, so a Q6_K quant of a 9 GB model leaves almost nothing for `-c`; dropping to Q4_K_M buys back roughly 3 GB of context headroom. `-ctk`/`-ctv` at `q4_0` halve the KV cache versus `q8_0` at some cost to long-context recall.
 
 ## Running the stack
@@ -102,6 +102,18 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
   Nothing else in the stack needs to change to use it. llama-swap spawns whatever a model's `cmd` names, `Stop-Stack` matches `llama-server.exe` by process name regardless of which directory it came from, and the tray's model list is parsed out of `config.yaml` — so start/stop/restart and the tray menu all work for prism-backed models with no extra wiring.
 - **bench** — runs `bench\run.py` against the live llama-swap (see below). Anything after `-Action bench` is forwarded to the script verbatim, which is why the param block sets `PositionalBinding = $false`; without it PowerShell binds trailing values to whichever parameter is next in declaration order.
+- **check-config** — the launch preflight (`Test-SwapConfig`) on its own, so a `config.yaml` edit can be checked without bouncing llama-swap to read the warnings on the way past. Every failure it looks for is one that llama-swap starts happily with, and that only shows up as `connection refused` from the proxy the first time that model is picked, because `llama-server` died on spawn:
+
+  | check | why it's invisible otherwise |
+  | --- | --- |
+  | weights file missing | llama-swap has no idea the path is wrong until it spawns |
+  | engine binary missing | a model on `${llama-server-prism}` without `-Action install-prism` can never start |
+  | macro not defined in `macros:` | a typo'd macro name expands to nothing |
+  | no `-m <file>.gguf` | llama-server starts with nothing to load |
+  | `--port` hardcoded | llama-swap assigns the port via `${PORT}`; a literal one is two models racing for it, and is exactly the `dial tcp [::1]:5800 refused` this stack produced once |
+  | duplicate model id | YAML keeps the last, so the earlier entry silently does nothing — including one you just edited |
+
+  It **warns and never blocks**, including on the launch path. An entry whose weights or engine aren't installed yet is a legitimate state, and refusing to start over one bad entry would take the other nine models down with it. The panel shows the engine half of this as `engine missing` in the Models table.
 - **status** — installed vs. pinned versions; `-Latest` adds the newest upstream release of each component (GitHub releases API + nodejs.org dist index).
 - **upgrade** — moves to the versions in the `$VER` table at the top of `start.ps1`, or to the newest upstream releases with `-Latest`. Stops the stack, deletes only the artifacts whose version actually changed, re-runs the deploy steps, relaunches. `llama.cpp\models\` and `llamaswap\config.yaml` are never touched. An open-webui version bump lands in a new `open-webui-<ver>\` directory with `backend\data\` (the `webui.db` holding users/chats/settings) and `.env` (holding `WEBUI_SECRET_KEY`) copied over; the previous directory is parked as `_old-open-webui-<ver>\` rather than deleted, so delete it manually once the upgrade is confirmed good.
 - **uninstall** — prints exactly what it will delete, then requires typing `yes` (`-Force` skips). Removes binaries, the open-webui tree, logs, the version stamp and the download cache. Keeps `.gguf` weights unless `-IncludeModels` is passed, and always keeps `start.ps1`, `CLAUDE.md`, `llamaswap\config.yaml`.
