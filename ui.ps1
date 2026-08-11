@@ -31,12 +31,26 @@ $webuiPort = 8080
 # ---------------------------------------------------------------- shortcuts
 
 function Find-AppBrowser {
-    # Any Chromium supports --app. Edge is on every Windows 11, so this effectively always hits.
-    @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-      "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
-      "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-      "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe") |
-        Where-Object { Test-Path $_ } | Select-Object -First 1
+    # Any Chromium supports --app, but which one is picked matters a lot for memory. Opening the
+    # window in a browser that is ALREADY RUNNING costs ~106 MB across 2 processes, because it
+    # joins the existing browser process tree. Cold-starting a different browser spins up a whole
+    # instance - browser, GPU, utility and renderer processes - and measured 500 MB. So prefer a
+    # live browser, and only fall back to a fixed order when none is running.
+    $installed = [ordered]@{
+        chrome = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+                   "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe")
+        msedge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe")
+        brave  = @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe")
+    }
+    $running = @(Get-Process -Name chrome, msedge, brave -ErrorAction SilentlyContinue |
+                 Select-Object -ExpandProperty ProcessName -Unique)
+
+    foreach ($name in @($running + $installed.Keys)) {      # running first, then any installed
+        foreach ($p in $installed[$name]) {
+            if ($p -and (Test-Path $p)) { return $p }
+        }
+    }
+    $null
 }
 
 if ($Install) {
