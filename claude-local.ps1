@@ -54,9 +54,20 @@ param(
     #
     # --disallowedTools does NOT help: it withholds permission but still sends the schema.
     # Only --tools, which picks the set that gets sent at all, keeps Workflow out of the request.
-    # Pass -Tools '' to send everything, i.e. to check whether upstream has fixed it.
+    # `--tools default` would send everything including Workflow, so it can't be used either.
+    #
+    # So this is an allow-list of everything EXCEPT Workflow, not a curated minimum. An earlier
+    # version copied a short list off a bug report and quietly cost the session the `PowerShell`
+    # tool - on Windows, of all things. Unknown names are ignored rather than rejected (verified:
+    # `--tools NopeNotARealTool` produces no error), so listing a superset is safe and is the
+    # right trade: a tool this misses is silently unavailable, while a tool that doesn't exist
+    # costs nothing.
+    #
+    # Pass -Tools '' to send everything, i.e. to check whether upstream has fixed the grammar bug.
     # See github.com/ggml-org/llama.cpp issues 25746 / 25923 / 25895.
-    [string]$Tools = 'Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill,Agent,TaskCreate',
+    [string]$Tools = 'Bash,PowerShell,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,' +
+                     'BashOutput,KillShell,Task,Agent,Skill,SlashCommand,TodoWrite,TaskCreate,' +
+                     'TaskUpdate,TaskList,TaskGet,TaskOutput,TaskStop,AskUserQuestion,ExitPlanMode',
 
     # Resume one specific conversation by its id. Claude Code keeps every session as
     # ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, and -r/--resume takes that id, so the
