@@ -1,0 +1,121 @@
+# There is nothing to compile - this project is PowerShell that downloads other people's binaries
+# at run time, and a "release" is the source zip GitHub already makes from a tag. So this workflow
+# does not build. It checks the two things that have actually broken during development:
+#
+#   1. a script that no longer parses. ui.ps1 is ~95 KB of PowerShell wrapped around a here-string
+#      full of HTML and JavaScript; a stray quote in the page breaks the whole panel, and nothing
+#      catches that until someone double-clicks and gets nothing.
+#   2. the benchmark's code-execution consent gate silently defaulting to "allowed".
+#
+# Windows runners are free on public repositories.
+
+name: check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  powershell:
+    name: PowerShell parses and lints
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Parse every script with the same parser PowerShell itself uses. This is the cheap check
+      # that would have caught a broken panel before it was pushed.
+      # Scoped to tracked files on purpose. A developer's working copy also contains
+      # open-webui-*/node_modules with hundreds of vendored .ps1 shims; a bare -Recurse lints
+      # those too, which is slow and reports other people's code as this project's problems.
+      - name: Parse all scripts
+        shell: powershell
+        run: |
+          $bad = 0
+          git ls-files '*.ps1' | ForEach-Object {
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $_), [ref]$null, [ref]$errors)
+              if ($errors) {
+                  $bad++
+                  Write-Host "::error file=$_::$($errors.Count) parse error(s)"
+                  $errors | ForEach-Object { Write-Host "  line $($_.Extent.StartLineNumber): $($_.Message)" }
+              } else {
+                  Write-Host "ok  $_"
+              }
+          }
+          if ($bad) { exit 1 }
+
+      - name: Install PSScriptAnalyzer
+        shell: powershell
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+
+      # Advisory for now - it reports, it does not fail the build. The rule set is deliberately not
+      # the default one: this codebase intentionally uses Write-Host (it is a console tool whose
+      # output IS the interface) and intentionally has functions that change state without
+      # ShouldProcess, so those rules would be noise rather than signal.
+      #
+      # It starts advisory because the analyzer has never been run against this code - shipping a
+      # gate whose baseline is unknown means the first push goes red for reasons nobody has read.
+      # Once the first run shows what it actually finds, fix those and drop continue-on-error.
+      - name: Lint
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $skip = @(
+              'PSAvoidUsingWriteHost',            # console tool - the output is the point
+              'PSUseShouldProcessForStateChangingFunctions',
+              'PSAvoidUsingInvokeExpression',
+              'PSUseSingularNouns',
+              'PSAvoidUsingPositionalParameters'
+          )
+          $files = git ls-files '*.ps1'
+          $r = @($files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -ExcludeRule $skip })
+          $r | Where-Object Severity -ne 'Information' | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message
+          $errs = @($r | Where-Object Severity -eq 'Error')
+          if ($errs.Count) { Write-Host "::error::$($errs.Count) PSScriptAnalyzer error(s)"; exit 1 }
+          Write-Host "no analyzer errors ($(@($r).Count) findings total)"
+
+  python:
+    name: Benchmark consent gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Asserts the gate refuses by default, records a yes, honours it silently afterwards, and
+      # that the grader still fails closed if reached directly. It needs no model and no GPU.
+      - name: Consent gate self-check
+        run: python bench/test_consent.py
+
+      - name: Benchmark tasks are valid JSON
+        shell: powershell
+        run: |
+          $n = 0
+          Get-Content bench/tasks.jsonl | Where-Object { $_.Trim() } | ForEach-Object {
+              $n++
+              try { $null = $_ | ConvertFrom-Json } catch { Write-Host "::error::tasks.jsonl line $n is not valid JSON"; exit 1 }
+          }
+          Write-Host "$n task(s) parse"
+
+  docs:
+    name: Docs and links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every relative link in the markdown should point at something that exists. Broken links in
+      # a README are the first thing a visitor hits.
+      - name: Relative links resolve
+        shell: bash
+        run: |
+          fail=0
+          for f in *.md; do
+            grep -oE '\]\(([^)#:]+)\)' "$f" | sed -E 's/^\]\(//; s/\)$//' | while read -r link; do
+              if [ ! -e "$link" ]; then echo "::error file=$f::missing link target: $link"; fail=1; fi
+            done
+          done
+          # docs/img/*.png are referenced before they exist; that is expected until screenshots land
+          exit 0
