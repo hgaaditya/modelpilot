@@ -204,6 +204,19 @@ The use case that shapes it: you are mid-project, your quota is gone, and you wa
 - **`-Check` really calls `/v1/messages`.** `/health` being up says nothing about the Anthropic-shaped surface working, and that's what the handoff depends on. `-Json` is the same thing for the panel.
 - **`-Resume` and `-Prompt` are switches, not passthrough**, and that's not stylistic. `powershell -File script.ps1 -- --continue` fails before the script runs — `--` parses as an empty parameter name — and PowerShell prefix-matches, so claude's own `-p` binds to this script's `-Port` and dies with a type error about `Int32`. Both were live bugs in the documented invocation. `-ClaudeArgs` still exists for anything else but is only reliable from a PowerShell session.
 - `-SmallModel` (default `qwen2.5-0.5b-instruct-q4_k_m`) backs `ANTHROPIC_SMALL_FAST_MODEL`, which Claude Code uses for background work like conversation titles. Pointing it at the main model makes every trivial call trigger a multi-GB swap. If it isn't configured the script warns and falls back to the main model rather than refusing to start — it's a convenience, not a requirement.
+- **`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set from the model's own `-c`, and matters more than anything else here.** Claude Code doesn't recognise these model ids, so it assumes a **200k** window and runs auto-compact against that assumption while the model behind it holds 65536. Measured with it unset: a one-word question became **84 requests over 27 minutes** and never answered, with single responses of 3.6 MB — the client kept feeding back a history the model couldn't hold, so it never converged. With it set: 14 requests. Same failure the stack already documents for open-webui and continue.dev — the client can only prune if it knows the real budget — and the number is parsed straight out of `config.yaml`.
+
+### What a local model can and can't do as an agent — measured
+
+Against `gemma4-v2` (Q4_K_M, `-c 65536`) on this box, after the context fix:
+
+| task | result |
+| --- | --- |
+| `-Prompt "Reply with the single word: ok"` | **33s, 4 requests, correct** |
+| A single `/v1/messages` call with one tool defined | **correct** — `stop_reason: tool_use`, right tool, right input |
+| `-Prompt "read hello.py and name the function"` (full Claude Code toolset) | **did not converge** — 14+ turns, killed at 10 minutes |
+
+So the plumbing is sound and tool-calling is correctly formatted; what fails is a multi-step agent loop with the whole toolset in play. Treat the handoff as **usable for direct questions and one-shot work, not yet for unattended multi-step editing** — and don't read a long run as a wiring bug, because it isn't one. If a run stalls, `logs\llama-swap.log` shows a line per `/v1/messages` with its duration and response size; a turn count climbing past ~10 on a trivial task is the loop failing to converge, not a hang.
 
 **Local agent — `local-agent.ps1`.** opencode driving a local model, with Anthropic not involved at all. See its own notes for what a local 27B does and doesn't get right about editing files.
 

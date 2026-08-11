@@ -209,10 +209,22 @@ $env:ANTHROPIC_SMALL_FAST_MODEL = $SmallModel
 # optimistic once a multi-GB model has to be swapped in before anything can be generated.
 $env:API_TIMEOUT_MS       = '600000'
 
+# The one that decides whether this is usable at all. Claude Code doesn't recognise these model
+# ids, so it assumes a 200k context window and runs auto-compact against that assumption - while
+# the model behind it has whatever -c config.yaml gave it. Left unset against a 65536 model, a
+# one-word question turned into 84 requests over 27 minutes, with single responses of 3.6 MB: the
+# client kept feeding a history the model could not hold, so it never converged.
+#
+# This is the same failure the rest of this stack already documents for open-webui and
+# continue.dev - the client can only prune correctly if it knows the real budget - and the number
+# is right here, parsed out of the model's own -c.
+$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = "$($report.context)"
+
 Write-Host "Claude Code -> $base"
 Write-Host "  model:       $Model  (-c $($report.context))"
 Write-Host "  small model: $SmallModel"
 Write-Host "  directory:   $(Get-Location)"
+Write-Host "  context:     $($report.context) tokens (told to Claude Code, which would otherwise assume 200k)"
 Write-Host ""
 if (-not $Resume) { Write-Host "Picking up an existing session in this directory? Add -Resume." ; Write-Host "" }
 
