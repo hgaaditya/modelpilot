@@ -240,14 +240,23 @@ On this box, with every fix above in place:
 
 | model | result |
 | --- | --- |
-| `bonsai-27b` | **fails in 24s** — `400 ... Jinja Exception: System message must be at the beginning`. Its chat template rejects Claude Code's payload outright. |
-| `qwen3-30b-moe` at `-c 32768` | **runs the loop, then `Prompt is too long`.** Claude Code's system prompt plus tool definitions doesn't fit in 32768 even with `Workflow` excluded. |
-| `gemma4-v2` at `-c 65536` | **doesn't converge in 300s.** Turns are ~2s now, so this is ~150 turns without finishing — a capability limit, cleanly separated from the speed problem. |
+| `qwen3-30b-moe` at `-c 40960` | **works** — real tool call, right answer, 74s. `--n-cpu-moe 14`, 40.3 tok/s, 10648 MiB. |
+| `gemma4-v2` at `-c 65536` | **works** — 33s. |
+| `bonsai-27b` at `-c 65536` | **works.** |
+| `qwen3-30b-moe` at `-c 32768` | **`Prompt is too long`** — Claude Code's system prompt plus tool definitions doesn't fit in 32768 even with `Workflow` excluded. This one is about the number, not the model. |
 
-Two lessons worth keeping:
+**Every model on this box works.** That is worth stating loudly, because during development each of the three was at some point confidently declared incapable — one for "not converging", one for a "wrong answer", one for a chat-template rejection that looked completely unambiguous. All three verdicts were harness bugs. `bonsai-27b`'s `Jinja Exception: System message must be at the beginning` was the most convincing of them and it disappeared once the probe stopped dragging the user's own `CLAUDE.md` and `SessionStart` hook output into the request.
 
-1. **"32K is the floor" is optimistic.** It's repeated everywhere and it isn't enough for real Claude Code with tools — `Prompt is too long` at exactly 32768 is the evidence. `$MIN_AGENT_CTX` is a pre-filter only; the probe is what decides.
+Three lessons, all of them about the harness rather than the models:
+
+1. **"32K is the floor" is optimistic.** Repeated everywhere, and not enough for real Claude Code with tools — `Prompt is too long` at exactly 32768 is the evidence. `$MIN_AGENT_CTX` is a pre-filter only; the probe decides.
 2. **Model choice is not just about context**, which is why the panel offers a dropdown rather than auto-picking: the auto-pick sorts on `-c` and cannot know any of the above.
+3. **Three separate harness bugs each produced a confident, wrong "this model can't do agentic work" verdict**, and all three failed in the direction of blaming the model:
+   - the probe asked a question needing no tool, so it never reached the code that breaks — and stamped a model *verified* that failed instantly on real work;
+   - the probe inherited the user's own `CLAUDE.md`, plugins and hooks, so a `SessionStart` hook's output came back as the model's answer (fixed with `--bare`);
+   - `Start-Process -ArgumentList` does **not** quote elements containing spaces, so the prompt arrived word-split — Claude Code got `-p "Read"` plus five stray arguments, and models sensibly replied "which file did you mean?". Proved by passing the same array to a script that prints `$args`.
+
+   Every one of these failed in the same direction: blaming the model. A local model producing odd behaviour is the *expected* answer, which is exactly what makes it the dangerous one — it explains any result, so it gets accepted without the evidence a surprising claim would need. Before concluding a model can't do something here, reproduce it outside this harness.
 
 `bonsai-27b` is worth understanding before trusting `-Check`. Its chat template rejects Claude Code's real payload, but **every synthetic shape passes** — plain user, system as string, system as a block array, tools, content as a block array, a prior assistant turn, and a complete `tool_use`/`tool_result` round trip were all tried and all returned 200. So whatever ordering llama-swap produces from Claude Code's actual request isn't reproducible from the obvious payloads, and `-Check` reports Ready for a model that then fails. **`-Check` is necessary, not sufficient** — it proves the endpoint and the model answer, not that a session will hold together.
 

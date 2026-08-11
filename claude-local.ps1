@@ -284,8 +284,21 @@ if ($Check -and -not $report.problem) {
         Set-LocalEnv $report.context
         # Bounded, because "never converges" is one of the two ways this fails and an unbounded
         # probe would simply hang instead of reporting it.
-        $probeArgs = @('-p', 'Read the file probe_target.py and reply with only the name of the function it defines.',
-                       '--settings', (New-SessionSettings))
+        # --bare skips hooks, plugins and LSP. Without it the probe measures the user's Claude Code
+        # setup rather than the model: on this machine a SessionStart hook's own output came back
+        # as the answer ("Summary of previous conversation in SessionStart hook..."), failing a
+        # model that had done nothing wrong. A compatibility verdict has to be about the model.
+        # The path is absolute because Claude Code's Read tool requires one. Given a bare filename
+        # a model does the right thing and asks for the absolute path - and in -p mode there is
+        # nobody to answer, so the probe recorded a correct model as broken. The probe has to test
+        # the model, not whether it can guess the working directory.
+        # Start-Process joins -ArgumentList with spaces and does NOT quote elements that contain
+        # spaces, so a prompt passed as one array element arrives word-split: claude saw -p "Read"
+        # followed by loose garbage, and the model - correctly - replied that it did not know
+        # which file was meant. Every element that can contain a space is quoted here by hand.
+        $probeFile = Join-Path $probeDir 'probe_target.py'
+        $prompt = "Read the file $probeFile and reply with only the name of the function it defines."
+        $probeArgs = @('-p', "`"$prompt`"", '--bare', '--settings', "`"$(New-SessionSettings)`"")
         if ($Tools) { $probeArgs += @('--tools', $Tools) }
         $p = Start-Process -FilePath (Get-Command claude).Source -PassThru -WindowStyle Hidden `
                  -WorkingDirectory $probeDir -RedirectStandardOutput $logOut -RedirectStandardError $logErr `

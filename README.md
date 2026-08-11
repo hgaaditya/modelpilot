@@ -52,13 +52,14 @@ model with at least 32k of context — Claude Code sends 15–25k tokens of syst
 definitions before your first message — so check with `.\claude-local.ps1 -Check`, which names
 what's missing rather than failing later inside the session.
 
-**What to expect.** Direct questions and one-shot work land in seconds. Long multi-step editing
-sessions, where the model has to drive a dozen tools to a conclusion, are where a local model
-currently struggles — measured here, one model answered a plain question in 33 seconds but would
-not converge on "read this file and name its function" inside ten minutes, and another failed
-outright on Claude Code's message format. Which model you pick matters as much as its size, so the
-tab lets you choose one and test it. Good enough to keep moving; not yet a replacement for
-unattended agentic work.
+**What to expect.** Measured here, a 30B sparse-MoE model read a file with a tool and answered
+correctly in 74 seconds, at about 40 tokens/sec. It is slower than the hosted model and it will not
+carry a long unattended refactor, but it keeps a session moving.
+
+Press **Test it** on the Coding agents tab before you rely on a model. It runs Claude Code for
+real, makes it use a tool, and remembers the answer — a model that merely responds to a chat
+message can still fail the moment tools are involved, and the tab only offers ones that have
+actually passed.
 
 The other direction also works: keep Claude Code on the cloud model and hand only the token-heavy
 reading to a local one with `local-llm.ps1`, so a 200k-token log costs nothing against your quota.
