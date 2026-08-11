@@ -176,7 +176,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action bench --compare ben
 
 The constraint that shapes everything: **tasks must be machine-gradeable**, since an LLM judge would defeat the point. `bench\tasks.jsonl` holds one task per line, each with a `type` naming its grader:
 
-- `python` — extracts the code block and runs it against the task's `tests` in a subprocess. **This executes model-generated code on your machine**, sandboxed only by a timeout and a temp directory. Fine for models you chose to download; exclude these with `--tasks` if that isn't acceptable.
+- `python` — extracts the code block and runs it against the task's `tests` in a subprocess. **This executes model-generated code on your machine**, as you, sandboxed only by a timeout and a temp directory. It is therefore **gated on consent** and skipped until granted; see below.
 - `json` — output must parse as JSON and carry the expected keys. Catches models that wrap JSON in prose or fences.
 - `regex` / `contains` — exact-format and exact-answer checks.
 - `needle` — the harness generates a long deterministic haystack, buries a fact at a given `depth`, and asks for it back. This is the one that actually exercises the context sizes configured in `config.yaml`.
@@ -186,6 +186,16 @@ Speed numbers come from llama.cpp's own `timings` block in the response (`predic
 Results land in `bench\results\<timestamp>.json` (gitignored). `--compare` diffs a run against an earlier one, which is the point of keeping them: it's how you tell whether a quant change or a context change actually helped. `--repeat N` runs each task N times and reports the median, for when a single sample is too noisy to trust.
 
 Adding a task is one line in `tasks.jsonl` — no code change, as long as an existing grader covers it.
+
+### The code-execution gate
+
+Running the model's code is the only way the `python` grader can tell whether it works, so there's no version of that task that doesn't execute. What there is, is a decision made explicitly:
+
+- Run `bench\run.py` from a terminal and it explains what will happen and asks. Answering `yes` is recorded in `bench\.code-exec-consent` (gitignored — consent doesn't travel with a clone) so it's asked once and not on every run, which is what trains people to pass the flag reflexively.
+- `--allow-code-execution` skips the question for scripted runs. It deliberately does **not** write the consent file: a flag is per-run, not a standing grant.
+- With no terminal to ask — `-Action bench` from `start.ps1` or the panel both run detached — the answer is **no**, and the `python` tasks are dropped with a message saying how to enable them. Defaulting to yes when there's nobody there to object isn't consent.
+
+`grade_python` re-checks the flag itself rather than trusting the task filter in `main()`, so a future caller that bypasses the filter fails closed instead of quietly executing. `bench\test_consent.py` asserts all of that, including that the grader writes no file when the gate is off; run it after touching any of this.
 
 ## Working inside `open-webui-0.11.0/`
 

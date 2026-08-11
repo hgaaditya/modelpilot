@@ -56,9 +56,10 @@ Run `-Action status` to see what's installed against what's pinned.
 - **The control panel has no password.** It binds to `127.0.0.1` and rejects cross-origin requests,
   so websites you visit can't drive it — but any program running as you on this machine can. It
   assumes a single-user desktop.
-- **`bench\run.py` executes code the model writes**, in a temp directory under a timeout, in order
-  to grade whether the code works. That is the point of that grader, but it is real execution — run
-  it only with models you're willing to trust, or exclude those tasks with `--tasks json needle`.
+- **`bench\run.py` can execute code the model writes**, in a temp directory under a timeout, in
+  order to grade whether that code works. It asks first, and skips those tasks unless you say yes;
+  nothing runs code because you happened to start a benchmark. The rest of the benchmark — JSON,
+  regex, long-context recall — never executes anything.
 - **Models are downloaded from Hugging Face** over the network. Nothing else phones home; the
   version checker queries GitHub only when you press *Check for updates*.
 

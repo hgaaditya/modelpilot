@@ -13,6 +13,9 @@ by machine: exact answers, parseable JSON, code that either passes its tests or 
 
 Speed numbers come from llama.cpp's own `timings` block, so they measure the model rather
 than this script's overhead.
+
+The 'python' tasks grade code by running it, which means executing model-generated code on
+this machine. They are skipped until you say otherwise - see allow_code_execution.
 """
 
 import argparse
@@ -33,6 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "llamaswap" / "config.yaml"
 TASKS = Path(__file__).resolve().parent / "tasks.jsonl"
 RESULTS = Path(__file__).resolve().parent / "results"
+CONSENT = Path(__file__).resolve().parent / ".code-exec-consent"
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 CODE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
@@ -109,10 +113,13 @@ def grade_json(task, text):
 def grade_python(task, text):
     """Run the model's code against the task's asserts.
 
-    NOTE: this executes model-generated code on this machine. It's sandboxed only by a
-    timeout and a temp directory - fine for benchmarking models you chose to download,
-    not something to point at untrusted output. Skip these with --tasks to avoid it.
+    This executes model-generated code on this machine, sandboxed only by a timeout and a
+    temp directory. Gated on consent (see allow_code_execution) rather than on a comment
+    nobody reads. The check is repeated here so a future caller that skips the filter in
+    main() fails closed instead of quietly executing.
     """
+    if not ALLOW_EXEC:
+        return False, "code execution not permitted (see --allow-code-execution)"
     m = CODE_RE.search(text)
     code = m.group(1) if m else text
     src = code + "\n\n" + task["tests"] + "\nprint('PASS')\n"
@@ -131,6 +138,55 @@ def grade_python(task, text):
 
 
 GRADERS = {"contains": grade_contains, "regex": grade_regex, "json": grade_json, "python": grade_python}
+
+# Set once by main(). The python grader is the only thing in this harness that runs code it
+# didn't write, so nothing executes until this is explicitly turned on.
+ALLOW_EXEC = False
+
+
+def allow_code_execution(flag):
+    """Decide whether the python grader may run model-written code.
+
+    Three ways in, in order: an explicit --allow-code-execution, a previous yes recorded in
+    bench/.code-exec-consent, or a prompt. Answering the prompt is remembered, because a
+    question asked on every single run trains people to pass the flag reflexively, which is
+    exactly the habit a consent gate exists to prevent.
+
+    With no terminal to ask - the control panel and start.ps1 both run this detached - the
+    answer is no. Defaulting to yes when there is nobody to object is not consent.
+    """
+    if flag:
+        return True
+    if CONSENT.exists():
+        return True
+    if not sys.stdin.isatty():
+        print("Skipping the 'python' tasks: they run model-generated code, and there's no\n"
+              "terminal here to ask. Run bench/run.py directly to be asked, or pass\n"
+              "--allow-code-execution if you already know you want it.\n")
+        return False
+    print("\n" + "=" * 72)
+    print("The 'python' tasks grade a model by RUNNING THE CODE IT WROTE on this machine.")
+    print("It runs as you, with your permissions, in a temp directory under a 15s timeout -")
+    print("that is the only sandbox. A model can write a program that deletes files, opens")
+    print("network connections, or anything else you could do yourself.")
+    print("")
+    print("This is how the grader decides whether the code works, so there is no version of")
+    print("the task that doesn't execute it. The other graders (json, regex, contains,")
+    print("needle) never execute anything and are unaffected by this answer.")
+    print("=" * 72)
+    try:
+        answer = input("Type 'yes' to allow code execution (anything else skips those tasks): ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() != "yes":
+        print("Skipping the 'python' tasks.\n")
+        return False
+    CONSENT.write_text(
+        "Consent to run model-generated code, given at %s.\n"
+        "Delete this file to be asked again.\n" % datetime.now().isoformat(timespec="seconds"),
+        encoding="utf-8")
+    print("Recorded in %s - delete that file to be asked again.\n" % CONSENT)
+    return True
 
 
 FILLER = ("The archive contains routine maintenance records. "
@@ -224,12 +280,24 @@ def main():
     ap.add_argument("--cooldown", type=int, default=10,
                     help="seconds to idle between models, letting llama-swap free VRAM before the "
                          "next one loads (0 to disable)")
+    ap.add_argument("--allow-code-execution", action="store_true",
+                    help="permit the 'python' tasks to run model-generated code on this machine "
+                         "without asking (otherwise you're prompted, or they're skipped)")
     args = ap.parse_args()
 
     all_tasks = [json.loads(l) for l in TASKS.read_text(encoding="utf-8").splitlines() if l.strip()]
     if args.tasks:
         want = set(args.tasks)
         all_tasks = [t for t in all_tasks if t["id"] in want or t["type"] in want]
+
+    # Ask before selecting the tasks, not while grading: dropping them here means a run that
+    # was going to execute code says so up front, rather than at the first python task minutes in.
+    global ALLOW_EXEC
+    if any(t["type"] == "python" for t in all_tasks):
+        ALLOW_EXEC = allow_code_execution(args.allow_code_execution)
+        if not ALLOW_EXEC:
+            all_tasks = [t for t in all_tasks if t["type"] != "python"]
+
     models = args.models or models_from_config(CONFIG)
     if not all_tasks or not models:
         sys.exit("nothing to run (tasks=%d models=%d)" % (len(all_tasks), len(models)))

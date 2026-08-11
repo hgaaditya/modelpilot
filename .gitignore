@@ -24,9 +24,19 @@
 
 # editor/session cruft
 /.claude/
+__pycache__/
+*.pyc
+
+# hardware/crash investigation output - diagnose.ps1's reports, and whatever monitoring tool
+# was pointed at the box during a stability hunt
+/diag-*.txt
+/GPU-Z Sensor Log.txt
 
 # benchmark output (timestamped runs, regenerable)
 /bench/results/
+
+# per-machine answer to "may the python grader run model-written code" - consent doesn't travel
+/bench/.code-exec-consent
 
 # PrismML llama.cpp fork (downloaded by -Action install-prism, ~1.2 GB of binaries)
 /llama.cpp-prism/
