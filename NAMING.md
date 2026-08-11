@@ -6,6 +6,10 @@ The code is MIT — fork it, change it, sell it, embed it in something closed. T
 It does not grant rights to the **name**. Those are different things, and the MIT licence is silent
 on trademarks by design.
 
+(This lives in its own file rather than as a paragraph appended to `LICENSE`, because GitHub
+detects licences by matching the file against canonical text — an extra paragraph makes it report
+"Other" instead of MIT, losing the badge and the ability to filter for it. Keep `LICENSE` verbatim.)
+
 ## What that means in practice
 
 **You may**, without asking:
