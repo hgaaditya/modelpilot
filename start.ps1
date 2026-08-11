@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -84,6 +84,19 @@ param(
     # uninstall: also delete the multi-GB .gguf weights (kept by default - they're slow to re-fetch).
     [switch]$IncludeModels,
 
+    # suggest: narrow llmfit's recommendations. Capability defaults to tool_use because a model
+    # that cannot call tools is useless for the coding-agent path, which is the reason most people
+    # are picking a model here at all - and it is the property they otherwise find out last.
+    [ValidateSet('general', 'coding', 'reasoning', 'chat', 'multimodal', 'embedding')]
+    [string]$UseCase,
+    [string]$Capability = 'tool_use',
+    [ValidateSet('perfect', 'good', 'marginal')]
+    [string]$MinFit = 'good',
+    [int]$Top = 8,
+
+    # suggest: machine-readable, for the control panel.
+    [switch]$Json,
+
     # uninstall: skip the confirmation prompt.
     [switch]$Force
 )
@@ -104,12 +117,19 @@ $VER = @{
     # Bonsai-style ternary weights use ggml tensor types 42/142, and stock b10155 tops out at 41,
     # so those models fail to load on the normal binary no matter how they're configured.
     prism     = 'prism-b9599-9ca265a'
+    # llmfit (MIT, github.com/AlexsJones/llmfit) - a hardware-aware model recommender. Answers the
+    # question this stack could not: not "does this quant of the model I already chose fit", which
+    # is '-Action inspect', but "which model should I get at all". 5 MB download, installed by
+    # '-Action install-llmfit'.
+    llmfit    = 'v1.1.9'
 }
 
 $root         = $PSScriptRoot
 $llamaCpp     = Join-Path $root 'llama.cpp'
 $llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side with the stock build
 $modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
+$llmfitDir    = Join-Path $root 'llmfit'
+$llmfitExe    = Join-Path $llmfitDir 'llmfit.exe'
 $llamaSwapDir = Join-Path $root 'llamaswap'
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
@@ -952,6 +972,112 @@ function Invoke-Autotune {
 if ($Action -eq 'stop') { Stop-Stack $Component; return }
 
 if ($Action -eq 'tray') { Start-Tray; Write-Host "Tray indicator started (look in the notification area)."; return }
+
+if ($Action -eq 'install-llmfit') {
+    # llmfit is a single 24 MB exe, MIT-licensed, and answers a question nothing else here does:
+    # which model to get in the first place. Separate from deploy because the stack works fine
+    # without it - it recommends, it doesn't run anything.
+    if ((Test-Path $llmfitExe) -and -not $Force) {
+        Write-Host "$llmfitExe already present (use -Force to reinstall)."
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $llmfitDir, $dl | Out-Null
+    $tag = $VER.llmfit
+    if ($Latest) {
+        $r = Get-GitHubRelease 'AlexsJones/llmfit'
+        if ($r) { $tag = $r.tag_name } else { Write-Warning "Could not query llmfit's releases - using pinned $tag" }
+    }
+    $rel = Get-GitHubRelease 'AlexsJones/llmfit' $tag
+    if (-not $rel) { throw "No release '$tag' in AlexsJones/llmfit." }
+    # Matched by shape, not by a name built from the tag, so a changed naming scheme fails loudly
+    # here rather than 404ing on a URL we guessed.
+    $asset = $rel.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
+    if (-not $asset) {
+        Write-Host "`nNo Windows x64 asset in $tag. Available:"
+        $rel.assets | ForEach-Object { Write-Host "  $($_.name)" }
+        throw "Nothing to install."
+    }
+    $zip = Join-Path $dl $asset.name
+    if (-not (Test-Path $zip)) { Get-File $asset.browser_download_url $zip }
+    $tmp = Join-Path $dl 'llmfit-x'
+    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    # The archive nests everything under a versioned directory, so find the exe rather than
+    # assuming it sits at the root.
+    $found = Get-ChildItem $tmp -Recurse -Filter 'llmfit.exe' | Select-Object -First 1
+    if (-not $found) { throw "llmfit.exe not found inside $($asset.name)." }
+    Copy-Item $found.FullName $llmfitExe -Force
+    Get-ChildItem $tmp -Recurse -Include 'LICENSE', 'README.md' | ForEach-Object { Copy-Item $_.FullName $llmfitDir -Force }
+    Remove-Item $tmp -Recurse -Force
+
+    $stamp = Read-Stamp; if (-not $stamp) { $stamp = @{} }
+    $stamp['llmfit'] = $tag
+    Write-Stamp $stamp
+    Write-Host "Installed llmfit $tag to $llmfitExe"
+    Write-Host "Ask it what to run:  .\start.ps1 -Action suggest"
+    return
+}
+
+if ($Action -eq 'suggest') {
+    # Complements '-Action inspect' rather than replacing it. inspect answers "which quant of THIS
+    # repo fits"; suggest answers "which model at all", which is the question a new install
+    # actually has and which this stack previously answered with "paste a Hugging Face repo".
+    if (-not (Test-Path $llmfitExe)) { throw "llmfit isn't installed - run '.\start.ps1 -Action install-llmfit' (5 MB)." }
+
+    # --runtime llamacpp because that is the only engine here; --capability tool_use because a
+    # model that can't call tools is useless for the coding-agent path, and it is the capability
+    # people most often discover the hard way. --no-dashboard because llmfit otherwise starts a
+    # background web server, which this is not asking for.
+    $a = @('recommend', '--runtime', 'llamacpp', '--min-fit', $MinFit, '-n', "$Top", '--no-dashboard')
+    if ($UseCase)    { $a += @('--use-case', $UseCase) }
+    if ($Capability) { $a += @('--capability', $Capability) }
+
+    Write-Host "Asking llmfit what fits this machine..."
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $raw = try { & $llmfitExe @a 2>$null | Out-String } finally { $ErrorActionPreference = $old }
+    if (-not $raw.Trim()) { throw "llmfit returned nothing. Try running '$llmfitExe doctor' directly." }
+    $data = $raw | ConvertFrom-Json
+
+    # Only rows we can actually act on: llmfit also ranks vLLM/AWQ and MLX builds, which this
+    # stack cannot load, and those carry no GGUF source to download.
+    $rows = @($data.models | Where-Object { $_.gguf_sources -and $_.gguf_sources.Count -gt 0 })
+
+    if ($Json) {
+        # Flattened to exactly what a caller needs to show a row and act on it: the repo and quant
+        # are what '-Action add-model' takes, so the panel's Download button is a one-liner.
+        @{ models = @($rows | ForEach-Object {
+                @{ name = $_.name; repo = $_.gguf_sources[0].repo; quant = $_.best_quant
+                   fit = $_.fit_label; sizeGb = $_.disk_size_gb; tps = $_.estimated_tps
+                   moe = [bool]$_.is_moe; ctx = $_.context_length; license = "$($_.license)" } }) } |
+            ConvertTo-Json -Depth 5 -Compress
+        return
+    }
+
+    if (-not $rows.Count) {
+        Write-Warning "llmfit found no GGUF-backed model matching those filters. Loosen them with -MinFit marginal, or drop -Capability."
+        return
+    }
+
+    Write-Host ""
+    Write-Host ("{0,-46} {1,-9} {2,-8} {3,7} {4,8}  {5}" -f 'model', 'quant', 'fit', 'GB', 'tok/s', 'notes')
+    Write-Host ('-' * 108)
+    foreach ($m in $rows) {
+        $note = @()
+        if ($m.is_moe) { $note += 'MoE' }
+        if ($m.context_length) { $note += "ctx $($m.context_length)" }
+        Write-Host ("{0,-46} {1,-9} {2,-8} {3,7:N1} {4,8:N1}  {5}" -f
+            $m.name.Substring(0, [Math]::Min(46, $m.name.Length)), $m.best_quant, $m.fit_label,
+            $m.disk_size_gb, $m.estimated_tps, ($note -join ', '))
+    }
+    Write-Host ""
+    Write-Host "Fetch one with (repo is llmfit's GGUF source, not the model name above):"
+    foreach ($m in $rows | Select-Object -First 3) {
+        Write-Host "  .\start.ps1 -Action add-model -Model '$($m.gguf_sources[0].repo)' -Quant $($m.best_quant)"
+    }
+    Write-Host ""
+    Write-Host "Speeds are llmfit's estimate from memory bandwidth, not a measurement - '-Action bench' measures."
+    return
+}
 
 if ($Action -eq 'install-prism') {
     # Deliberately a separate action rather than part of deploy: it's ~620 MB of downloads that

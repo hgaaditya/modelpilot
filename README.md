@@ -20,7 +20,7 @@ The panel opens and walks you through three steps:
 | | |
 | --- | --- |
 | **1. Press Start** | Downloads the inference engine, the router and the chat UI (~1.5 GB). Several minutes, once. |
-| **2. Add a model** | On the **Models** tab, paste a Hugging Face GGUF repo — `unsloth/gpt-oss-20b-GGUF` is a good first one — press **Inspect**, and download whichever variant it says fits your card. It measures your actual free VRAM rather than guessing. |
+| **2. Add a model** | On the **Models** tab, press **Suggest models** — it ranks known models against your actual RAM, VRAM and memory bandwidth and lists only ones that can call tools, each with a Download button. If you already know what you want, paste its Hugging Face GGUF repo and press **Inspect** to see which quant fits. |
 | **3. Open the chat** | The **Open** button next to open-webui. Your first message loads the model, which takes a few seconds. |
 
 Closing the panel window doesn't stop anything — it minimises to a tray icon, and the models keep

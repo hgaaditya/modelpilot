@@ -662,7 +662,20 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 </div>
 
 <div class="pane" id="p2">
- <fieldset><legend>Add a model</legend>
+ <fieldset><legend>What should I run?</legend>
+  <div class="mode">Ranks known models against this machine's actual RAM, VRAM and memory bandwidth, and only lists ones that can call tools - so what you download can drive a coding agent.</div>
+  <div class="row">
+   <select id="sgcase" style="width:auto">
+    <option value="">any use case</option><option value="coding">coding</option>
+    <option value="reasoning">reasoning</option><option value="general">general</option><option value="chat">chat</option>
+   </select>
+   <button class="gh" id="sgbtn" onclick="suggest()">Suggest models</button>
+   <span id="sgmsg" style="color:var(--dim);font-size:11px"></span>
+  </div>
+  <div id="sug"></div>
+ </fieldset>
+
+ <fieldset><legend>Add a model you already know</legend>
   <div class="row">
    <input id="repo" placeholder="Hugging Face repo, e.g. unsloth/gpt-oss-20b-GGUF  (or a direct .gguf URL)" style="flex:1;min-width:260px">
    <button class="gh" onclick="inspect()">Inspect</button>
@@ -938,6 +951,25 @@ async function del(id,gb){
  setTimeout(tick,700);
 }
 function fmt(mb){return (mb/1024).toFixed(1)+' GB'}
+async function suggest(){
+ const b=document.getElementById('sgbtn');b.classList.add('busy');b.disabled=true;
+ document.getElementById('sgmsg').textContent='scoring models against this hardware...';
+ try{
+  const d=await (await fetch('/api/suggest?usecase='+encodeURIComponent(document.getElementById('sgcase').value))).json();
+  if(d.error){document.getElementById('sug').innerHTML='<div class="hint miss">'+d.error+'</div>';return}
+  const m=d.models||[];
+  document.getElementById('sug').innerHTML=m.length?
+   '<table><thead><tr><th>Model</th><th>Quant</th><th>Fit</th><th>Size</th><th>est. tok/s</th><th>Context</th><th></th></tr></thead><tbody>'+
+   m.map(x=>`<tr><td>${x.name}${x.moe?' <span class="tag">MoE</span>':''}</td><td>${x.quant}</td>
+    <td>${x.fit==='Perfect'?'<span class="on2">'+x.fit+'</span>':x.fit}</td>
+    <td>${x.sizeGb} GB</td><td>${x.tps}</td><td>${x.ctx||'-'}</td>
+    <td><button class="gh" onclick="dl('${x.repo}','${x.quant}')">Download</button></td></tr>`).join('')+
+   '</tbody></table><div class="hint" style="margin:7px 0 0">Speeds are estimated from memory bandwidth, not measured - <code>-Action bench</code> measures. A model needs -c 32768 or more to drive Claude Code; set that on the Models list after downloading.</div>'
+   :'<div class="hint">Nothing fits this machine with those filters.</div>';
+  document.getElementById('sgmsg').textContent='';
+ }catch(e){document.getElementById('sug').innerHTML='<div class="hint miss">'+e+'</div>'}
+ finally{b.classList.remove('busy');b.disabled=false;document.getElementById('sgmsg').textContent=''}
+}
 async function inspect(){
  const r=document.getElementById('repo').value.trim(); if(!r)return;
  spin('inspect',120000);
@@ -1251,6 +1283,24 @@ try {
                     if ($p.quant) { $a += @('-Quant', $p.quant) }
                     Start-Job2 "download" $a | Out-Null
                     $body = '{"ok":true}'
+                }
+                '^/api/suggest$' {
+                    # llmfit is offline and answers in a couple of seconds, so this runs inline
+                    # rather than as a job - the whole point is a list you act on immediately.
+                    $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs,
+                           '-Action', 'suggest', '-Json', '-Top', '8')
+                    if ($q['usecase']) { $a += @('-UseCase', $q['usecase']) }
+                    if ($q['tools'] -eq '0') { $a += @('-Capability', '') }
+                    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+                    $out = try { & powershell @a 2>&1 | ForEach-Object { "$_" } } finally { $ErrorActionPreference = $old }
+                    $line = $out | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -First 1
+                    if ($line) { $body = $line }
+                    else {
+                        $res.StatusCode = 500
+                        $msg = ($out | Where-Object { $_.Trim() -and $_ -notmatch '^\s*(\+|At line|At C:)' } | Select-Object -First 1)
+                        $body = @{ error = ("$msg" -replace '^powershell(\.exe)?\s*:\s*', '').Trim() } | ConvertTo-Json -Compress
+                    }
                 }
                 '^/api/inspect$' {
                     # Runs inline: it is the one action the user is actively waiting on, and its

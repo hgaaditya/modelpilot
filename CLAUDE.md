@@ -102,6 +102,19 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
   Nothing else in the stack needs to change to use it. llama-swap spawns whatever a model's `cmd` names, `Stop-Stack` matches `llama-server.exe` by process name regardless of which directory it came from, and the tray's model list is parsed out of `config.yaml` — so start/stop/restart and the tray menu all work for prism-backed models with no extra wiring.
 - **bench** — runs `bench\run.py` against the live llama-swap (see below). Anything after `-Action bench` is forwarded to the script verbatim, which is why the param block sets `PositionalBinding = $false`; without it PowerShell binds trailing values to whichever parameter is next in declaration order.
+- **install-llmfit** / **suggest** — [llmfit](https://github.com/AlexsJones/llmfit) (MIT, Rust, one 24 MB exe) answers the question this stack couldn't: *which model should I get at all*. `-Action inspect` sizes a repo you already chose; `suggest` ranks known models against this machine's RAM, VRAM and memory bandwidth. They're complementary — keep both.
+
+  ```powershell
+  .\start.ps1 -Action install-llmfit          # 5 MB download, pinned in $VER.llmfit
+  .\start.ps1 -Action suggest -UseCase coding
+  ```
+
+  Three filters are applied for us and are the reason the output is usable:
+  - `--runtime llamacpp` — llmfit also ranks vLLM/AWQ and MLX builds, which this stack cannot load.
+  - `--capability tool_use` (the `-Capability` default) — a model that can't call tools is useless for the coding-agent path, and it's the property people otherwise discover last.
+  - `--no-dashboard` — **llmfit starts a background web server otherwise.** Never drop this flag.
+
+  Rows with no `gguf_sources` are then dropped, because there'd be nothing to download. What's left carries `gguf_sources[0].repo` and `best_quant`, which are exactly `add-model`'s `-Model` and `-Quant` — so the panel's **What should I run?** table has a working Download button per row, and `-Json` is the same data for it. Speeds are llmfit's memory-bandwidth estimate, not a measurement; `-Action bench` measures. Note that its context figure is the model's *trained* maximum, not what fits here — a downloaded model still needs `-c` set (32768+ for Claude Code), which is `set-tuning` or `autotune`.
 - **set-tuning** — write `-c` and `-ctk`/`-ctv` for one model directly, without measuring: `-Id <model> -Context <n> -Kv <type>`. Same `Set-ModelTuning` that `autotune -Apply` uses, so a hand-picked number and a measured one land identically and neither disturbs the rest of the file. `-NCpuMoe` defaults to `-1` meaning *leave the entry's existing value alone*, which is not the same as `0` (offload nothing) — a plain `[int]` can't express "unset", and silently dropping the flag would change how an MoE model runs. Backs the panel's Models → Edit.
 - **check-config** — the launch preflight (`Test-SwapConfig`) on its own, so a `config.yaml` edit can be checked without bouncing llama-swap to read the warnings on the way past. Every failure it looks for is one that llama-swap starts happily with, and that only shows up as `connection refused` from the proxy the first time that model is picked, because `llama-server` died on spawn:
 
