@@ -460,6 +460,65 @@ function Get-Agents {
     }
 }
 
+# Claude Code's own session history. It keeps every conversation as
+# ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, so "which projects was I working on" is
+# answerable without asking the user to remember a path.
+#
+# The directory name is NOT a reliable source for that path: it replaces both ':' and '\' with
+# '-', so C:\Users\me\pc-debugging and C:\Users\me\pc\debugging encode identically. The records
+# inside carry the real cwd, so that's what's read.
+#
+# ponytail: cached for 30s. Each session is a bounded head-read, but there are already 68 files
+# here and the Coding agents tab re-renders every 3s - uncached, that tab would spend its whole
+# life re-reading disk.
+$script:sessCache = $null
+function Get-ClaudeSessions([switch]$Refresh) {
+    if ($script:sessCache -and -not $Refresh -and
+        ((Get-Date) - $script:sessCache.at).TotalSeconds -lt 30) { return $script:sessCache.rows }
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    $rows = @()
+    if (Test-Path $root) {
+        # Our own probe directory is not a project anyone wants to resume.
+        $probe = Join-Path $env:TEMP 'localllm-agent-probe'
+        # One row per PROJECT, not per session. Resuming means "the conversation I was having in
+        # that repo", and a directory can hold dozens of sessions - eight identical one-shot runs
+        # crowding out eight real projects is the opposite of useful. Files are walked newest
+        # first, so the first hit for a cwd is its most recent session, which is what --continue
+        # would pick anyway. To reach an older one, run `claude --resume` inside that project.
+        $seen = @{}
+        foreach ($f in (Get-ChildItem $root -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 120)) {
+            $cwd = $null; $title = $null
+            foreach ($line in (Get-Content $f.FullName -TotalCount 60 -ErrorAction SilentlyContinue)) {
+                if (-not $line.StartsWith('{')) { continue }
+                try { $o = $line | ConvertFrom-Json } catch { continue }
+                if (-not $cwd -and $o.cwd) { $cwd = $o.cwd }
+                if (-not $title -and $o.type -eq 'user') {
+                    $c = $o.message.content
+                    $t = if ($c -is [string]) { $c } else { ($c | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text }
+                    if ($t) { $title = ($t -replace '\s+', ' ').Trim() }
+                }
+                if ($cwd -and $title) { break }
+            }
+            if (-not $cwd) { continue }
+            if ($cwd -eq $probe) { continue }
+            if ($seen.ContainsKey($cwd)) { continue }
+            if (-not (Test-Path $cwd)) { continue }     # project deleted or on a disconnected drive
+            $seen[$cwd] = $true
+            $rows += @{
+                id = $f.BaseName; cwd = $cwd
+                title = $(if ($title) { $title.Substring(0, [Math]::Min(110, $title.Length)) } else { '(no prompt yet)' })
+                kb = [int]($f.Length / 1KB)
+                when = $f.LastWriteTime.ToString('MM-dd HH:mm')
+                ago = [int]((Get-Date) - $f.LastWriteTime).TotalMinutes
+            }
+            if ($rows.Count -ge 12) { break }
+        }
+    }
+    $script:sessCache = @{ at = (Get-Date); rows = $rows }
+    $rows
+}
+
 function Get-Engine {
     $swapExe = Join-Path $root 'llamaswap\llama-swap.exe'
     $servers = @(Get-Process -Name llama-server -ErrorAction SilentlyContinue |
@@ -697,6 +756,11 @@ table.sens td.now{font-weight:600;color:var(--fg)}
   <div id="agstat" style="color:var(--dim);font-size:11px;margin-top:5px"></div>
  </fieldset>
 
+ <fieldset><legend>Your recent Claude Code sessions</legend>
+  <div class="mode">Read from Claude Code's own history. <b>Hand over</b> reopens that exact conversation on a local model - same files, same context, nothing uploaded.</div>
+  <table><tbody id="sess"><tr><td style="color:var(--dim)">loading...</td></tr></tbody></table>
+ </fieldset>
+
  <fieldset><legend>Claude Code, on a local model</legend>
   <div class="mode">Claude Code works exactly as normal, but every request goes to a model here instead of Anthropic - so it costs you nothing.</div>
   <div class="row" id="agbtn1"></div>
@@ -784,10 +848,34 @@ function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
  monRun(i===4);
- if(i===3)agents();}
+ if(i===3){agents();sessions()}}
 // ---- coding agents
-let AG={};
+let AG={},SESS=[];
 function pdir(){return document.getElementById('pdir').value.trim()}
+function ago(m){
+ if(m<60)return m+'m ago';
+ if(m<1440)return Math.round(m/60)+'h ago';
+ return Math.round(m/1440)+'d ago';
+}
+async function sessions(){
+ try{SESS=await (await fetch('/api/sessions')).json()}catch(e){return}
+ document.getElementById('sess').innerHTML=SESS.length?SESS.map(s=>`<tr>
+  <td style="max-width:0;overflow:hidden;text-overflow:ellipsis"><div>${s.title.replace(/</g,'&lt;')}</div>
+   <div style="color:var(--dim);font-size:11px">${s.cwd.replace(/</g,'&lt;')}</div></td>
+  <td style="color:var(--dim);white-space:nowrap">${ago(s.ago)}</td>
+  <td>${B('gh','claudelaunch',`handOff('${s.id}',${JSON.stringify(s.cwd)})`,'Hand over')}</td></tr>`).join('')
+  :'<tr><td style="color:var(--dim)">No Claude Code sessions found for any project on this machine.</td></tr>';
+}
+// Resuming means both the directory and the conversation - Claude Code stores sessions per
+// project, so a session id without its cwd resumes nothing.
+async function handOff(id,cwd){
+ document.getElementById('pdir').value=cwd;
+ spin('claudelaunch',6000);
+ const r=await (await fetch('/api/launch-claude',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({dir:cwd,sessionId:id,model:document.getElementById('agmodel').value})})).json();
+ if(r.error)alert(r.error);
+ setTimeout(tick,700);
+}
 async function agents(){
  try{AG=await (await fetch('/api/agents')).json()}catch(e){return}
  const dir=document.getElementById('pdir');
@@ -1095,8 +1183,9 @@ async function tick(){
  if(!VER.rows){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
  document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
  // The agents tab is derived from the same job list, so it refreshes on the normal poll while
- // it is in front rather than only when it is clicked into.
- if(document.getElementById('p3').classList.contains('on'))agents();
+ // it is in front rather than only when it is clicked into. The session list is server-cached
+ // for 30s, so re-rendering it on the 3s poll costs a hashtable lookup, not 40 file reads.
+ if(document.getElementById('p3').classList.contains('on')){agents();sessions()}
  const md=document.getElementById('mdir');
  if(M.settings&&document.activeElement!==md){md.value=M.settings.modelsDir;
   document.getElementById('st').innerHTML=`<span>llama-swap</span><div>127.0.0.1:${M.settings.swapPort}</div><span>Chat UI</span><div>127.0.0.1:${M.settings.webuiPort}</div><span>This panel</span><div>127.0.0.1:${location.port}</div>`;}
@@ -1177,6 +1266,10 @@ try {
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/agents$'  { $body = Get-Agents | ConvertTo-Json -Depth 5 -Compress }
+                '^/api/sessions$' {
+                    $r = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['refresh'] -eq '1'
+                    $body = ConvertTo-Json -InputObject @(Get-ClaudeSessions -Refresh:$r) -Depth 4 -Compress
+                }
                 '^/api/launch-claude$' {
                     # Claude Code is a terminal UI, so this is the one thing the panel cannot run
                     # for you - it opens a console window and hands over. Not a job: a job is
@@ -1190,8 +1283,9 @@ try {
                     # space or a quote in it cannot turn into extra arguments.
                     $a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
                            (Join-Path $root 'claude-local.ps1'), '-Directory', $p.dir)
-                    if ($p.model)  { $a += @('-Model', $p.model) }
-                    if ($p.resume) { $a += '-Resume' }
+                    if ($p.model)     { $a += @('-Model', $p.model) }
+                    if ($p.sessionId) { $a += @('-SessionId', $p.sessionId) }
+                    elseif ($p.resume) { $a += '-Resume' }
                     Start-Process powershell -ArgumentList $a
                     $body = '{"ok":true}'
                 }

@@ -198,6 +198,21 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
   model can drive an agent loop at all (`bonsai-27b` has the largest context here and fails
   outright), so the tab says as much and offers **Test it** per model.
   - `/api/agents` is cheap enough to poll: CLIs on PATH, which models qualify, last project.
+  - **`/api/sessions` reads Claude Code's own history**, so handing a project over doesn't start by
+    asking you to remember a path. Claude Code stores every conversation as
+    `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, and `-r/--resume <id>` takes it straight
+    back — so **Hand over** reopens that exact conversation on a local model.
+    - The **directory name is not usable as the path**: it replaces both `:` and `\` with `-`, so
+      `C:\Users\me\pc-debugging` and `C:\Users\me\pc\debugging` encode identically. The records
+      inside carry the real `cwd`, and that's what's read.
+    - **One row per project, not per session.** A directory accumulates dozens of sessions and
+      eight identical one-shot runs would crowd out eight real projects. Files are walked newest
+      first, so the first hit for a `cwd` is that project's latest — the same one `--continue`
+      would pick. For an older session, run `claude --resume` inside the project.
+    - A session id alone resumes nothing: Claude Code scopes sessions to a directory, so the
+      handoff sets **both** `-Directory` and `-SessionId`.
+    - Cached 30s server-side. Each row is a bounded head-read, but there are already 68 session
+      files on this machine and the tab re-renders every 3s.
   - `/api/launch-claude` is the one thing that is **not** a job. Claude Code is a terminal UI, so it
     opens a console and hands over; a job is hidden with its output redirected, which is exactly
     wrong for something you are about to type into. opencode and `local-llm.ps1` do run to

@@ -58,6 +58,12 @@ param(
     # See github.com/ggml-org/llama.cpp issues 25746 / 25923 / 25895.
     [string]$Tools = 'Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill,Agent,TaskCreate',
 
+    # Resume one specific conversation by its id. Claude Code keeps every session as
+    # ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, and -r/--resume takes that id, so the
+    # panel can list real sessions and hand one straight back - which is the actual "my quota ran
+    # out mid-project" move, rather than starting somewhere new.
+    [string]$SessionId,
+
     # Continue the existing Claude Code session in -Directory instead of starting a new one.
     # A switch rather than the usual `-- --continue`, because `--` is not passed through by
     # `powershell -File script.ps1` - it is parsed as an empty parameter name and the launch fails
@@ -378,8 +384,10 @@ Write-Host "  context:     $($report.context) tokens (told to Claude Code, which
 Write-Host ""
 if (-not $Resume) { Write-Host "Picking up an existing session in this directory? Add -Resume." ; Write-Host "" }
 
-$a = @('--settings', (New-SessionSettings))
-if ($Resume) { $a += '--continue' }
+$a = @('--settings', "`"$(New-SessionSettings)`"")
+# A specific session wins over "the most recent one" - if you picked it, you meant it.
+if ($SessionId) { $a += @('--resume', $SessionId) }
+elseif ($Resume) { $a += '--continue' }
 if ($Prompt) { $a += @('-p', $Prompt) }
 # Keeps the Workflow tool's 524288-character maxLength out of the request - see -Tools above.
 if ($Tools) { $a += @('--tools', $Tools) }

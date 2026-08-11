@@ -39,9 +39,10 @@ serving. Right-click the tray icon to stop the stack for real.
 ## Running out of Claude quota mid-project
 
 Claude Code can be pointed at a model running here instead of at Anthropic, on the same repo, with
-your files and session history intact and nothing uploaded. The panel's **Coding agents** tab has
-the command ready to copy, and a **Test the handoff now** button that loads a model and calls the
-real endpoint — worth pressing *before* you need it.
+your files and session history intact and nothing uploaded. The panel's **Coding agents** tab lists
+your recent Claude Code projects — read from Claude Code's own history, so there's no path to
+remember — and **Hand over** reopens that exact conversation on a local model. There's also a
+**Test it** button that runs a real tool call against a model; worth pressing *before* you need it.
 
 ```bash
 powershell -ExecutionPolicy Bypass -File .\claude-local.ps1 -Directory C:\your\project -Resume
