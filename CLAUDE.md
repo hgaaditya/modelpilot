@@ -172,6 +172,18 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
 - `-Install`, and the **Settings → Desktop integration** button that calls the same
   `Install-Shortcuts`, write a desktop and start-menu `.lnk`. The panel exists so that nothing
   requires opening a terminal; a Settings tab that tells you to run a PowerShell command defeats it.
+- **`127.0.0.1`, never `localhost`.** Not interchangeable on Windows: `localhost` can resolve to
+  `::1` first, and llama-swap and open-webui bind IPv4 only. This repo's own logs carry
+  `dial tcp [::1]:5800 ... actively refused` from exactly that mismatch. Keep the literal IP in
+  every URL, env var and doc.
+- **Dialogs are in-page, not `alert`/`confirm`/`prompt`.** The browser titles its own dialogs with
+  the origin — *"127.0.0.1:9300 says"* — which names nothing the user recognises and gives the
+  panel away as a web page. `msg` / `ask` / `askText` are promise-based replacements over one
+  modal, so call sites just `await` them; `ask` takes `danger:true` to colour a destructive
+  confirm, and a real verb on the button ("Delete 6.9 GB") instead of OK/Cancel.
+- **The Engine tab lists the endpoints** llama-swap serves, because one port answers both the
+  OpenAI and Anthropic shapes and routes by the `model` field — anything that takes a base URL and
+  a model name works, and nothing in the panel used to say so.
 - **Busy buttons.** Every action here starts a detached job and returns immediately, so a click had
   no visible effect until the next 3s poll — which reads as the click not registering. State comes
   from two places: `/api/jobs` reports `running` per job (from a `.pid` written next to the log,

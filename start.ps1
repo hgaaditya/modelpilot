@@ -225,7 +225,7 @@ function Resolve-Latest($ver) {
 }
 
 # open-webui's backend: only the python.exe running out of our own venv, never a user's other
-# interpreter. Both Stop-Stack and Test-StackRunning key off this.
+# interpreter. Both Stop-Stack and Test-ComponentRunning key off this.
 function Get-WebuiProcess {
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }
@@ -253,7 +253,6 @@ function Test-ComponentRunning($component = 'all') {
     $false
 }
 
-function Test-StackRunning { Test-ComponentRunning 'all' }
 
 function Stop-Stack($component = 'all') {
     $stopped = 0

@@ -565,6 +565,33 @@ function Get-ClaudeSessions([switch]$Refresh) {
     $rows
 }
 
+# What this stack exposes to anything else on the machine. llama-swap speaks both the OpenAI and
+# the Anthropic shapes on one port and routes by the "model" field, so any tool that can be given
+# a base URL and a model name works - continue.dev, Zed, aider, a script. Worth stating outright,
+# because nothing in the panel previously said the ports were usable from outside it.
+#
+# 127.0.0.1 is deliberate and not interchangeable with 'localhost': on Windows 'localhost' can
+# resolve to ::1 first, and these servers bind IPv4 only. That is not hypothetical here - this
+# repo's own logs carry "dial tcp [::1]:5800 ... actively refused" from exactly that mismatch.
+function Get-Endpoints {
+    $s = Get-Settings
+    $swap = "http://127.0.0.1:$($s.swapPort)"
+    @{
+        swapUp = (Test-Endpoint "$swap/health")
+        webuiUp = (Test-Endpoint "http://127.0.0.1:$($s.webuiPort)/health")
+        models = @(Get-ConfiguredModels | Where-Object { $_.present -and $_.engineOk } | ForEach-Object { $_.id })
+        rows = @(
+            @{ what = 'OpenAI chat completions'; url = "$swap/v1/chat/completions"
+               note = 'Most tools. Set the base URL to ' + $swap + '/v1 and pick a model id.' }
+            @{ what = 'OpenAI models list'; url = "$swap/v1/models"; note = 'What ids are available.' }
+            @{ what = 'Anthropic messages'; url = "$swap/v1/messages"
+               note = 'What Claude Code uses. ANTHROPIC_BASE_URL=' + $swap }
+            @{ what = 'llama-swap dashboard'; url = "$swap/ui"; note = 'Its own web UI: running models, logs.' }
+            @{ what = 'Chat UI (open-webui)'; url = "http://127.0.0.1:$($s.webuiPort)"; note = 'The browser chat.' }
+        )
+    }
+}
+
 function Get-Engine {
     $swapExe = Join-Path $root 'llamaswap\llama-swap.exe'
     $servers = @(Get-Process -Name llama-server -ErrorAction SilentlyContinue |
@@ -670,6 +697,7 @@ function Get-Jobs {
 
 $html = @'
 <!doctype html><html><head><meta charset="utf-8"><title>LocalLLM</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='6.5' y='6.5' width='19' height='19' rx='3.5' fill='none' stroke='%232360c4' stroke-width='2'/%3E%3Cg stroke='%232360c4' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 6.5V3M16 6.5V3M20 6.5V3M12 25.5V29M16 25.5V29M20 25.5V29'/%3E%3Cpath d='M6.5 12H3M6.5 16H3M6.5 20H3M25.5 12H29M25.5 16H29M25.5 20H29'/%3E%3C/g%3E%3Cpath d='M12 12.5h8a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-4.2L13 21v-2.5h-1a1.5 1.5 0 0 1-1.5-1.5v-3a1.5 1.5 0 0 1 1.5-1.5z' fill='%232360c4'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#f3f4f6;--panel:#fff;--line:#d6dae1;--fg:#1b2027;--dim:#5f6875;--ok:#127a45;--warn:#8a6100;--bad:#c1362b;--acc:#2360c4;--soft:#eef1f5}
 *{box-sizing:border-box}
@@ -714,6 +742,19 @@ input{width:100%}
 /* One line saying how a mode behaves, above its controls. Plain text rather than a .hint box:
    three stacked callouts read as three warnings. */
 .mode{color:var(--dim);font-size:11.5px;margin:0 0 7px}
+/* In-page dialogs. The browser's own alert/confirm/prompt are titled with the origin -
+   "127.0.0.1:9300 says" - which tells the user nothing and looks like a web page rather than the
+   application this is pretending to be. These are also the only place the panel can put a real
+   label on a destructive choice. */
+#ovl{position:fixed;inset:0;background:rgba(20,25,32,.42);display:none;align-items:center;justify-content:center;z-index:50}
+#ovl.on{display:flex}
+#dlg{background:var(--panel);border:1px solid var(--line);border-radius:5px;box-shadow:0 12px 34px rgba(0,0,0,.28);
+ width:min(430px,92vw);overflow:hidden}
+#dlg h4{margin:0;padding:8px 12px;background:var(--soft);border-bottom:1px solid var(--line);font-size:12px;font-weight:600}
+#dlgbody{padding:11px 12px;font-size:12.5px;white-space:pre-wrap;line-height:1.5}
+#dlgbody b{font-weight:600}
+#dlgin{width:100%;margin-top:9px}
+#dlgfoot{display:flex;gap:7px;justify-content:flex-end;padding:9px 12px;border-top:1px solid var(--line);background:var(--soft)}
 .row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 pre{background:#f7f8fa;border:1px solid var(--line);border-radius:3px;padding:6px;font-size:11px;margin:5px 0 0;white-space:pre-wrap;max-height:100px;overflow:auto;user-select:text;color:#3a4250}
 code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
@@ -726,8 +767,29 @@ table.sens td:not(:first-child),table.sens th:not(:first-child){text-align:right
 table.sens tbody tr:nth-child(odd){background:var(--soft)}
 table.sens td:first-child{color:var(--dim)}
 table.sens td.now{font-weight:600;color:var(--fg)}
+/* Endpoint list: the URL is the thing being copied, so it gets a monospace column of its own
+   and the explanation sits underneath rather than competing with it. */
+table.ep td{vertical-align:top;padding:4px 8px}
+table.ep td:first-child{white-space:nowrap;color:var(--dim);width:1%}
+table.ep code{font-size:11.5px;user-select:all}
+table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
+.logo{width:19px;height:19px;flex:0 0 auto}
 </style></head><body>
-<header><span id="d" class="dot down"></span><b>LocalLLM</b><span id="sub" style="color:var(--dim);font-size:11px"></span>
+<!-- The mark: a chip outline with a conversation bubble inside it. The whole idea of this app in
+     one glyph - a model running on your own silicon rather than someone else's. Drawn as an
+     inline SVG symbol so it costs no request, scales, and inherits the theme's colours; the
+     favicon below is the same shape as a data URI. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol id="mark" viewBox="0 0 32 32">
+ <rect x="6.5" y="6.5" width="19" height="19" rx="3.5" fill="none" stroke="currentColor" stroke-width="2"/>
+ <g stroke="currentColor" stroke-width="2" stroke-linecap="round">
+  <path d="M12 6.5V3M16 6.5V3M20 6.5V3M12 25.5V29M16 25.5V29M20 25.5V29"/>
+  <path d="M6.5 12H3M6.5 16H3M6.5 20H3M25.5 12H29M25.5 16H29M25.5 20H29"/>
+ </g>
+ <path d="M12 12.5h8a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-4.2L13 21v-2.5h-1a1.5 1.5 0 0 1-1.5-1.5v-3a1.5 1.5 0 0 1 1.5-1.5z"
+  fill="var(--acc)" stroke="none"/>
+</symbol></svg>
+<header><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><use href="#mark"/></svg>
+<b>LocalLLM</b><span id="d" class="dot down" title="stack status"></span><span id="sub" style="color:var(--dim);font-size:11px"></span>
 <span style="flex:1"></span>
 <button class="gh" id="hre" onclick="act('restart')">Restart</button>
 <button class="gh" id="hst" onclick="act('stop')">Stop</button>
@@ -765,6 +827,11 @@ table.sens td.now{font-weight:600;color:var(--fg)}
   <table><thead><tr><th>PID</th><th>Memory</th></tr></thead><tbody id="e4"></tbody></table>
   <div class="hint" style="margin:7px 0 0">llama-server is not started directly - llama-swap spawns one per model on demand and stops it after the model's idle timeout.</div>
  </fieldset>
+ <fieldset><legend>Endpoints you can use from other tools</legend>
+  <div class="mode">One port speaks both the OpenAI and the Anthropic shapes and routes by the <code>model</code> field, so anything that takes a base URL and a model name works - continue.dev, Zed, aider, a shell script.</div>
+  <table class="ep"><tbody id="eps"></tbody></table>
+  <div id="epmodels" class="hint" style="margin:7px 0 0"></div>
+ </fieldset>
 </div>
 
 <div class="pane" id="p2">
@@ -798,6 +865,7 @@ table.sens td.now{font-weight:600;color:var(--fg)}
 <div class="pane" id="p3">
  <fieldset><legend>Project</legend>
   <div class="row"><input id="pdir" placeholder="C:\path\to\your\project" style="flex:1">
+   <span style="color:var(--dim);font-size:11px">run on</span>
    <select id="agmodel" style="width:auto"></select></div>
   <div id="agstat" style="color:var(--dim);font-size:11px;margin-top:5px"></div>
  </fieldset>
@@ -860,8 +928,58 @@ table.sens td.now{font-weight:600;color:var(--fg)}
  </fieldset>
 </div>
 </main>
+<div id="ovl"><div id="dlg" role="dialog" aria-modal="true">
+ <h4 id="dlgtitle">LocalLLM</h4>
+ <div id="dlgbody"></div>
+ <div id="dlgfoot"><button class="gh" id="dlgno">Cancel</button><button class="act" id="dlgyes">OK</button></div>
+</div></div>
 <script>
-let S={},E={},M={},VER={},JOBS=[];
+// ---- dialogs
+// One implementation behind msg/ask/askText, all promise-based so callers just await them.
+// Replaces alert/confirm/prompt, whose browser-drawn versions are titled "127.0.0.1:9300 says".
+let dlgResolve=null;
+function dlgClose(v){
+ document.getElementById('ovl').classList.remove('on');
+ const r=dlgResolve;dlgResolve=null;if(r)r(v);
+}
+function dlgOpen(o){
+ return new Promise(res=>{
+  dlgResolve=res;
+  document.getElementById('dlgtitle').textContent=o.title||'LocalLLM';
+  document.getElementById('dlgbody').innerHTML=o.html;
+  const yes=document.getElementById('dlgyes'),no=document.getElementById('dlgno');
+  yes.textContent=o.ok||'OK';
+  yes.className=o.danger?'dz':'act';
+  no.style.display=o.noCancel?'none':'';
+  no.textContent=o.cancel||'Cancel';
+  document.getElementById('ovl').classList.add('on');
+  const inp=document.getElementById('dlgin');
+  if(inp){inp.focus();inp.select()}else{yes.focus()}
+ });
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+// Plain message - one button, nothing to cancel.
+function msg(text,title){return dlgOpen({html:esc(text),ok:'Close',noCancel:true,title})}
+// Yes/no. danger:true colours the confirm button as destructive.
+function ask(text,opts){opts=opts||{};return dlgOpen({html:esc(text),ok:opts.ok||'Continue',cancel:opts.cancel,danger:opts.danger,title:opts.title})}
+// Text entry. Resolves to null on cancel, matching prompt().
+async function askText(text,value,help){
+ const r=await dlgOpen({html:esc(text)+(help?`<div style="color:var(--dim);font-size:11.5px;margin-top:6px">${esc(help)}</div>`:'')+
+   `<input id="dlgin" value="${esc(value==null?'':value)}">`,ok:'Save'});
+ return r;
+}
+document.addEventListener('DOMContentLoaded',()=>{
+ document.getElementById('dlgyes').onclick=()=>{const i=document.getElementById('dlgin');dlgClose(i?i.value:true)};
+ document.getElementById('dlgno').onclick=()=>dlgClose(null);
+ document.getElementById('ovl').onclick=e=>{if(e.target.id==='ovl')dlgClose(null)};
+});
+document.addEventListener('keydown',e=>{
+ if(!dlgResolve)return;
+ if(e.key==='Escape'){e.preventDefault();dlgClose(null)}
+ if(e.key==='Enter'){e.preventDefault();const i=document.getElementById('dlgin');dlgClose(i?i.value:true)}
+});
+
+let S={},E={},M={},VER={},JOBS=[],EP={};
 // Every button here starts a detached job and returns immediately, so for up to one poll
 // interval a click had no visible effect whatsoever - which reads as the click not registering.
 // Busy state comes from two places: the server's job list, which is the truth and survives a
@@ -916,11 +1034,20 @@ async function sessions(force){
  if(!force&&Date.now()-sessAt<30000)return;
  sessAt=Date.now();
  try{SESS=await (await fetch('/api/sessions')).json()}catch(e){sessAt=0;return}
- document.getElementById('sess').innerHTML=SESS.length?SESS.map(s=>`<tr>
-  <td style="max-width:0;overflow:hidden;text-overflow:ellipsis"><div>${s.title.replace(/</g,'&lt;')}</div>
-   <div style="color:var(--dim);font-size:11px">${s.cwd.replace(/</g,'&lt;')}</div></td>
-  <td style="color:var(--dim);white-space:nowrap">${ago(s.ago)}</td>
-  <td>${B('gh','claudelaunch',`handOff('${s.id}',${JSON.stringify(s.cwd)})`,'Hand over')}</td></tr>`).join('')
+ // The folder is the identity here - it's what you recognise a project by, and what the handoff
+ // actually acts on - so it leads, in full, with the conversation title as its subtitle. The
+ // earlier layout put a truncated title first with the path greyed out underneath and the age
+ // floating in its own column, which read as three unrelated things per row.
+ document.getElementById('sess').innerHTML=SESS.length?SESS.map(s=>{
+  const leaf=s.cwd.replace(/[\\/]+$/,'').split(/[\\/]/).pop()||s.cwd;
+  const parent=s.cwd.slice(0,s.cwd.length-leaf.length).replace(/[\\/]+$/,'');
+  return `<tr>
+  <td style="max-width:0">
+   <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+    <b>${esc(leaf)}</b><span style="color:var(--dim)">&nbsp;&nbsp;${esc(parent)}</span></div>
+   <div style="color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+    ${esc(s.title)} <span style="opacity:.75">&middot; ${ago(s.ago)}</span></div></td>
+  <td style="width:1%;white-space:nowrap;vertical-align:middle">${B('gh','claudelaunch',`handOff('${s.id}',${JSON.stringify(s.cwd)})`,'Hand over')}</td></tr>`}).join('')
   :'<tr><td style="color:var(--dim)">No Claude Code sessions found for any project on this machine.</td></tr>';
 }
 // Resuming means both the directory and the conversation - Claude Code stores sessions per
@@ -930,7 +1057,7 @@ async function handOff(id,cwd){
  spin('claudelaunch',6000);
  const r=await (await fetch('/api/launch-claude',{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify({dir:cwd,sessionId:id,model:document.getElementById('agmodel').value})})).json();
- if(r.error)alert(r.error);
+ if(r.error)msg(r.error);
  setTimeout(tick,700);
 }
 async function agents(){
@@ -983,20 +1110,20 @@ async function agents(){
  }
 }
 async function launchClaude(resume){
- if(!pdir()){alert('Type your project directory in the Project box first.');return}
+ if(!pdir()){msg('Pick a project first - either choose one from the list below, or type its folder in the Project box.');return}
  spin('claudelaunch',6000);
  const r=await (await fetch('/api/launch-claude',{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify({dir:pdir(),resume,model:document.getElementById('agmodel').value})})).json();
- if(r.error)alert(r.error);
+ if(r.error)msg(r.error);
  setTimeout(tick,700);
 }
 async function runLocal(kind){
- const prompt=document.getElementById(kind==='agent'?'agtask':'dgtask').value.trim();
- if(!prompt){alert('Say what it should do.');return}
+ const task=document.getElementById(kind==='agent'?'agtask':'dgtask').value.trim();
+ if(!task){msg('Say what it should do first.');return}
  spin(kind==='agent'?'opencode':'delegate',1800000);
  const r=await (await fetch('/api/run-local',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({kind,prompt,dir:pdir(),file:document.getElementById('dgfile').value.trim()})})).json();
- if(r.error)alert(r.error);
+   body:JSON.stringify({kind,prompt:task,dir:pdir(),file:document.getElementById('dgfile').value.trim()})})).json();
+ if(r.error)msg(r.error);
  setTimeout(tick,700);
 }
 async function agCheck(){
@@ -1038,7 +1165,7 @@ function selected(){
 function jkey(a,comp){return (comp&&comp!=='all')?a+'-'+comp:a}
 async function act(a,c){
  const comp=(c!==undefined)?c:selected();
- if(comp===null){alert('No services are ticked, so Start/Stop have nothing to act on.\n\nTick at least one on the Dashboard.');return}
+ if(comp===null){msg('No services are ticked, so Start, Stop and Restart have nothing to act on.\n\nTick llama-swap and/or open-webui on the Dashboard.');return}
  spin(jkey(a,comp),a==='deploy'?600000:60000);
  await post('/api/action',{action:a,component:comp});setTimeout(tick,1200);
 }
@@ -1053,7 +1180,7 @@ async function saveDir(){await post('/api/settings',{modelsDir:document.getEleme
 async function inst(what){
  const names={components:'install or repair all components',upgrade:'upgrade to the pinned versions',
   'upgrade-latest':'upgrade to the newest upstream releases','prism':'install the PrismML fork (~620 MB)'};
- if(!confirm('This will '+names[what]+'.\n\nThe stack will be stopped and restarted. Model weights and config.yaml are not touched.\n\nContinue?'))return;
+ if(!await ask('This will '+names[what]+'.\n\nThe stack is stopped and restarted. Model weights and config.yaml are not touched.'))return;
  // Job names are set server-side: components->install, upgrade/upgrade-latest->upgrade, prism->prism.
  mark({components:'install',upgrade:'upgrade','upgrade-latest':'upgrade',prism:'prism'}[what],1800000);
  await post('/api/install',{what});setTimeout(tick,900);
@@ -1071,28 +1198,33 @@ async function chk(){
 // download. Writing them is start.ps1's Set-ModelTuning, the same code -Action autotune applies.
 async function edit(id){
  const m=(M.models||[]).find(x=>x.id===id); if(!m)return;
- const ctx=prompt('Context size for "'+id+'" (-c), in tokens.\n\nLarger costs VRAM: every token has to fit alongside the weights.\nUse Tune to have it measured instead of guessed.',m.ctx||16384);
+ const ctx=await askText('Context size for "'+id+'", in tokens (-c).',m.ctx||16384,
+   'Bigger costs VRAM - every token has to fit alongside the weights. Tune measures the largest that fits instead of guessing.');
  if(ctx===null)return;
- if(!/^\d+$/.test(ctx.trim())||+ctx<256){alert('Context has to be a whole number of tokens, 256 or more.');return}
- const kv=prompt('KV cache quantisation for "'+id+'" (-ctk/-ctv).\n\nq8_0 = better long-context recall\nq4_0 = half the cache size, so more context in the same VRAM\nf16  = no quantisation, largest',m.kv||'q8_0');
+ if(!/^\d+$/.test(ctx.trim())||+ctx<256){msg('Context has to be a whole number of tokens, 256 or more.');return}
+ const kv=await askText('KV cache type for "'+id+'" (-ctk/-ctv).',m.kv||'q8_0',
+   'q8_0 keeps long-context recall. q4_0 halves the cache, so more context fits in the same VRAM. f16 is unquantised and largest.');
  if(kv===null)return;
- if(!['q8_0','q4_0','q4_1','q5_0','q5_1','f16','f32'].includes(kv.trim())){alert('Unknown KV type "'+kv.trim()+'".');return}
+ if(!['q8_0','q4_0','q4_1','q5_0','q5_1','f16','f32'].includes(kv.trim())){msg('Unknown KV type "'+kv.trim()+'".');return}
  spin('edit:'+id,20000);
  const r=await (await fetch('/api/tune',{method:'POST',headers:{'Content-Type':'application/json'},
    body:JSON.stringify({id,ctx:+ctx,kv:kv.trim()})})).json();
  delete PEND['edit:'+id];
- if(r.error){alert('Could not write the config: '+r.error);tick();return}
+ if(r.error){msg('Could not write the config: '+r.error);tick();return}
  // llama-swap reads config.yaml only at startup, so the edit does nothing until it bounces.
- if(confirm('Saved. llama-swap only reads config.yaml at startup, so this takes effect after a restart.\n\nRestart llama-swap now?')) act('restart','swap');
+ if(await ask('Saved. llama-swap only reads config.yaml at startup, so this takes effect after a restart.',
+   {ok:'Restart llama-swap',cancel:'Later'})) act('restart','swap');
  else tick();
 }
 // Deleting weights is multi-GB and irreversible, so it asks twice: once for the files, then
 // separately about the config entry, which is a different decision.
 async function del(id,gb){
- if(!confirm('Delete the weight files for "'+id+'"?\n\nThis frees about '+gb+' GB and cannot be undone - the model would have to be downloaded again.'))return;
- const alsoConfig=confirm('Also remove the "'+id+'" entry from config.yaml?\n\nOK  = remove the entry too\nCancel = keep the entry (it will show as "no weights")');
+ if(!await ask('Delete the weight files for "'+id+'"?\n\nThis frees about '+gb+' GB and cannot be undone - the model would have to be downloaded again.',
+   {ok:'Delete '+gb+' GB',danger:true}))return;
+ const alsoConfig=!!await ask('Also remove the "'+id+'" entry from config.yaml?\n\nKeeping it leaves the model listed with no weights, which is useful if you plan to download it again.',
+   {ok:'Remove the entry too',cancel:'Keep the entry'});
  const r=await (await fetch('/api/delete-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,alsoConfig})})).json();
- if(r.error)alert('Delete failed: '+r.error); else if(alsoConfig)await post('/api/action',{action:'restart',component:'swap'});
+ if(r.error)msg('Delete failed: '+r.error); else if(alsoConfig)await post('/api/action',{action:'restart',component:'swap'});
  setTimeout(tick,700);
 }
 function fmt(mb){return (mb/1024).toFixed(1)+' GB'}
@@ -1160,7 +1292,13 @@ async function tick(){
  document.getElementById('svc').innerHTML=S.services.map(s=>`<tr>
   <td>${s.managed?`<input type="checkbox" style="width:auto" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)">`:''}</td>
   <td>${s.name}</td><td style="color:var(--dim)">${s.role}</td>
-  <td>${s.installed?(s.up?'<span class="on2">running</span>':(s.managed&&!s.selected?'<span style="color:var(--dim)">stopped (not selected)</span>':'<span class="miss">stopped</span>')):'<span class="tag">not installed</span>'}</td>
+  <td>${!s.installed?'<span class="tag">not installed</span>'
+    // An unmanaged entry is a CLI you invoke per task, not a service - calling it "stopped", in
+    // red, reads as a fault when nothing is wrong and there is no button that would fix it.
+    :!s.managed?'<span style="color:var(--dim)">available</span>'
+    :s.up?'<span class="on2">running</span>'
+    :s.selected?'<span class="miss">stopped</span>'
+    :'<span style="color:var(--dim)">stopped (not selected)</span>'}</td>
   <td>${s.url&&s.up?`<a href="${s.url}" target="_blank"><button class="gh">Open</button></a>`:''}</td></tr>`).join('');
  document.getElementById('hw').innerHTML=`<span>GPU</span><div>${S.gpu.name}</div>
   <span>VRAM</span><div>${fmt(S.gpu.used)} / ${fmt(S.gpu.total)}<div class="bar"><i style="width:${100*S.gpu.used/S.gpu.total}%"></i></div></div>
@@ -1216,6 +1354,19 @@ async function tick(){
     B('gh','stop-webui',"act('stop','webui')",'Stop'));
   document.getElementById('comps').innerHTML=h;
   document.getElementById('e4').innerHTML=E.servers.length?E.servers.map(s=>`<tr><td>${s.pid}</td><td>${s.mb} MB</td></tr>`).join(''):'<tr><td colspan=2 style="color:var(--dim)">none - no model loaded</td></tr>';
+ }
+ // Endpoints change only when a port or a model does, so they ride the same poll as the rest of
+ // this tab rather than getting their own.
+ try{EP=await (await fetch('/api/endpoints')).json()}catch(e){}
+ if(EP.rows){
+  document.getElementById('eps').innerHTML=EP.rows.map(r=>{
+   const up=r.url.indexOf(':'+ (M.settings?M.settings.webuiPort:8080))>0 ? EP.webuiUp : EP.swapUp;
+   return `<tr><td>${esc(r.what)}</td>
+    <td><code>${esc(r.url)}</code> ${up?'':'<span class="tag miss">not running</span>'}
+     <div class="note">${esc(r.note)}</div></td></tr>`}).join('');
+  document.getElementById('epmodels').innerHTML=EP.models.length
+   ? 'Model ids ready to use: '+EP.models.map(m=>'<code>'+esc(m)+'</code>').join(' ')
+   : 'No model has both its weights and an engine yet, so there is nothing to request.';
  }
  try{M=await (await fetch('/api/models')).json()}catch(e){}
  if(M.models){
@@ -1325,6 +1476,7 @@ try {
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/agents$'  { $body = Get-Agents | ConvertTo-Json -Depth 5 -Compress }
+                '^/api/endpoints$' { $body = Get-Endpoints | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/sessions$' {
                     $r = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['refresh'] -eq '1'
                     $body = ConvertTo-Json -InputObject @(Get-ClaudeSessions -Refresh:$r) -Depth 4 -Compress
