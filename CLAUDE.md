@@ -45,7 +45,7 @@ models:
 
 ## Running the stack
 
-`start.ps1` at the repo root is the single entry point — idempotent, safe to re-run on a fresh clone or an already-set-up machine:
+`start.ps1` at the repo root does all the work — idempotent, safe to re-run on a fresh clone or an already-set-up machine. (Double-clicking `LocalLLM.cmd` is the end-user route to the same thing through the control panel; see below.)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1
@@ -107,6 +107,35 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 - **uninstall** — prints exactly what it will delete, then requires typing `yes` (`-Force` skips). Removes binaries, the open-webui tree, logs, the version stamp and the download cache. Keeps `.gguf` weights unless `-IncludeModels` is passed, and always keeps `start.ps1`, `CLAUDE.md`, `llamaswap\config.yaml`.
 
 Which versions are actually installed is tracked in `.stack-versions.json` (gitignored, written after each successful deploy/upgrade). Without it, `upgrade` treats every component as stale and re-provisions the lot. Bare `-Action deploy` deliberately *ignores* `$VER` when a stamp exists — bumping the pins requires `-Action upgrade`, so a routine relaunch can never surprise you with a re-download.
+
+## The control panel — `LocalLLM.cmd` / `ui.ps1`
+
+The end-user entry point. `ui.ps1` serves a local web page on `127.0.0.1:9300` and opens it in a
+Chromium `--app` window, so it looks like a desktop app with no address bar. Everything it does
+shells out to `start.ps1` — the CLI stays the single source of truth and the panel is a face on it,
+never a second implementation. New behaviour belongs in `start.ps1` with the panel calling it.
+
+**`LocalLLM.cmd`** is the double-click shim, and the only file a new user has to touch: a `.ps1`
+opens in Notepad when double-clicked, so it can't be the entry point. It runs `ui.ps1 -Launch`,
+which clears mark-of-the-web from the `.ps1` files (they arrive blocked when extracted from a
+downloaded zip), spawns the panel **detached**, and then polls `/api/ping` for 15s. The detachment
+matters — closing the panel window is a minimise, not a quit, so the server has to outlive its
+launcher. The polling matters just as much: without it a failure to start is completely invisible,
+which is the worst possible first-run outcome. `README.md` is the user-facing version of this.
+
+- `/api/ping` is **deliberately exempt** from the CSRF gate that covers every other `/api/*` path.
+  It's how a second launch discovers a panel is already up, and that check runs before any token
+  exists to send. Gating it broke single-instance detection outright — every launch believed
+  nothing was running, then died failing to bind the port. It returns a fixed literal, so the only
+  thing it tells a cross-origin caller is that this port is a LocalLLM panel, which a failed bind
+  reveals anyway. Don't "fix" this by gating it again.
+- The **Dashboard banner** is a three-step first-run walkthrough (install → add a model → open the
+  chat), each step keyed on state and gone once done. Step 3 keys on *no model has ever been used*
+  (`loads`/`lastUsed`), not on *nothing loaded right now* — models unload on their idle timer all
+  day, and a banner that came back every time would be noise.
+- `-Install`, and the **Settings → Desktop integration** button that calls the same
+  `Install-Shortcuts`, write a desktop and start-menu `.lnk`. The panel exists so that nothing
+  requires opening a terminal; a Settings tab that tells you to run a PowerShell command defeats it.
 
 ## Using the local models from Claude Code
 

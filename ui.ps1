@@ -2,6 +2,7 @@
 #
 #   .\ui.ps1                 # start the server and open the window
 #   .\ui.ps1 -NoWindow       # server only (then browse to http://127.0.0.1:9300)
+#   .\ui.ps1 -Launch         # spawn the server detached and wait for it (what LocalLLM.cmd runs)
 #   .\ui.ps1 -Install        # desktop + start-menu shortcut, and the start-with-Windows command
 #
 # Why a local web page rather than WinForms: the same density CPU-Z gets from Win32 controls is
@@ -19,7 +20,8 @@
 param(
     [int]$Port = 9300,
     [switch]$NoWindow,
-    [switch]$Install
+    [switch]$Install,
+    [switch]$Launch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,22 +75,59 @@ function Find-AppBrowser {
     $null
 }
 
-if ($Install) {
+function Install-Shortcuts {
     $ws = New-Object -ComObject WScript.Shell
     $target = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $argline = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $made = @()
     foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
                        (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
-        $lnk = $ws.CreateShortcut((Join-Path $dir 'LocalLLM.lnk'))
+        $path = Join-Path $dir 'LocalLLM.lnk'
+        $lnk = $ws.CreateShortcut($path)
         $lnk.TargetPath = $target; $lnk.Arguments = $argline
         $lnk.WorkingDirectory = $root; $lnk.Description = 'LocalLLM control panel'
         $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,15"
         $lnk.Save()
-        Write-Host "shortcut -> $(Join-Path $dir 'LocalLLM.lnk')"
+        $made += $path
     }
+    $made
+}
+
+if ($Install) {
+    Install-Shortcuts | ForEach-Object { Write-Host "shortcut -> $_" }
+    $target = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $argline = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     Write-Host ""
     Write-Host "Start with Windows (run once):"
     Write-Host "  schtasks /Create /TN LocalLLM /TR `"$target $argline`" /SC ONLOGON /F"
+    return
+}
+
+# Double-clicking LocalLLM.cmd lands here. The panel has to outlive its launcher - closing the
+# browser window is a minimise, not a quit - so this spawns the server detached and then waits on
+# its health endpoint. Without the wait, a failure to start (a taken port, a broken PowerShell
+# policy) would be completely silent: no window, no message, nothing to act on.
+if ($Launch) {
+    # Files extracted from a downloaded .zip carry mark-of-the-web. -ExecutionPolicy Bypass already
+    # ignores it, but clearing it stops the "do you want to run" prompt in every other entry point.
+    Get-ChildItem $root -Filter *.ps1 | Unblock-File -ErrorAction SilentlyContinue
+    Start-Process powershell -WindowStyle Hidden `
+        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+                      '-File', $PSCommandPath, '-Port', $Port
+    Write-Host "Starting the LocalLLM panel..."
+    foreach ($i in 1..30) {
+        Start-Sleep -Milliseconds 500
+        try {
+            if ((Invoke-WebRequest "http://127.0.0.1:$Port/api/ping" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) {
+                Write-Host "Panel is up on http://127.0.0.1:$Port - the window should be open."
+                return
+            }
+        } catch { }
+    }
+    Write-Warning "The panel did not answer on port $Port within 15 seconds."
+    Write-Host "Run this to see why:"
+    Write-Host "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Read-Host "Press Enter to close"
     return
 }
 
@@ -430,7 +469,9 @@ code{background:var(--soft);padding:1px 4px;border-radius:3px;font-size:11px}
  </fieldset>
  <fieldset><legend>Ports</legend><div class="kv" id="st"></div></fieldset>
  <fieldset><legend>Desktop integration</legend>
-  <div class="hint" style="margin:0">Run once in PowerShell for a desktop and start-menu icon:<br><code>.\ui.ps1 -Install</code></div>
+  <div class="row"><button class="gh" onclick="mkLnk()">Create desktop &amp; start-menu shortcut</button>
+   <span id="lnk" style="color:var(--dim);font-size:11px"></span></div>
+  <div class="hint" style="margin-top:8px">Otherwise the panel is opened by double-clicking <code>LocalLLM.cmd</code> in the install folder.</div>
  </fieldset>
 </div>
 </main>
@@ -493,6 +534,12 @@ async function inspect(){
    <td><button class="gh" onclick="dl('${d.repo}','${v.quant}')">Download</button></td></tr>`).join('')+'</tbody></table>';
  }catch(e){document.getElementById('insp').innerHTML='<div class="hint miss">'+e+'</div>'}
 }
+async function mkLnk(){
+ document.getElementById('lnk').textContent='working...';
+ try{const d=await (await fetch('/api/shortcuts',{method:'POST'})).json();
+  document.getElementById('lnk').textContent=d.error?d.error:'created: '+d.paths.join('  |  ');
+ }catch(e){document.getElementById('lnk').textContent=''+e}
+}
 async function dl(repo,quant){await post('/api/download',{model:repo,quant});document.getElementById('insp').innerHTML='<div class="hint">Download started - watch Activity below.</div>';setTimeout(tick,800)}
 async function tick(){
  try{S=await (await fetch('/api/status')).json()}catch(e){return}
@@ -512,10 +559,21 @@ async function tick(){
   <span>GPU load</span><div>${S.gpu.util}% &nbsp; ${S.gpu.temp} °C</div>
   <span>System RAM</span><div>${S.ramUsed} / ${S.ramTot} GB<div class="bar"><i style="width:${100*S.ramUsed/S.ramTot}%"></i></div></div>
   <span>Loaded model</span><div>${S.loaded||'<span style="color:var(--dim)">idle</span>'}</div>`;
+ // First-run walkthrough. Someone who just unzipped this has three things to do in order -
+ // install the components, fetch a model, open the chat - and no way to know that from a panel
+ // that only reports state. Each step names the next action and disappears once it is done.
+ const fresh=mine.some(s=>!s.installed), noModels=M.models&&M.models.length===0;
+ const noWeights=M.models&&M.models.length>0&&M.models.every(m=>!m.present);
  let g='';
  if(need===0) g='<div class="hint">No services are ticked, so Start and Stop have nothing to act on. Tick llama-swap and/or open-webui below.</div>';
- else if(!up) g='<div class="hint">Nothing is running. Press <b>Start</b> - the first run downloads components and can take several minutes.</div>';
+ else if(fresh) g='<div class="hint"><b>Step 1 of 3.</b> Nothing is installed yet. Press <b>Start</b> - it downloads the inference engine, the router and the chat UI (about 1.5 GB) and takes several minutes on a first run. Progress shows under <b>Engine</b>.</div>';
+ else if(!up) g='<div class="hint">Nothing is running. Press <b>Start</b>.</div>';
  else if(up<need) g='<div class="hint">Only part of your stack is up. <b>Restart</b> brings the rest back.</div>';
+ else if(noModels) g='<div class="hint"><b>Step 2 of 3.</b> The stack is running but has no models. Open <b>Models</b>, paste a Hugging Face GGUF repo (try <code>unsloth/gpt-oss-20b-GGUF</code>), press <b>Inspect</b>, and download a variant it says fits your card.</div>';
+ else if(noWeights) g='<div class="hint">Models are configured but none of their weight files are on disk. Download one from <b>Models</b>, or delete the entries that point at weights you do not have.</div>';
+ // Step 3 is keyed on "no model has ever been used", not on "nothing loaded right now" - models
+ // unload on their idle timer all day, and a banner that returns every time would be noise.
+ else if(M.models&&M.models.every(m=>!m.loads&&!m.lastUsed)) g='<div class="hint"><b>Step 3 of 3.</b> Ready. Open the chat UI with the <b>Open</b> button below and pick a model - your first message loads it, which takes a few seconds.</div>';
  document.getElementById('guide').innerHTML=g;
 
  try{E=await (await fetch('/api/engine')).json()}catch(e){}
@@ -634,7 +692,13 @@ try {
 
         # Gate every API path. The page itself is served without a token (it has to be, it is
         # what carries the token) but it only renders - it cannot act.
-        if ($req.Url.AbsolutePath -like '/api/*') {
+        #
+        # /api/ping is the one exception, and has to be: it is how a second launch discovers that a
+        # panel is already up, and that check runs before any token exists to send. Gating it meant
+        # every launch believed nothing was running and then failed to bind the port. It returns a
+        # fixed literal - no state, no action - so the only thing it leaks to a cross-origin caller
+        # is that this port is a LocalLLM panel, which failing to bind reveals anyway.
+        if ($req.Url.AbsolutePath -like '/api/*' -and $req.Url.AbsolutePath -ne '/api/ping') {
             $origin = $req.Headers['Origin']
             $token  = $req.Headers['X-LocalLLM-Token']
             $bad = ($origin -and $origin -ne $script:selfOrigin) -or ($token -ne $script:csrfToken)
@@ -735,6 +799,10 @@ try {
                     }
                     $script:verInfo = $null      # versions will have moved
                     $body = '{"ok":true}'
+                }
+                '^/api/shortcuts$' {
+                    # Fast enough to run inline - it writes two .lnk files and nothing else.
+                    $body = @{ ok = $true; paths = @(Install-Shortcuts) } | ConvertTo-Json -Compress
                 }
                 '^/api/delete-model$' {
                     $p = Read-Body $req
