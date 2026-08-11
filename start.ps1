@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -573,6 +573,118 @@ function Get-HfVariants($repo) {
 
 function Format-Size($bytes) { '{0:N1} GB' -f ($bytes / 1GB) }
 
+# GGUF keeps all its metadata at the head of the file, so a range request reads a model's
+# architecture and shape without pulling the weights. That is the difference between knowing a
+# 63 GB MoE model won't load and finding out after downloading it.
+function Get-GgufInfo {
+    param([string]$Path, [string]$Url)
+
+    # The metadata block has no fixed size - a model with a 200k-token vocabulary carries tens of
+    # MB of tokenizer arrays ahead of the weights - and nothing in the header says how long it is.
+    # So read a window, and if parsing runs off the end, fetch a bigger one.
+    # Running off the end surfaces as several different exception messages depending on which
+    # read overflowed, so retry on any failure rather than trying to enumerate them.
+    $last = $null
+    foreach ($HeadBytes in 4MB, 16MB, 64MB) {
+        try { return Get-GgufInfoAt -Path $Path -Url $Url -HeadBytes $HeadBytes }
+        catch { $last = $_ }
+    }
+    throw "could not parse GGUF metadata within 64 MB: $($last.Exception.Message)"
+}
+
+function Get-GgufInfoAt {
+    param([string]$Path, [string]$Url, [int]$HeadBytes)
+
+    $bytes = if ($Path) {
+        $fs = [IO.File]::OpenRead($Path)
+        try {
+            $buf = New-Object byte[] ([math]::Min([long]$HeadBytes, $fs.Length))
+            [void]$fs.Read($buf, 0, $buf.Length); $buf
+        } finally { $fs.Dispose() }
+    } else {
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.AddRange(0, $HeadBytes - 1)
+        $req.UserAgent = 'localllm-setup'
+        $resp = $req.GetResponse()
+        try {
+            $ms = New-Object IO.MemoryStream
+            $resp.GetResponseStream().CopyTo($ms)
+            $ms.ToArray()
+        } finally { $resp.Dispose() }
+    }
+
+    if ([Text.Encoding]::ASCII.GetString($bytes, 0, 4) -ne 'GGUF') { throw "Not a GGUF file." }
+    $o = 4
+    $ver = [BitConverter]::ToUInt32($bytes, $o); $o += 4
+    $nTensors = [BitConverter]::ToUInt64($bytes, $o); $o += 8
+    $nKv = [BitConverter]::ToUInt64($bytes, $o); $o += 8
+
+    # GGUF value type ids; 8 = string, 9 = array, the rest are fixed-width scalars.
+    $width = @{ 0 = 1; 1 = 1; 2 = 2; 3 = 2; 4 = 4; 5 = 4; 6 = 4; 7 = 1; 10 = 8; 11 = 8; 12 = 8 }
+    function Read-GgufString([byte[]]$b, [ref]$off) {
+        $n = [BitConverter]::ToUInt64($b, $off.Value); $off.Value += 8
+        $s = [Text.Encoding]::UTF8.GetString($b, $off.Value, $n); $off.Value += $n; $s
+    }
+    function Skip-GgufValue([byte[]]$b, [ref]$off, [int]$t, $w) {
+        if ($t -eq 8) { [void](Read-GgufString $b $off); return }
+        if ($t -eq 9) {
+            $et = [BitConverter]::ToUInt32($b, $off.Value); $off.Value += 4
+            $n = [BitConverter]::ToUInt64($b, $off.Value); $off.Value += 8
+            for ($i = 0; $i -lt $n; $i++) { Skip-GgufValue $b $off $et $w }
+            return
+        }
+        $off.Value += $w[[int]$t]
+    }
+
+    $kv = @{}
+    $ref = [ref]$o
+    # The keys worth having (architecture, expert counts, block count) are written before the
+    # tokenizer arrays, which are what make these headers tens of MB. So walk until the buffer
+    # runs out and keep whatever was read - a truncated tail costs nothing we need.
+    try {
+        for ($i = 0; $i -lt $nKv; $i++) {
+            $key = Read-GgufString $bytes $ref
+            $t = [BitConverter]::ToUInt32($bytes, $ref.Value); $ref.Value += 4
+            if ($t -eq 8) { $kv[$key] = Read-GgufString $bytes $ref }
+            elseif ($t -in 4, 5) { $kv[$key] = [BitConverter]::ToUInt32($bytes, $ref.Value); Skip-GgufValue $bytes $ref $t $width }
+            elseif ($t -in 10, 11) { $kv[$key] = [BitConverter]::ToUInt64($bytes, $ref.Value); Skip-GgufValue $bytes $ref $t $width }
+            else { Skip-GgufValue $bytes $ref $t $width }
+        }
+    } catch {
+        # Ran past the window. Fine if the architecture block already landed; the caller retries
+        # with a bigger read if it didn't.
+        if (-not $kv['general.architecture']) { throw }
+    }
+
+    $arch = $kv['general.architecture']
+    [pscustomobject]@{
+        Arch        = $arch
+        Version     = $ver
+        Tensors     = $nTensors
+        Experts     = [int]$kv["$arch.expert_count"]        # >0 means MoE
+        ExpertsUsed = [int]$kv["$arch.expert_used_count"]
+        Blocks      = [int]$kv["$arch.block_count"]
+        TrainCtx    = [int]$kv["$arch.context_length"]
+        Embedding   = [int]$kv["$arch.embedding_length"]
+        FileType    = $kv['general.file_type']
+    }
+}
+
+# llama.cpp's own fitter: loads the model's metadata, looks at free VRAM, and prints the CLI
+# args that fit. Beats hand-measuring, and it accounts for the KV type it's told about.
+function Get-FittedContext($ggufPath, $kvType = 'q4_0') {
+    $exe = Join-Path $llamaCpp 'llama-fit-params.exe'
+    $prismExe = Join-Path $llamaPrism 'llama-fit-params.exe'
+    # A low-bit model only loads on the fork, so fit it with the fork's own binary.
+    if ((Test-Path $prismExe) -and -not (Test-Path $exe)) { $exe = $prismExe }
+    if (-not (Test-Path $exe)) { return $null }
+    try {
+        $out = & $exe -m $ggufPath -ctk $kvType -ctv $kvType -fa on 2>$null | Select-Object -Last 1
+        if ($out -match '-c\s+(\d+)') { return [int]$Matches[1] }
+    } catch { }
+    $null
+}
+
 # Appends a model entry to config.yaml, matching the style already in the file. The file is
 # hand-maintained and git-tracked, so it gets a .bak first and is never rewritten wholesale.
 function Add-ModelToConfig($id, $ggufPath, $context) {
@@ -686,6 +798,64 @@ if ($Action -eq 'restart') {
     if (-not $webui) { throw "Nothing deployed - run '.\start.ps1' with no arguments first." }
     Stop-Stack $Component
     Start-Stack $webui $Component
+    return
+}
+
+if ($Action -eq 'inspect') {
+    if (-not $Model) { throw "-Action inspect needs -Model <hf repo, hf url, or .gguf url>." }
+    $spec = Resolve-ModelSpec $Model
+
+    $vramMib = 0
+    try { $vramMib = [int]((nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits) -split "`n")[0] } catch { }
+    $freeMib = 0
+    try { $freeMib = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits) -split "`n")[0] } catch { }
+    $ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+    Write-Host "`nthis machine: $vramMib MiB VRAM ($freeMib MiB free now), $ramGb GB system RAM`n"
+
+    $targets = if ($spec.Repo) {
+        Write-Host "Reading $($spec.Repo) from Hugging Face..."
+        @(Get-HfVariants $spec.Repo) | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; Bytes = $_.Bytes
+                Url = "https://huggingface.co/$($spec.Repo)/resolve/main/$($_.Parts[0].path)" }
+        }
+    } else {
+        @([pscustomobject]@{ Name = (Split-Path ($spec.Url -split '\?')[0] -Leaf); Bytes = 0; Url = $spec.Url })
+    }
+
+    # Architecture and expert counts are properties of the model, not of the quantisation, so
+    # every variant in a repo shares them. Read one header (the smallest, so the range request is
+    # cheapest) instead of pulling tens of MB per variant.
+    $probe = $targets | Sort-Object Bytes | Select-Object -First 1
+    Write-Host "Reading metadata from $($probe.Name) ..."
+    $info = $null; $why = ''
+    try { $info = Get-GgufInfo -Url $probe.Url } catch { $why = $_.Exception.Message }
+    if (-not $info) { throw "Could not read GGUF metadata: $why" }
+
+    Write-Host ""
+    Write-Host "arch $($info.Arch) | $($info.Blocks) blocks | trained context $($info.TrainCtx) | $(if ($info.Experts -gt 0) { "MoE, $($info.Experts) experts, $($info.ExpertsUsed) active per token" } else { 'dense' })"
+
+    Write-Host ("`n{0,-44} {1,9} {2,-10} {3,-16} {4}" -f 'variant', 'size', 'arch', 'kind', 'verdict')
+    Write-Host ('-' * 104)
+    foreach ($t in $targets) {
+        $kind = if ($info.Experts -gt 0) { "MoE $($info.Experts)e/$($info.ExpertsUsed)a" } else { 'dense' }
+        $sizeGb = $t.Bytes / 1GB
+
+        # Weights must fit somewhere. On VRAM alone for a dense model; for MoE the experts can
+        # live in system RAM and only the active path needs the card, which is the whole reason
+        # a 12 GB GPU can run a 100B model at all.
+        $budgetGb = ($vramMib - 1500) / 1024      # leave ~1.5 GB for the desktop and buffers
+        $verdict =
+            if ($sizeGb -le $budgetGb) { 'fits in VRAM' }
+            elseif ($info.Experts -gt 0 -and $sizeGb -le ($ramGb - 4)) { 'MoE: offload experts (--n-cpu-moe)' }
+            elseif ($info.Experts -gt 0) { "MoE but needs > $ramGb GB RAM" }
+            else { 'too big (dense, will not fit)' }
+
+        Write-Host ("{0,-44} {1,9} {2,-10} {3,-16} {4}" -f `
+            $t.Name, (Format-Size $t.Bytes), $info.Arch, $kind, $verdict)
+    }
+    Write-Host ""
+    Write-Host "arch must be one llama.cpp knows - an unknown one fails at load no matter the size."
+    Write-Host "Pull one with:  .\start.ps1 -Action add-model -Model '<repo>' -Quant <label>"
     return
 }
 
