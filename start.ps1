@@ -97,6 +97,10 @@ param(
     # suggest: machine-readable, for the control panel.
     [switch]$Json,
 
+    # deploy: keep node_modules and the private Node runtime after the frontend is built. They are
+    # ~1.1 GB and are only needed to rebuild it, so they are deleted by default.
+    [switch]$KeepBuildDeps,
+
     # uninstall: skip the confirmation prompt.
     [switch]$Force
 )
@@ -393,6 +397,23 @@ function Invoke-Deploy($ver) {
         & $npmCmd run build
         if ($LASTEXITCODE -ne 0) { Pop-Location; throw "npm run build failed" }
         Pop-Location
+
+        # The frontend build is static: the Python backend serves build\ and never invokes node.
+        # Verified - neither backend\start_windows.bat nor main.py references node or node_modules.
+        # So once build\ exists, node_modules and the private Node runtime are dead weight, and on
+        # this machine they were 1,014 MB and 95 MB respectively. That is more than the entire
+        # inference stack costs. An upgrade re-fetches them, which is the same work a rebuild would
+        # have needed anyway.
+        if (-not $KeepBuildDeps) {
+            foreach ($d in @((Join-Path $webui 'node_modules'), $nodeRoot)) {
+                if (Test-Path $d) {
+                    $mb = [int]((Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue |
+                                 Measure-Object Length -Sum).Sum / 1MB)
+                    Write-Host "Removing build-only $((Split-Path $d -Leaf)) ($mb MB) - the backend serves build\ and never calls node."
+                    Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
     }
 
     # --- 8. .env wired to point at llama-swap instead of Ollama ---
