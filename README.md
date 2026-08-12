@@ -7,12 +7,66 @@
 **Run large language models on your own Windows machine — and hand your Claude Code sessions over
 to them when your quota runs out.** Nothing leaves the box.
 
-Download, extract, double-click. No Docker, no WSL, no Python or Node install, nothing added to
-your PATH or your registry.
+**Unzip it, double-click one file, press Start.** No Docker, no WSL, no Python or Node to install
+first, no admin rights, and nothing added to your PATH or registry.
 
 <!-- SCREENSHOT: the control panel's Dashboard tab, full window.
      Suggested filename: docs/img/dashboard.png  (~1040x720, the panel's native size) -->
 ![The LocalLLM control panel](docs/img/dashboard.png)
+
+---
+
+## How to install it
+
+There is no installer and nothing to set up first. Three steps.
+
+### 1. Download and unzip it
+
+Click the green **Code** button at the top of this page, choose **Download ZIP**, and unzip it.
+
+Put it somewhere simple like `C:\LocalLLM` or `D:\LocalLLM`. **Don't** put it in
+`C:\Program Files` — Windows makes that folder read-only without admin rights, and the brackets in
+`Program Files (x86)` break part of the build.
+
+### 2. Double-click `LocalLLM.cmd`
+
+That's the only file you need to touch. A window opens — this is the control panel, and it's how
+you'll do everything from here on.
+
+### 3. Press the **Start** button
+
+This is the bit that installs everything: the engine that runs the models, the router that loads
+them on demand, and the chat page. It's about **1.5 GB** and takes a few minutes on a normal
+connection. You only ever do this once.
+
+You don't need Python, Node, Docker, WSL, or a package manager. If they're missing, it fetches its
+own private copies into its own folder. It never touches anything you already have installed, never
+asks for admin, and never adds anything to your PATH or registry.
+
+**Then pick a model.** Go to the **Models** tab and press **Suggest models** — it looks at your
+actual RAM, graphics card and memory speed and shows only models that will genuinely run well, each
+with a Download button. When one has finished downloading, open the chat from the **Open** button
+on the Dashboard.
+
+<!-- SCREENSHOT: the Models tab with "Suggest models" results showing, so the fit/speed columns are visible.
+     Suggested filename: docs/img/models.png -->
+![Choosing a model that fits](docs/img/models.png)
+
+### Every time after that
+
+Double-click `LocalLLM.cmd` and press **Start** again. It skips everything that's already
+installed, so it just brings the servers up — a few seconds, not minutes.
+
+Closing the panel window doesn't shut anything down. It minimises to an icon in the system tray and
+your models keep serving. To actually stop everything, right-click that tray icon and choose Stop.
+
+### If something goes wrong
+
+Nothing is hidden. Every download and every start-up writes to the `logs` folder, and the
+**Activity** tab in the panel shows the same output live. To remove it completely, run
+`start.ps1 -Action uninstall` — because nothing was installed system-wide, that really does remove
+all of it. Deleting the folder works too, though it leaves the downloaded models behind unless you
+delete those as well.
 
 ---
 
@@ -32,30 +86,6 @@ you, and it measures rather than guesses.
   non-obvious client bugs already worked around.
 - **Verifies instead of assuming.** Launches are health-checked, configs are validated against
   disk, and a model is only offered to a coding agent after it has actually driven one.
-
-## Getting started
-
-1. **Download** this repo as a ZIP (green **Code** button → *Download ZIP*) and extract it.
-
-   Extract somewhere plain, like `C:\LocalLLM`. Avoid `C:\Program Files (x86)\...` — it needs
-   admin rights to write to, and the parentheses in the path break the chat UI's JavaScript build.
-
-2. **Double-click `LocalLLM.cmd`.**
-
-The panel opens and walks you through three steps.
-
-| | |
-| --- | --- |
-| **1. Press Start** | Downloads the inference engine, the router and the chat UI (~1.5 GB). Several minutes, once. |
-| **2. Add a model** | Press **Suggest models** — it ranks known models against your actual RAM, VRAM and memory bandwidth and lists only ones that can call tools, each with a Download button. Already know what you want? Paste its Hugging Face GGUF repo and press **Inspect**. |
-| **3. Open the chat** | The **Open** button next to open-webui. Your first message loads the model, which takes a few seconds. |
-
-<!-- SCREENSHOT: the Models tab with "Suggest models" results showing, so the fit/speed columns are visible.
-     Suggested filename: docs/img/models.png -->
-![Choosing a model that fits](docs/img/models.png)
-
-Closing the panel window doesn't stop anything — it minimises to a tray icon and the models keep
-serving. Right-click the tray icon to stop the stack for real.
 
 ## What you need
 
