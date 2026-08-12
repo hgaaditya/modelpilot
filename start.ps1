@@ -126,12 +126,15 @@ $VER = @{
     # is '-Action inspect', but "which model should I get at all". 5 MB download, installed by
     # '-Action install-llmfit'.
     llmfit    = 'v1.1.9'
+    # uv (astral-sh/uv) - replaces winget for getting Python, and pip for installing into it.
+    uv        = '0.12.3'
 }
 
 $root         = $PSScriptRoot
 $llamaCpp     = Join-Path $root 'llama.cpp'
 $llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side with the stock build
 $modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
+$uvDir        = Join-Path $root 'uv'          # provides Python; nothing is installed system-wide
 $llmfitDir    = Join-Path $root 'llmfit'
 $llmfitExe    = Join-Path $llmfitDir 'llmfit.exe'
 $llamaSwapDir = Join-Path $root 'llamaswap'
@@ -361,22 +364,37 @@ function Invoke-Deploy($ver) {
     # Fetch them with '-Action add-model'; Test-SwapConfig reports any that config.yaml expects
     # but that aren't on disk.
 
-    # --- 4. Python 3.11/3.12 (open-webui pins requires-python <3.13) ---
-    $pyExe = Find-CompatPython
-    if (-not $pyExe) {
-        Write-Host "No Python 3.11/3.12 found (open-webui needs <3.13) - installing via winget..."
-        winget install --id Python.Python.3.12 -e --silent --accept-package-agreements --accept-source-agreements
-        $pyExe = Find-CompatPython
-        if (-not $pyExe) { throw "Python 3.12 install did not register with the 'py' launcher. Install it manually and re-run." }
-    }
+    # --- 4. Python 3.12, via uv (open-webui pins requires-python <3.13) ---
+    # winget used to do this and was the most fragile step in the whole bootstrap: it is absent on
+    # LTSC and Server, absent on images where the Store is stripped, can demand interactive
+    # elevation, and installs machine-wide so an uninstall leaves it behind.
+    #
+    # uv is a single static binary that fetches its own standalone CPython. Measured here: 2s to
+    # download uv, 2s to install Python 3.12, 1s to make the venv - and it resolved open-webui's
+    # 127 pinned packages in 6 seconds, which pip spends minutes on. No admin, no registry, and
+    # UV_PYTHON_INSTALL_DIR keeps the interpreter inside this install so uninstall really removes
+    # it. It also pins the Python version rather than inheriting whatever the machine happens to
+    # have, which makes "what Python are you on?" answerable in a bug report.
+    $uvExe = Get-Uv
+
+    # Contained, not machine-wide: both the interpreter and uv's download cache live under $root.
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $root '.python'
+    $env:UV_CACHE_DIR          = Join-Path $root '.uv-cache'
 
     # --- 5. venv + backend deps ---
     if (-not (Test-Path $venvPy)) {
+        # --no-bin: without it uv also drops a python3.12.exe shim in ~\.local\bin, which is a
+        # write outside this install and warns when something unmanaged is already there. The venv
+        # is what gets used; the shim was never wanted.
+        Write-Host "Installing Python 3.12 (private to this install) ..."
+        & $uvExe python install 3.12 --no-bin
+        if ($LASTEXITCODE -ne 0) { throw "uv could not install Python 3.12." }
         Write-Host "Creating venv at $venv ..."
-        & $pyExe -m venv $venv
-        & $venvPy -m pip install --upgrade pip
-        & $venvPy -m pip install -r (Join-Path $webui 'backend\requirements.txt')
-        if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+        & $uvExe venv $venv --python 3.12
+        if ($LASTEXITCODE -ne 0) { throw "uv could not create the venv at $venv." }
+        Write-Host "Installing backend dependencies (127 packages, several GB with torch) ..."
+        & $uvExe pip install --python $venvPy -r (Join-Path $webui 'backend\requirements.txt')
+        if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
     }
 
     # --- 6. isolated Node (open-webui .npmrc has engine-strict=true, pins <=22.x) ---
@@ -438,11 +456,21 @@ function Invoke-Deploy($ver) {
     $webui
 }
 
-function Find-CompatPython {
-    (py -0p 2>$null) -split "`r?`n" |
-        Where-Object { $_ -match '-V:3\.1[12]\b' } |
-        Select-Object -First 1 |
-        ForEach-Object { ($_ -split '\s{2,}')[-1].Trim() }
+# uv (astral-sh/uv, MIT/Apache-2.0): one static binary that installs its own CPython and resolves
+# dependencies. Fetched the same way as every other component here - pinned version, GitHub
+# release, matched by asset name - so it is one more download rather than a new kind of dependency.
+function Get-Uv {
+    $exe = Join-Path $uvDir 'uv.exe'
+    if (Test-Path $exe) { return $exe }
+    New-Item -ItemType Directory -Force -Path $uvDir, $dl | Out-Null
+    $zip = Join-Path $dl "uv-$($VER.uv).zip"
+    if (-not (Test-Path $zip)) {
+        Write-Host "Fetching uv $($VER.uv) (18 MB) - it provides Python, so nothing has to be installed system-wide..."
+        Get-File "https://github.com/astral-sh/uv/releases/download/$($VER.uv)/uv-x86_64-pc-windows-msvc.zip" $zip
+    }
+    Expand-Archive -Path $zip -DestinationPath $uvDir -Force
+    if (-not (Test-Path $exe)) { throw "uv.exe missing after extracting $zip - check the asset layout." }
+    $exe
 }
 
 # ==========================================================================
@@ -1534,6 +1562,13 @@ switch ($Action) {
         if (Test-Path $logDir)    { $targets += $logDir }
         if (Test-Path $stampFile) { $targets += $stampFile }
         if (Test-Path $dl)        { $targets += $dl }
+        # uv, the private CPython it installed, and its download cache. All inside $root precisely
+        # so that uninstall can take them - the old winget route installed Python machine-wide and
+        # left it behind for the user to find and remove themselves.
+        if (Test-Path $uvDir)     { $targets += $uvDir }
+        foreach ($d in @((Join-Path $root '.python'), (Join-Path $root '.uv-cache'))) {
+            if (Test-Path $d) { $targets += $d }
+        }
 
         if (-not $targets) { Write-Host "Nothing installed - nothing to remove."; break }
 

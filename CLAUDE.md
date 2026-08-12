@@ -56,7 +56,11 @@ On a clean machine it bootstraps everything (skipping any step whose artifact al
 1. Downloads llama.cpp `b10155` (CUDA build if `nvidia-smi` is found, else CPU) into `llama.cpp\`
 2. Downloads llama-swap `v244` into `llamaswap\`, and writes `llamaswap\config.yaml` from `config.example.yaml` if it isn't there yet, substituting this clone's path for `{{LOCALLLM_ROOT}}`
 3. Ensures `llama.cpp\models\` exists — weights are **not** bootstrapped, since GGUF quant sources vary by provider and can't be guessed; fetch them with `-Action add-model` (below)
-4. Installs Python 3.12 via winget if no 3.11/3.12 is found (open-webui pins `requires-python <3.13`), creates `open-webui-0.11.0\.venv`, installs `backend\requirements.txt`
+4. Fetches **uv** (one 18 MB static binary), which installs its own CPython 3.12 into `.python\`, creates `open-webui-0.11.0\.venv` and installs `backend\requirements.txt`
+
+   This replaced `winget install Python.Python.3.12`, which was the most fragile step in the bootstrap: winget is absent on LTSC and Server, absent on images with the Store stripped, can demand interactive elevation, and installs machine-wide so an uninstall left Python behind. uv needs none of that. Measured on a clean run: 8s to fetch uv, 5s to install Python, 1s for the venv, and **6s to resolve open-webui's 127 pinned packages** (340 with transitive deps) — a job pip spends minutes on.
+
+   `UV_PYTHON_INSTALL_DIR` and `UV_CACHE_DIR` point inside the install so `-Action uninstall` can actually remove them. `python install --no-bin` is deliberate: without it uv also drops a `python3.12.exe` shim into `~\.local\bin`, which is a write outside the install and warns when something unmanaged is already there.
 5. Downloads an isolated Node.js v22.23.1 into `open-webui-0.11.0\.node-runtime\` — open-webui's `.npmrc` has `engine-strict=true` pinning `<=22.x.x`, so this never touches or depends on a machine's global Node version
 6. `npm install` + `npm run build` for the frontend (production build, served by the backend from one port)
 7. Writes `open-webui-0.11.0\.env` from `.env.example` with `OPENAI_API_BASE_URL` pointed at llama-swap and `ENABLE_OLLAMA_API=false` (this stack doesn't use Ollama, despite `.env.example`'s default framing around it)

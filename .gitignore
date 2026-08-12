@@ -44,6 +44,12 @@ __pycache__/
 # llmfit binary (downloaded by -Action install-llmfit)
 /llmfit/
 
+# uv, plus the private CPython it installs and its download cache. Kept inside the install rather
+# than machine-wide so nothing is left behind on uninstall.
+/uv/
+/.python/
+/.uv-cache/
+
 # per-machine panel state (paths, ports, which services you run) - not shareable
 /.ui-settings.json
 /.ui-usage.json

@@ -64,8 +64,11 @@ serving. Right-click the tray icon to stop the stack for real.
   falls back to CPU-only otherwise, which works but is slow. 8 GB of VRAM runs a useful model;
   12 GB runs a good one.
 - **Disk:** about 3 GB for the stack, plus model weights (2–20 GB each).
-- Everything else — Python, Node — is fetched into the install folder. Nothing is installed
-  system-wide, and your existing Python and Node are never touched.
+- **Nothing needs to be preinstalled.** No Python, no Node, no Docker, no WSL, no package manager,
+  no admin rights. Python arrives as a private copy inside the install folder (via
+  [uv](https://github.com/astral-sh/uv)), Node is fetched the same way and deleted once the
+  frontend is built. Your existing Python and Node are never touched, and `-Action uninstall`
+  removes all of it because none of it was installed system-wide.
 
 ## Running out of Claude quota mid-project
 
