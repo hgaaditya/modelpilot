@@ -87,6 +87,42 @@ param(
     # -NoMcp:$false restores them if a session genuinely needs an MCP server.
     [bool]$NoMcp = $true,
 
+    # Third-party plugins, and the user-level settings that enable them. Not the same lever as
+    # -Bare: this keeps the project's own CLAUDE.md, the built-in tools and skills, and drops only
+    # what another workflow installed machine-wide.
+    #
+    # It exists because a local session came back answering from *other sessions*. The claude-mem
+    # plugin's SessionStart hook injects an index of every past conversation on this machine -
+    # 18,407 tokens by its own banner - and a 27B model cannot tell background context from the
+    # task in front of it, so it answered a question about this repo with a July crash triage.
+    # caveman and ponytail inject their whole style documents on top of that.
+    #
+    # Measured in this repo, against a captured /v1/messages with the defaults below already on
+    # (--strict-mcp-config and the -Tools list), counted with llama-swap's own count_tokens:
+    #   plugins on   44,284 tokens - 34% of gemma4-v2's 131072, before you type
+    #   plugins off  29,231 tokens - 22%
+    # 15,053 tokens, and the part that goes is the part that was contaminating the answers.
+    #
+    # --setting-sources drops the *user* settings file, which is where enabledPlugins lives. That
+    # also drops the global ~/.claude/CLAUDE.md, which is this machine's preferences for cloud
+    # sessions rather than anything about the repo. Verified by capturing the real request: the
+    # project CLAUDE.md is still in it, caveman/ponytail/RTK are not.
+    #
+    # -NoPlugins:$false restores the lot for a session that wants a specific plugin.
+    [bool]$NoPlugins = $true,
+
+    # Everything else a session loads before you type: the CLAUDE.md chain, hooks, plugins and
+    # skills. --bare is what -Check already uses, and it exists here because the cost is not small
+    # and is invisible until the session dies. Measured against this repo with
+    # /v1/messages/count_tokens: the CLAUDE.md files alone are ~13,700 tokens, and there are 136
+    # SKILL.md files on this machine whose descriptions come to another ~7,000. Against a 40960
+    # window that is a session reporting "Context limit reached" before its first message - which
+    # is what it did.
+    #
+    # Off by default, because a coding session usually wants its project's own instructions. Turn
+    # it on when the window is tight and the repo's CLAUDE.md is large.
+    [switch]$Bare,
+
     # Plugins to disable for local sessions only. These inject instructions into every request, so
     # they cost window on every turn while buying behaviour a small quantised model follows less
     # reliably than a frontier one does. Disabled here rather than in the user's own settings, so
@@ -160,6 +196,22 @@ $swapConfig = Join-Path $PSScriptRoot 'llamaswap\config.yaml'
 # only. Shared by the -Check probe and the real launch so the two cannot drift - a probe that
 # passes under different settings than the session it is vouching for is worthless.
 function Set-LocalEnv($ctx) {
+    # Claude Code marks every process it spawns with CLAUDE_CODE_CHILD_SESSION, and a session
+    # carrying that marker does not write a transcript. The marker is inherited by anything
+    # launched from a Claude Code session - this script, the control panel, and the terminal the
+    # panel opens - so a handoff started from inside a dying session came up with
+    # "Transcript saving is off" and left no .jsonl behind.
+    #
+    # That is not cosmetic and it is not an edge case: launching the handoff from the session whose
+    # quota just ran out is the exact scenario this script exists for, and the panel's Hand over
+    # list is read from those .jsonl files. A local session started that way would silently never
+    # appear in it, so the next handoff cannot resume the work the last one did.
+    #
+    # The session ids go with it - a new, independent session must not claim the id of the one that
+    # launched it. Cleared for this process only, like everything else here.
+    foreach ($v in 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_HOST_SESSION_ID') {
+        if (Test-Path "env:$v") { Remove-Item "env:$v" }
+    }
     $env:ANTHROPIC_BASE_URL   = $base
     $env:ANTHROPIC_AUTH_TOKEN = 'local'      # llama-swap doesn't check it, but the client requires one
     $env:ANTHROPIC_MODEL      = $Model
@@ -219,6 +271,26 @@ function Set-Compat($id, $ok, $reason) {
     $h | ConvertTo-Json -Depth 5 | Set-Content $compatFile -Encoding utf8
 }
 
+# A resumed conversation is replayed in full, images included - and these GGUFs are text-only, so
+# llama-server answers "500 image input is not supported" and Claude Code retries it ten times
+# because a 500 reads as transient. Nothing about that names the actual cause, and the session
+# never recovers: the images are in the history, so every turn resends them.
+#
+# Caught the first time Hand over was pointed at a real conversation - this repo's own, which had
+# 11 pasted screenshots in it. Any cloud session where you pasted an image has the same problem.
+# Scanned by line rather than parsed: these transcripts are megabytes of tool output and the only
+# question is whether the marker appears at all.
+function Get-TranscriptImageCount($sessionId) {
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    if (-not (Test-Path $root)) { return 0 }
+    # Session ids are unique, so the encoded directory name doesn't have to be reconstructed -
+    # which is just as well, since it maps both ':' and '' to '-' and isn't reversible.
+    $f = Get-ChildItem $root -Recurse -Filter "$sessionId.jsonl" -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+    if (-not $f) { return 0 }
+    @(Select-String -Path $f.FullName -Pattern '"type"\s*:\s*"image"' -AllMatches -ErrorAction SilentlyContinue).Count
+}
+
 # A floor for the model list, not a measured requirement. Claude Code's own fixed overhead was
 # measured here at ~1.1k tokens per request (379 for the background model, 1091 for the main one
 # with 3 tools), counted through llama-swap's /v1/messages/count_tokens on payloads captured from
@@ -260,11 +332,27 @@ function Get-ModelFacts {
 # own prompt. A model failing any of those is not a fallback, it is a 500 a minute from now.
 function Test-Runnable($f) { $f -and $f.present -and $f.engineOk -and $f.ctx -ge $MIN_AGENT_CTX }
 
-# Best available agent model: the largest context among the runnable ones, because context is what
-# runs out first in a coding session. Deliberately not "the biggest model" - a 20B at -c 16384 is
-# useless here and a 14B at -c 65536 is not.
+# Best available agent model: among the runnable ones, whichever has the largest context - because
+# context is what runs out first in a coding session. Deliberately not "the biggest model": a 20B
+# at -c 16384 is useless here and a 14B at -c 65536 is not.
+#
+# Context is the tie-breaker, NOT the first sort key. A model that -Check has already watched fail
+# Claude Code is never picked, and a verified one always beats an untested one - because the
+# alternative is what this actually did: it handed every session to the largest-context model on
+# the box, which was one that 400s on its own chat template, and the failure surfaced inside Claude
+# Code where it reads as the handoff being broken. The panel filtered that model out of its
+# dropdown and this function did not, so the two disagreed about the default.
 function Select-AgentModel($ids, $facts) {
-    $fit = @($ids | Where-Object { Test-Runnable $facts[$_] } | Sort-Object { -$facts[$_].ctx })
+    $compat = Get-Compat
+    $rank = {
+        param($id)
+        $c = $compat[$id]
+        if ($null -eq $c) { 1 } elseif ($c.ok) { 0 } else { 2 }   # verified, untested, known-bad
+    }
+    # Parenthesised deliberately: `Test-Runnable $x -and $y` binds -and as a PARAMETER of
+    # Test-Runnable rather than as an operator, and the filter then passes everything.
+    $fit = @($ids | Where-Object { (Test-Runnable $facts[$_]) -and (& $rank $_) -lt 2 } |
+             Sort-Object @{ Expression = { & $rank $_ } }, @{ Expression = { -$facts[$_].ctx } })
     if ($fit.Count) { $fit[0] } else { $null }
 }
 
@@ -289,9 +377,15 @@ if (-not $report.problem) {
     if (-not $Model) {
         $Model = Select-AgentModel $known $facts
         if (-not $Model) {
-            # Say which of the three requirements nothing meets, rather than just "none found".
+            # Say which of the four requirements nothing meets, rather than just "none found".
             $big = @($known | Where-Object { $facts[$_] -and $facts[$_].ctx -ge $MIN_AGENT_CTX })
-            $report.problem = if ($big.Count) {
+            $compat = Get-Compat
+            $rejected = @($known | Where-Object { (Test-Runnable $facts[$_]) -and $compat[$_] -and -not $compat[$_].ok })
+            $report.problem = if ($rejected.Count) {
+                "Every model that could run this has already been shown to fail Claude Code: " +
+                "$(($rejected | ForEach-Object { "$_ ($($compat[$_].reason))" }) -join '; '). " +
+                "Pass -Model to try one anyway, or add a model that works."
+            } elseif ($big.Count) {
                 "Every model with enough context is missing its weights or its engine: $($big -join ', '). " +
                 "Fetch weights with '.\start.ps1 -Action add-model', or run '-Action check-config' for the detail."
             } else {
@@ -326,13 +420,65 @@ if (-not $report.problem -and $Model -and $facts[$Model].ctx -lt $MIN_AGENT_CTX)
                    "so expect to be compacting constantly. Raise it to at least $MIN_AGENT_CTX.")
 }
 
+# What the session carries before you type anything. Every overhead number this repo has published
+# for Claude Code (~1.1k tokens per request) came from the -Check probe, which runs --bare - so all
+# of them are a floor that excludes precisely the things a real session loads. Measured here with
+# /v1/messages/count_tokens against this repo: the CLAUDE.md chain alone is ~13,700 tokens, a third
+# of a 40960 window, spent before the first message. Unstated, that arrives as "Context limit
+# reached" on a session that has done nothing, and reads as the model or the handoff being broken.
+#
+# Counted, not estimated - the router is already up and count_tokens is free. @imports inside a
+# CLAUDE.md are not followed, so this is still a floor, and skills and hooks are on top of it.
+if (-not $Bare -and -not $Check -and -not $report.problem -and $Model) {
+    $ctxFiles = @()
+    $d = Get-Item -LiteralPath $(if ($Directory) { $Directory } else { (Get-Location).Path }) -ErrorAction SilentlyContinue
+    while ($d) { $f = Join-Path $d.FullName 'CLAUDE.md'; if (Test-Path $f) { $ctxFiles += $f }; $d = $d.Parent }
+    $g = Join-Path $env:USERPROFILE '.claude\CLAUDE.md'
+    if (Test-Path $g) { $ctxFiles += $g }
+    if ($ctxFiles.Count) {
+        $text = ($ctxFiles | ForEach-Object { Get-Content $_ -Raw }) -join "`n"
+        # Body as explicit UTF-8 bytes. PowerShell 5.1 otherwise encodes the string as Latin-1, and
+        # a CLAUDE.md full of em dashes then arrives as ill-formed UTF-8 - llama-swap answers 500
+        # with an error OBJECT rather than an HTTP failure, so this doesn't throw either: it just
+        # yields a null token count. Same bug local-llm.ps1 already carries the fix for.
+        $payload = @{ model = $Model; messages = @(@{ role = 'user'; content = $text }) } | ConvertTo-Json -Depth 5
+        $n = try {
+            (Invoke-RestMethod "$base/v1/messages/count_tokens" -Method Post -ContentType 'application/json' `
+                 -Body ([Text.Encoding]::UTF8.GetBytes($payload)) -TimeoutSec 30).input_tokens
+        } catch { $null }
+        # A character estimate beats saying nothing, which is how this cost stayed invisible.
+        if (-not $n) { $n = [int]($text.Length / 4) }
+        $pct = [int](100 * $n / [Math]::Max(1, $report.context))
+        $line = "CLAUDE.md will cost ~$n tokens ($pct% of this model's $($report.context)), before skills, hooks and your first message."
+        if ($pct -ge 25) { Write-Warning "$line Add -Bare to leave all of it out." } else { Write-Host "  project docs: ~$n tokens ($pct%)" }
+    }
+}
+
+if ($SessionId -and -not $report.problem) {
+    $imgs = Get-TranscriptImageCount $SessionId
+    if ($imgs) {
+        Write-Warning ("That conversation contains $imgs image(s), and these models are text-only. Claude Code replays the " +
+                       "whole history on resume, so llama-server will answer '500 image input is not supported' and the " +
+                       "client will retry it ten times. Start a fresh session in this directory instead - the files are " +
+                       "the same, only the chat history is lost.")
+        Write-Host ""
+    }
+}
+
 # 4. The endpoint Claude Code actually uses. /health being up says nothing about /v1/messages
 #    working - that is the Anthropic-shaped surface, and it is what a handoff depends on.
 if (-not $report.problem -and $Model) {
+    # This request is what actually loads the weights, so on a cold start it is where all the time
+    # goes - tens of seconds for a multi-GB model. Say so: with nothing printed, the console this
+    # was launched into sits blank and the handoff looks hung.
+    Write-Host "Warming '$Model' - this request is what loads the weights, so a cold start takes 10-60s..."
     try {
         $body = @{ model = $Model; max_tokens = 1; messages = @(@{ role = 'user'; content = 'hi' }) } | ConvertTo-Json -Depth 5
+        # 300s, matching healthCheckTimeout in config.yaml, not 60. A 27B loading from a cold page
+        # cache overran the old 60s ceiling and the launch aborted with "/v1/messages failed" -
+        # reporting a broken endpoint for a model that was simply still loading.
         $r = Invoke-RestMethod "$base/v1/messages" -Method Post -ContentType 'application/json' `
-                 -Body $body -TimeoutSec $(if ($Check) { 900 } else { 60 })
+                 -Body $body -TimeoutSec $(if ($Check) { 900 } else { 300 })
         if (-not $r) { $report.problem = "/v1/messages returned nothing for '$Model'." }
     } catch {
         $report.problem = "/v1/messages failed for '$Model': $($_.Exception.Message)"
@@ -446,11 +592,15 @@ Write-Host "  model:       $Model  (-c $($report.context))"
 Write-Host "  small model: $SmallModel"
 Write-Host "  directory:   $(Get-Location)"
 Write-Host "  context:     $($report.context) tokens (told to Claude Code, which would otherwise assume 200k)"
+Write-Host "  extras:      MCP $(if ($NoMcp) { 'off' } else { 'on' }), plugins $(if ($NoPlugins) { 'off' } else { 'on' }) - project CLAUDE.md, skills and built-in tools stay either way"
 Write-Host ""
 if (-not $Resume) { Write-Host "Picking up an existing session in this directory? Add -Resume." ; Write-Host "" }
 
 $a = @('--settings', "`"$(New-SessionSettings)`"")
 if ($NoMcp) { $a += '--strict-mcp-config' }   # see -NoMcp: MCP tool schemas are ~40% of a local window
+# see -NoPlugins: user settings hold enabledPlugins, and one of them injects every past session
+if ($NoPlugins) { $a += @('--setting-sources', 'project,local') }
+if ($Bare)  { $a += '--bare' }                # see -Bare: CLAUDE.md + skills measured at ~20k here
 # A specific session wins over "the most recent one" - if you picked it, you meant it.
 if ($SessionId) { $a += @('--resume', $SessionId) }
 elseif ($Resume) { $a += '--continue' }

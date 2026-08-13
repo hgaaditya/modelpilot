@@ -55,6 +55,13 @@ $script:selfOrigin = "http://127.0.0.1:$Port"
 # Version strings cost a process launch each, so they're read once and kept.
 $script:versionCache = @{}
 
+# The page is served once and then lives in a window that is never closed - closing it is a
+# minimise. So an edit to this file, or any restart onto new code, left the browser running the
+# old markup and old JS until someone reopened it by hand. The build stamp is this file's mtime;
+# the page remembers the first one it saw and reloads itself when the server reports a different
+# one, which is exactly the case where its own code is stale.
+$script:build = (Get-Item -LiteralPath $PSCommandPath).LastWriteTimeUtc.Ticks.ToString()
+
 # ---------------------------------------------------------------- window management
 
 # Chromium runs every --app window of a browser inside one process tree, and only one process in
@@ -217,7 +224,7 @@ function Get-Settings {
     # and nothing else, so someone who only wants the router doesn't get open-webui started, and
     # doesn't get told the stack is half-down because a service they deselected isn't running.
     $d = @{ modelsDir = (Join-Path $llamaCpp 'models'); swapPort = $swapPort; webuiPort = $webuiPort
-            useSwap = $true; useWebui = $true; projectDir = '' }
+            useSwap = $true; useWebui = $true; projectDir = ''; agentModel = '' }
     if (Test-Path $settingsFile) {
         $s = Get-Content $settingsFile -Raw | ConvertFrom-Json
         foreach ($k in $d.Keys.Clone()) { if ($s.PSObject.Properties.Name -contains $k) { $d[$k] = $s.$k } }
@@ -327,6 +334,31 @@ function Update-Usage($loaded) {
 
 # Weights on disk that no config entry points at - downloaded but not registered, which is
 # otherwise invisible and looks like a missing model.
+# Downloads in flight. start.ps1 stages every weight file to <name>.part and drops a
+# <name>.part.json beside it carrying the expected size, so progress is bytes-on-disk over that
+# total - no parsing of curl's carriage-return progress meter, which is what made a 5 GB download
+# read as a stalled job. Speed and ETA are derived in the page from consecutive polls, the same
+# way the Monitoring tab accumulates its own samples: the server holds no per-session history.
+function Get-Downloads {
+    $s = Get-Settings
+    if (-not (Test-Path $s.modelsDir)) { return @() }
+    Get-ChildItem (Join-Path $s.modelsDir '*.part') -ErrorAction SilentlyContinue | ForEach-Object {
+        $total = 0
+        $meta = "$($_.FullName).json"
+        if (Test-Path $meta) {
+            try { $total = [long](Get-Content $meta -Raw | ConvertFrom-Json).total } catch { }
+        }
+        [pscustomobject]@{
+            file  = $_.Name -replace '\.part$', ''
+            bytes = $_.Length
+            total = $total
+            # A .part nobody has written to for a while is a dead download, not a slow one, and
+            # saying so is the difference between waiting and re-running.
+            idle  = [int]((Get-Date) - $_.LastWriteTime).TotalSeconds
+        }
+    }
+}
+
 function Get-OrphanModels {
     $s = Get-Settings
     if (-not (Test-Path $s.modelsDir)) { return @() }
@@ -369,6 +401,7 @@ function Get-Dashboard {
         # Win32_OperatingSystem reports kilobytes, so KB -> GB is /1MB.
         ramUsed = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
         ramTot  = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+        build   = $script:build
     }
 }
 
@@ -428,156 +461,16 @@ function Get-Sensors {
 # configured models could actually back one. Deliberately does NOT probe /v1/messages - that can
 # load a multi-GB model and take a minute, so it lives behind the Test button instead.
 function Get-Agents {
-    # Same threshold as claude-local.ps1: Claude Code sends 15-25k tokens of system prompt and tool
-    # definitions before your first message, so a model at -c 16384 fails on the first turn.
-    $min = 32768
-    $models = @(Get-ConfiguredModels)
-    $compat = @{}
-    $cf = Join-Path $root '.agent-compat.json'
-    if (Test-Path $cf) {
-        try { (Get-Content $cf -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $compat[$_.Name] = $_.Value } } catch { }
-    }
+    # The Claude Code handoff used to live here too, with a model chooser, a context
+    # threshold and a .agent-compat.json verdict behind it. All of it is gone: a local
+    # model drives opencode-style one-shot work fine and does not converge on a real
+    # agent loop, so the panel offers the one that works and says why the other left.
     @{
-        minContext = $min
-        claude   = [bool](Get-Command claude -ErrorAction SilentlyContinue)
         opencode = [bool](Get-Command opencode -ErrorAction SilentlyContinue)
-        script   = (Join-Path $root 'claude-local.ps1')
         delegate = (Join-Path $root 'local-llm.ps1')
         agentScript = (Join-Path $root 'local-agent.ps1')
         projectDir = (Get-Settings).projectDir
-        # Ready = it would run right now. Short = the only thing wrong is context, which the Models
-        # tab can fix in two clicks, so it is worth naming separately from "not usable".
-        #
-        # 'tested' comes from .agent-compat.json, written by claude-local.ps1 -Check after it runs
-        # Claude Code for real. Enough context is necessary but nowhere near sufficient - the
-        # largest-context model configured here fails Claude Code outright on its chat template -
-        # so a model that has been shown to fail is dropped from the list rather than offered with
-        # a warning nobody reads.
-        ready = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -ge $min } |
-                  ForEach-Object {
-                      $c = $compat[$_.id]
-                      @{ id = $_.id; ctx = $_.ctx
-                         tested = $(if ($null -eq $c) { 'untested' } elseif ($c.ok) { 'ok' } else { 'bad' })
-                         reason = $(if ($c -and -not $c.ok) { "$($c.reason)" } else { '' }) }
-                  } | Sort-Object { -$_.ctx })
-        short = @($models | Where-Object { $_.present -and $_.engineOk -and $_.ctx -lt $min } |
-                  ForEach-Object { @{ id = $_.id; ctx = $_.ctx } } | Sort-Object { -$_.ctx })
     }
-}
-
-# Claude Code's own session history. It keeps every conversation as
-# ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl, so "which projects was I working on" is
-# answerable without asking the user to remember a path.
-#
-# The directory name is NOT a reliable source for that path: it replaces both ':' and '\' with
-# '-', so C:\Users\me\pc-debugging and C:\Users\me\pc\debugging encode identically. The records
-# inside carry the real cwd, so that's what's read.
-#
-# ponytail: cached for 30s. Each session is a bounded head-read, but there are already 68 files
-# here and the Coding agents tab re-renders every 3s - uncached, that tab would spend its whole
-# life re-reading disk.
-$script:sessCache = $null
-function Get-ClaudeSessions([switch]$Refresh) {
-    if ($script:sessCache -and -not $Refresh -and
-        ((Get-Date) - $script:sessCache.at).TotalSeconds -lt 30) { return $script:sessCache.rows }
-    $root = Join-Path $env:USERPROFILE '.claude\projects'
-    $rows = @()
-    if (Test-Path $root) {
-        # A "project" is somewhere you'd actually work. Temp directories are where this app's own
-        # probes and one-shot runs live, and a session started in a system directory is a stray
-        # `claude` typed into the wrong window - neither is something you'd hand over, and both
-        # crowd out the real projects. Matching the temp root rather than named probe directories
-        # keeps this working when the next diagnostic invents a new folder name.
-        $skipRoots = @($env:TEMP, $env:TMP, (Join-Path $env:SystemRoot 'system32'), $env:SystemRoot) |
-                     Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') } | Select-Object -Unique
-        # One row per PROJECT, not per session. Resuming means "the conversation I was having in
-        # that repo", and a directory can hold dozens of sessions - eight identical one-shot runs
-        # crowding out eight real projects is the opposite of useful.
-        #
-        # The grouping happens on the FILE SYSTEM, before anything is read: Claude Code already
-        # keeps one directory per project, so the newest .jsonl in each directory is that
-        # project's latest session - the same one --continue would pick. Reading 120 transcripts
-        # and then discarding 108 duplicates took twelve seconds; picking the newest per directory
-        # first means ~15 reads. (The directory NAME still can't be trusted as the path - it maps
-        # both ':' and '\' to '-' - so the cwd is still read from inside the file.)
-        # To reach an older session, run `claude --resume` inside that project.
-        $seen = @{}
-        $newestPerProject = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object { Get-ChildItem $_.FullName -Filter *.jsonl -ErrorAction SilentlyContinue |
-                             Sort-Object LastWriteTime -Descending | Select-Object -First 1 } |
-            Sort-Object LastWriteTime -Descending
-        foreach ($f in $newestPerProject) {
-            # cwd and the opening prompt are near the start; the title is not. Claude Code writes
-            # {"type":"custom-title","customTitle":...} as the conversation develops and rewrites
-            # it as the subject changes, so the LAST one is the title its own sidebar shows -
-            # "Llama server setup script upgrades", not the first thing you happened to type.
-            # Head-read for the first, tail-read for the second.
-            # cwd is pulled with a regex rather than ConvertFrom-Json per line: these records carry
-            # whole tool outputs, and parsing sixty of them to read one string is the slow way.
-            $cwd = $null; $opening = $null
-            foreach ($line in (Get-Content $f.FullName -TotalCount 60 -ErrorAction SilentlyContinue)) {
-                if (-not $cwd -and $line -match '"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"') {
-                    $cwd = $Matches[1] -replace '\\\\', '\'
-                }
-                if (-not $opening -and $line -like '*"type":"user"*') {
-                    try {
-                        $o = $line | ConvertFrom-Json
-                        $c = $o.message.content
-                        $t = if ($c -is [string]) { $c } else { ($c | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text }
-                        if ($t) { $opening = ($t -replace '\s+', ' ').Trim() }
-                    } catch { }
-                }
-                if ($cwd -and $opening) { break }
-            }
-            # Every skip happens before the tail-read: most of the 120 candidates are duplicate
-            # projects or dead paths, and tail-reading a 9 MB transcript only to throw the result
-            # away is what made this tab take ten seconds to paint.
-            if (-not $cwd) { continue }
-            if ($seen.ContainsKey($cwd)) { continue }
-            if (-not (Test-Path $cwd)) { continue }     # project deleted or on a disconnected drive
-            $c = $cwd.TrimEnd('\')
-            if ($skipRoots | Where-Object { $c -eq $_ -or $c.StartsWith("$_\", 'OrdinalIgnoreCase') }) { continue }
-            $seen[$cwd] = $true
-
-            # Read the last chunk of the file by seeking, not with Get-Content -Tail. -Tail streams
-            # the whole file to find the end: on these transcripts (9 MB and up) that alone was
-            # fourteen seconds for eleven rows. A 256 KB window is far more than enough to contain
-            # the final custom-title record.
-            $title = $null
-            try {
-                $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
-                try {
-                    $take = [Math]::Min(262144, $fs.Length)
-                    [void]$fs.Seek(-$take, 'End')
-                    $buf = New-Object byte[] $take
-                    [void]$fs.Read($buf, 0, $take)
-                    $tail = [Text.Encoding]::UTF8.GetString($buf)
-                } finally { $fs.Dispose() }
-                $ct = $tail -split "`n" | Where-Object { $_ -like '*"type":"custom-title"*' } | Select-Object -Last 1
-                if ($ct) { $title = ($ct | ConvertFrom-Json).customTitle }
-            } catch { }
-            if (-not $title) { $title = $opening }
-            # A session opened with a slash command has the raw invocation as its first user
-            # message - "<command-message>init</command-message><command-name>/init</command-name>"
-            # - which is markup, not a title. Unwrap it to the command that was actually run.
-            if ($title -match '<command-name>\s*([^<]+?)\s*</command-name>') {
-                $cmdName = $Matches[1]
-                $cmdArgs = if ($title -match '<command-args>\s*([^<]*?)\s*</command-args>') { $Matches[1] } else { '' }
-                $title = ("$cmdName $cmdArgs").Trim()
-            }
-            if ($title) { $title = ($title -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim() }
-            $rows += @{
-                id = $f.BaseName; cwd = $cwd
-                title = $(if ($title) { $title.Substring(0, [Math]::Min(110, $title.Length)) } else { '(no prompt yet)' })
-                kb = [int]($f.Length / 1KB)
-                when = $f.LastWriteTime.ToString('MM-dd HH:mm')
-                ago = [int]((Get-Date) - $f.LastWriteTime).TotalMinutes
-            }
-            if ($rows.Count -ge 12) { break }
-        }
-    }
-    $script:sessCache = @{ at = (Get-Date); rows = $rows }
-    $rows
 }
 
 # What this stack exposes to anything else on the machine. llama-swap speaks both the OpenAI and
@@ -749,8 +642,25 @@ button.act.busy::before{border-color:#fff;border-top-color:transparent}
 button.busy:disabled{opacity:.85}
 input,select{background:#fff;border:1px solid var(--line);color:var(--fg);border-radius:3px;padding:3px 6px;font-size:12px;user-select:text}
 input{width:100%}
+.adv{display:none}body.showadv .adv{display:table-cell}
 .bar{height:5px;background:#e2e6ec;border-radius:3px;overflow:hidden;margin-top:3px}
 .bar i{display:block;height:100%;background:var(--acc)}
+/* Anything slow gets a card in the corner saying what is happening, how long it usually takes,
+   and its latest line of output. Every long action already routes through spin(), so the card is
+   driven off the same busy() state the buttons use rather than a second bookkeeping system. */
+#act{position:fixed;right:14px;bottom:14px;width:330px;max-width:calc(100vw - 28px);z-index:40;
+ background:var(--panel);border:1px solid var(--line);border-radius:6px;box-shadow:0 10px 28px rgba(0,0,0,.22);display:none}
+#act.on{display:block}
+#acth{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--soft);
+ border-bottom:1px solid var(--line);font-size:11px;color:var(--dim);border-radius:6px 6px 0 0}
+#acth button{background:none;border:0;color:var(--dim);font-size:14px;line-height:1;padding:0 2px;cursor:pointer}
+#actb{padding:9px 10px;font-size:12px;max-height:46vh;overflow:auto}
+.job{margin-bottom:10px}.job:last-child{margin-bottom:0}
+.job b{font-weight:600}
+.job .note{color:var(--dim);font-size:11px;margin-top:1px}
+.job pre{margin:4px 0 0;font-size:10.5px;color:var(--dim);white-space:pre-wrap;max-height:46px;overflow:hidden}
+.bar.indet i{width:34%;animation:slide 1.25s ease-in-out infinite}
+@keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
 .tag{font-size:10px;padding:1px 5px;border-radius:9px;border:1px solid var(--line);color:var(--dim);background:var(--soft)}
 .miss{color:var(--bad)}.on2{color:var(--ok)}
 .hint{background:#eaf1fb;border:1px solid #c3d6f2;border-radius:4px;padding:7px 9px;color:#28425f;font-size:12px;margin-bottom:9px}
@@ -811,9 +721,9 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 <button class="act" id="go" onclick="act('deploy')">Start</button></header>
 <nav>
 <button class="on" onclick="tab(0,this)">Dashboard</button>
-<button onclick="tab(1,this)">Engine</button>
 <button onclick="tab(2,this)">Models</button>
-<button onclick="tab(3,this)">Coding agents</button>
+<button onclick="tab(1,this)">Engine</button>
+<button onclick="tab(3,this)">Tools</button>
 <button onclick="tab(4,this)">Monitoring</button>
 <button onclick="tab(5,this)">Activity</button>
 <button onclick="tab(6,this)">Settings</button>
@@ -851,13 +761,14 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 
 <div class="pane" id="p2">
  <fieldset><legend>What should I run?</legend>
-  <div class="mode">Ranks known models against this machine's actual RAM, VRAM and memory bandwidth, and only lists ones that can call tools - so what you download can drive a coding agent.</div>
+  <div class="mode">Ranks known models against this machine's actual RAM, VRAM and memory bandwidth, and tells you which quant to take.</div>
   <div class="row">
    <select id="sgcase" style="width:auto">
     <option value="">any use case</option><option value="coding">coding</option>
     <option value="reasoning">reasoning</option><option value="general">general</option><option value="chat">chat</option>
    </select>
-   <button class="gh" id="sgbtn" onclick="suggest()">Suggest models</button>
+   <label style="font-size:11px;color:var(--dim)"><input type="checkbox" style="width:auto" id="sgtools"> must be able to call tools</label>
+   <button class="act" id="sgbtn" onclick="suggest()">Suggest models</button>
    <span id="sgmsg" style="color:var(--dim);font-size:11px"></span>
   </div>
   <div id="sug"></div>
@@ -870,30 +781,26 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
   </div>
   <div id="insp"></div>
  </fieldset>
+ <fieldset id="dlbox" style="display:none"><legend>Downloading</legend><div id="dlrows"></div></fieldset>
  <fieldset><legend>Configured models</legend>
-  <table><thead><tr><th>Model</th><th>Size</th><th>Context</th><th>KV</th><th>MoE</th><th>Last used</th><th>Loads</th><th>State</th><th></th></tr></thead><tbody id="mt"></tbody></table>
-  <div class="hint" style="margin:7px 0 0">Last used comes from the weight file's access time. Loads counts only what this panel has seen, so it is a floor rather than a lifetime total.</div>
+  <div class="row" style="margin-bottom:6px"><label style="font-size:11px;color:var(--dim)">
+    <input type="checkbox" style="width:auto" id="advchk" onchange="adv(this.checked)"> Show the raw llama.cpp settings</label></div>
+  <table><thead><tr><th>Model</th><th>Size</th><th>Conversation length</th><th class="adv">Context</th><th class="adv">KV</th><th class="adv">MoE</th><th class="adv">Last used</th><th class="adv">Loads</th><th>State</th><th></th></tr></thead><tbody id="mt"></tbody></table>
+  <div class="hint" style="margin:7px 0 0">Conversation length is how much of a chat the model can hold before it starts forgetting the beginning. <b>Tune</b> measures this machine and sets it as high as your card allows. Tick the box above for the raw <code>-c</code>, KV type and usage counts.</div>
  </fieldset>
  <fieldset><legend>Weights on disk with no config entry</legend><table><tbody id="orph"></tbody></table></fieldset>
 </div>
 
 <div class="pane" id="p3">
  <fieldset><legend>Project</legend>
-  <div class="row"><input id="pdir" placeholder="C:\path\to\your\project" style="flex:1">
-   <span style="color:var(--dim);font-size:11px">run on</span>
-   <select id="agmodel" style="width:auto"></select></div>
+  <div class="row"><input id="pdir" placeholder="C:\path\to\your\project" style="flex:1"></div>
+  <div class="hint" style="margin:7px 0 0">Used by the two Run buttons below.</div>
   <div id="agstat" style="color:var(--dim);font-size:11px;margin-top:5px"></div>
  </fieldset>
 
- <fieldset><legend>Your recent Claude Code sessions</legend>
-  <div class="mode">Read from Claude Code's own history. <b>Hand over</b> reopens that exact conversation on a local model - same files, same context, nothing uploaded.</div>
-  <table><tbody id="sess"><tr><td style="color:var(--dim)">loading...</td></tr></tbody></table>
- </fieldset>
-
- <fieldset><legend>Claude Code, on a local model</legend>
-  <div class="mode">Claude Code works exactly as normal, but every request goes to a model here instead of Anthropic - so it costs you nothing.</div>
-  <div class="row" id="agbtn1"></div>
-  <div id="agwarn"></div>
+ <fieldset><legend>Why Claude Code is not here</legend>
+  <div class="mode">Measured on this box: a fresh session with plugins off, asked to make <code>load_items</code> skip blank lines in a 12-line file, ran <b>219 tool calls over 29 minutes</b>, never produced a single line of reply, and left the file unchanged. Every earlier failure had a harness cause - this one had none, so it is a model limit rather than a wiring bug. The panel does not offer a session it cannot finish.</div>
+  <div class="hint" style="margin:7px 0 0">The script is still installed for direct questions: <code>claude-local.ps1 -Prompt "..."</code>. Note <code>-Check</code> passes this same model in 33s, so it does not predict whether a real session converges.</div>
  </fieldset>
 
  <fieldset><legend>opencode, on a local model</legend>
@@ -943,6 +850,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
  </fieldset>
 </div>
 </main>
+<div id="act"><div id="acth"><span id="actt">Working</span><button onclick="actHide()" title="hide">&times;</button></div><div id="actb"></div></div>
 <div id="ovl"><div id="dlg" role="dialog" aria-modal="true">
  <h4 id="dlgtitle">LocalLLM</h4>
  <div id="dlgbody"></div>
@@ -994,7 +902,7 @@ document.addEventListener('keydown',e=>{
  if(e.key==='Enter'){e.preventDefault();const i=document.getElementById('dlgin');dlgClose(i?i.value:true)}
 });
 
-let S={},E={},M={},VER={},JOBS=[],EP={};
+let S={},E={},M={},VER={},JOBS=[],EP={},BUILD=null;
 // Every button here starts a detached job and returns immediately, so for up to one poll
 // interval a click had no visible effect whatsoever - which reads as the click not registering.
 // Busy state comes from two places: the server's job list, which is the truth and survives a
@@ -1015,6 +923,8 @@ function busy(k){
 // clicked button without threading an event argument through every call site.
 function spin(k,ms){
  mark(k,ms);
+ ACTHID=0;   // a new action un-hides the card; dismissing it should not silence the next one
+ activity([]);
  const b=window.event&&window.event.target;
  if(b&&b.tagName==='BUTTON'){b.classList.add('busy');b.disabled=true}
 }
@@ -1034,103 +944,15 @@ function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
  monRun(i===4);
- if(i===3){agents();sessions(true)}}
+ if(i===3)agents()}
 // ---- coding agents
-let AG={},SESS=[];
+let AG={};
 function pdir(){return document.getElementById('pdir').value.trim()}
-function ago(m){
- if(m<60)return m+'m ago';
- if(m<1440)return Math.round(m/60)+'h ago';
- return Math.round(m/1440)+'d ago';
-}
-let sessAt=0;
-// force=true on a tab click so it paints immediately; otherwise at most once every 30s.
-async function sessions(force){
- if(!force&&Date.now()-sessAt<30000)return;
- sessAt=Date.now();
- try{SESS=await (await fetch('/api/sessions')).json()}catch(e){sessAt=0;return}
- // The folder is the identity here - it's what you recognise a project by, and what the handoff
- // actually acts on - so it leads, in full, with the conversation title as its subtitle. The
- // earlier layout put a truncated title first with the path greyed out underneath and the age
- // floating in its own column, which read as three unrelated things per row.
- document.getElementById('sess').innerHTML=SESS.length?SESS.map(s=>{
-  const leaf=s.cwd.replace(/[\\/]+$/,'').split(/[\\/]/).pop()||s.cwd;
-  const parent=s.cwd.slice(0,s.cwd.length-leaf.length).replace(/[\\/]+$/,'');
-  return `<tr>
-  <td style="max-width:0">
-   <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-    <b>${esc(leaf)}</b><span style="color:var(--dim)">&nbsp;&nbsp;${esc(parent)}</span></div>
-   <div style="color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-    ${esc(s.title)} <span style="opacity:.75">&middot; ${ago(s.ago)}</span></div></td>
-  <td style="width:1%;white-space:nowrap;vertical-align:middle">${B('gh','claudelaunch',`handOff('${s.id}',${JSON.stringify(s.cwd)})`,'Hand over')}</td></tr>`}).join('')
-  :'<tr><td style="color:var(--dim)">No Claude Code sessions found for any project on this machine.</td></tr>';
-}
-// Resuming means both the directory and the conversation - Claude Code stores sessions per
-// project, so a session id without its cwd resumes nothing.
-async function handOff(id,cwd){
- document.getElementById('pdir').value=cwd;
- spin('claudelaunch',6000);
- const r=await (await fetch('/api/launch-claude',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({dir:cwd,sessionId:id,model:document.getElementById('agmodel').value})})).json();
- if(r.error)msg(r.error);
- setTimeout(tick,700);
-}
 async function agents(){
  try{AG=await (await fetch('/api/agents')).json()}catch(e){return}
  const dir=document.getElementById('pdir');
  if(document.activeElement!==dir&&!dir.value&&AG.projectDir)dir.value=AG.projectDir;
- // Which model backs the agent is a choice, not an automatic pick: models differ in whether they
- // can drive an agent loop at all, and the auto-pick only knows about context. Rebuilt only when
- // the option list actually changes, so the poll doesn't reset a selection mid-use.
- // Only models that could work are offered: one already shown to fail Claude Code is dropped
- // outright rather than listed with a caveat. Untested ones stay, marked - otherwise a fresh
- // install would offer nothing at all until you happened to run a test.
- const usable=AG.ready.filter(m=>m.tested!=='bad'), rejected=AG.ready.filter(m=>m.tested==='bad');
- const sel=document.getElementById('agmodel');
- const want=usable.map(m=>m.id+':'+m.tested).join('|');
- if(sel.dataset.ids!==want){
-  const keep=sel.value;
-  sel.innerHTML=usable.map(m=>`<option value="${m.id}">${m.id} (-c ${m.ctx})${m.tested==='ok'?' - verified':' - untested'}</option>`).join('')
-                ||'<option value="">no usable model</option>';
-  sel.dataset.ids=want;
-  if(keep&&usable.some(m=>m.id===keep))sel.value=keep;
-  else{const v=usable.find(m=>m.tested==='ok');if(v)sel.value=v.id;}   // prefer a verified one
- }
- // One status line rather than a table: what matters is whether it can run, and if not, why.
- const bad=[];
- if(!AG.claude)bad.push('claude not on PATH');
- if(!usable.length)bad.push(AG.short.length?('no model has -c '+AG.minContext+'+ (raise one in Models > Edit)')
-   :(rejected.length?'every model here has failed Claude Code':'no model downloaded yet'));
- let st=bad.length?'<span class="miss">'+bad.join(' - ')+'</span>'
-   :(usable.some(m=>m.tested==='ok')?'':'Untested - press <b>Test it</b> before trusting one with a session.');
- if(rejected.length)st+=(st?'<br>':'')+'<span class="miss">Hidden as incompatible: '+
-   rejected.map(m=>m.id+' ('+(m.reason||'failed').replace(/</g,'&lt;').slice(0,80)+')').join('; ')+'</span>';
- document.getElementById('agstat').innerHTML=st;
- const off=!AG.claude||!AG.ready.length;
- document.getElementById('agbtn1').innerHTML=
-  B('act','claudelaunch',"launchClaude(false)",'Start a session')+' '+
-  B('gh','claudelaunch',"launchClaude(true)",'Resume last session')+' '+
-  B('gh','agentcheck','agCheck()','Test it')+
-  ' <span id="agmsg" style="color:var(--dim);font-size:11px"></span>';
- if(off)document.querySelectorAll('#agbtn1 button').forEach(b=>b.disabled=true);
- document.getElementById('agwarn').innerHTML=off?'':
-  '<div class="hint" style="margin:7px 0 0">Opens a terminal. Only that window is redirected - your normal <code>claude</code> still goes to Anthropic.</div>';
- // The verdict belongs next to the button that asked for it, not only in the Activity log.
- const j=JOBS.find(x=>x.name==='agentcheck'),el=document.getElementById('agmsg');
- if(busy('agentcheck'))el.textContent='loading a model, calling /v1/messages...';
- else if(j){
-  // The verdict is the Ready/WARNING line, not necessarily the first line of the tail.
-  const v=(j.tail||'').split('\n').find(l=>/^(Ready|WARNING)/.test(l.trim()));
-  el.innerHTML=v?(v.startsWith('Ready')?'<span class="on2">'+v+'</span>':'<span class="miss">'+v.replace(/</g,'&lt;').slice(0,110)+'</span>'):'';
- }
-}
-async function launchClaude(resume){
- if(!pdir()){msg('Pick a project first - either choose one from the list below, or type its folder in the Project box.');return}
- spin('claudelaunch',6000);
- const r=await (await fetch('/api/launch-claude',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({dir:pdir(),resume,model:document.getElementById('agmodel').value})})).json();
- if(r.error)msg(r.error);
- setTimeout(tick,700);
+ document.getElementById('agstat').innerHTML=AG.opencode?'':'<span class="miss">opencode not on PATH - only Delegate the reading will run</span>';
 }
 async function runLocal(kind){
  const task=document.getElementById(kind==='agent'?'agtask':'dgtask').value.trim();
@@ -1140,10 +962,6 @@ async function runLocal(kind){
    body:JSON.stringify({kind,prompt:task,dir:pdir(),file:document.getElementById('dgfile').value.trim()})})).json();
  if(r.error)msg(r.error);
  setTimeout(tick,700);
-}
-async function agCheck(){
- spin('agentcheck',900000);
- await post('/api/agent-check',{model:document.getElementById('agmodel').value});setTimeout(tick,900);
 }
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
@@ -1184,7 +1002,19 @@ async function act(a,c){
  spin(jkey(a,comp),a==='deploy'?600000:60000);
  await post('/api/action',{action:a,component:comp});setTimeout(tick,1200);
 }
-async function toggleSvc(key,on){await post('/api/settings',key==='swap'?{useSwap:on}:{useWebui:on});tick()}
+// The tick decides what Start/Stop act on; it does not itself start or stop anything. Unticking a
+// service that is up therefore leaves it running and simultaneously removes it from the health
+// summary, which is the one combination nobody expects - so offer the obvious follow-up rather
+// than making the checkbox silently destructive.
+async function toggleSvc(key,on){
+ const svc=(S.services||[]).find(x=>x.key===key);
+ await post('/api/settings',key==='swap'?{useSwap:on}:{useWebui:on});
+ if(!on&&svc&&svc.up){
+  if(await ask(svc.name+' is still running on its port. Unticking it only removes it from Start, Stop and the status summary.',
+    {ok:'Stop '+svc.name,cancel:'Leave it running'})){act('stop',key);return}
+ }
+ tick();
+}
 // Loading is the one action with no job behind it - llama-swap swaps the model in when the
 // one-token request lands. The mark clears when the model shows up as loaded, so the ceiling is
 // only a backstop for a load that fails outright.
@@ -1226,10 +1056,11 @@ async function edit(id){
    body:JSON.stringify({id,ctx:+ctx,kv:kv.trim()})})).json();
  delete PEND['edit:'+id];
  if(r.error){msg('Could not write the config: '+r.error);tick();return}
- // llama-swap reads config.yaml only at startup, so the edit does nothing until it bounces.
- if(await ask('Saved. llama-swap only reads config.yaml at startup, so this takes effect after a restart.',
-   {ok:'Restart llama-swap',cancel:'Later'})) act('restart','swap');
- else tick();
+ // llama-swap runs with -watch-config, so it re-reads the file within ~2s - no restart. What a
+ // reload does NOT do is re-spawn a llama-server that is already running: that one keeps the -c
+ // it was started with. So evict it if it's the model just edited, and say nothing otherwise.
+ if(S.loaded===id){await post('/api/unload',{});msg('Saved. The model was unloaded so the next request picks up the new settings.')}
+ tick();
 }
 // Deleting weights is multi-GB and irreversible, so it asks twice: once for the files, then
 // separately about the config entry, which is a different decision.
@@ -1239,15 +1070,27 @@ async function del(id,gb){
  const alsoConfig=!!await ask('Also remove the "'+id+'" entry from config.yaml?\n\nKeeping it leaves the model listed with no weights, which is useful if you plan to download it again.',
    {ok:'Remove the entry too',cancel:'Keep the entry'});
  const r=await (await fetch('/api/delete-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,alsoConfig})})).json();
- if(r.error)msg('Delete failed: '+r.error); else if(alsoConfig)await post('/api/action',{action:'restart',component:'swap'});
+ // No restart after removing the entry - llama-swap watches config.yaml (-watch-config).
+ if(r.error)msg('Delete failed: '+r.error);
  setTimeout(tick,700);
 }
 function fmt(mb){return (mb/1024).toFixed(1)+' GB'}
-async function suggest(){
+// minfit is only ever set by the "include tighter fits" button on an empty result - the default
+// is llmfit's 'good', and quietly starting from 'marginal' would recommend models that thrash.
+function relaxUse(){document.getElementById('sgcase').value='';suggest()}
+function relaxTools(on){document.getElementById('sgtools').checked=on;suggest()}
+async function suggest(minfit){
  const b=document.getElementById('sgbtn');b.classList.add('busy');b.disabled=true;
+ const use=document.getElementById('sgcase').value, tools=document.getElementById('sgtools').checked;
  document.getElementById('sgmsg').textContent='scoring models against this hardware...';
  try{
-  const d=await (await fetch('/api/suggest?usecase='+encodeURIComponent(document.getElementById('sgcase').value))).json();
+  const d=await (await fetch('/api/suggest?usecase='+encodeURIComponent(use)
+    +'&tools='+(tools?'1':'0')+(minfit?'&minfit='+minfit:''))).json();
+  // The picker is a separate 5 MB binary. Telling someone to go and run a CLI action is exactly
+  // the friction this panel exists to remove, so the error turns into the button that fixes it.
+  if(d.needInstall){document.getElementById('sug').innerHTML=
+    '<div class="hint">The picker is a separate 5 MB download. '
+    +'<button class="act" onclick="installPicker()">Install it</button></div>';return}
   if(d.error){document.getElementById('sug').innerHTML='<div class="hint miss">'+d.error+'</div>';return}
   const m=d.models||[];
   document.getElementById('sug').innerHTML=m.length?
@@ -1256,11 +1099,32 @@ async function suggest(){
     <td>${x.fit==='Perfect'?'<span class="on2">'+x.fit+'</span>':x.fit}</td>
     <td>${x.sizeGb} GB</td><td>${x.tps}</td><td>${x.ctx||'-'}</td>
     <td><button class="gh" onclick="dl('${x.repo}','${x.quant}')">Download</button></td></tr>`).join('')+
-   '</tbody></table><div class="hint" style="margin:7px 0 0">Speeds are estimated from memory bandwidth, not measured - <code>-Action bench</code> measures. A model needs -c 32768 or more to drive Claude Code; set that on the Models list after downloading.</div>'
-   :'<div class="hint">Nothing fits this machine with those filters.</div>';
+   '</tbody></table><div class="hint" style="margin:7px 0 0">Speeds are estimated from memory bandwidth, not measured - <b>Tune</b> on a downloaded model measures this machine properly. Context here is what the model was trained for, not what will fit; the downloaded entry gets its own setting.</div>'
+   :'<div class="hint"><b>Nothing matched.</b> That is the filters, not your hardware - '
+    +(use?'the <b>'+esc(use)+'</b> use case':'the current filters')
+    +' ruled everything out'+(minfit?' even at a looser fit':'')+'.<div class="row" style="margin-top:7px">'
+    +(use?'<button class="gh" onclick="relaxUse()">Try any use case</button>':'')
+    +'<button class="gh" onclick="relaxTools('+(tools?'false':'true')+')">'
+    +(tools?'Drop the tool-calling requirement':'Require tool calling')+'</button>'
+    +(minfit?'':'<button class="gh" onclick="suggest(&quot;marginal&quot;)">Include tighter fits</button>')
+    +'</div><div class="note" style="margin-top:6px">These filters do not simply narrow the list - each one changes how models are ranked, so turning one <i>on</i> can produce results where <i>off</i> produced none.</div></div>';
   document.getElementById('sgmsg').textContent='';
  }catch(e){document.getElementById('sug').innerHTML='<div class="hint miss">'+e+'</div>'}
  finally{b.classList.remove('busy');b.disabled=false;document.getElementById('sgmsg').textContent=''}
+}
+// Straight from the dashboard into the picker, with the tab switched for them. The nav button
+// is found by its label rather than threaded through, because tab() wants the element it marks.
+function firstModel(){
+ const b=[...document.querySelectorAll('nav button')].find(x=>x.textContent==='Models');
+ if(b)tab(2,b);
+ document.getElementById('sgtools').checked=false;   // a first model is for chatting, not tools
+ suggest();
+}
+async function installPicker(){
+ spin('llmfit',300000);
+ await post('/api/install-picker',{});
+ document.getElementById('sug').innerHTML='<div class="hint">Installing the picker - it appears under Activity. Press <b>Suggest models</b> again in a moment.</div>';
+ setTimeout(tick,900);
 }
 async function inspect(){
  const r=document.getElementById('repo').value.trim(); if(!r)return;
@@ -1280,9 +1144,106 @@ async function mkLnk(){
   document.getElementById('lnk').textContent=d.error?d.error:'created: '+d.paths.join('  |  ');
  }catch(e){document.getElementById('lnk').textContent=''+e}
 }
+// Previous sample per file, so speed is measured over the real gap between polls rather than
+// assumed to be one tick. A file that disappears from the list takes its sample with it.
+// -c is a token budget, which means nothing to someone choosing their first model. Words are
+// the unit they actually think in - roughly 0.75 words per token - and the band is what decides
+// whether a long chat survives, so both are shown and the raw number moves behind the toggle.
+function chat(ctx){
+ if(!ctx)return '-';
+ const w=Math.round(ctx*0.75/1000);
+ const band=ctx>=98304?'very long':ctx>=49152?'long':ctx>=24576?'medium':'short';
+ return `${band} <span style="color:var(--dim)">~${w}k words</span>`;
+}
+try{if(localStorage.getItem('showadv'))document.addEventListener('DOMContentLoaded',()=>{document.getElementById('advchk').checked=true;adv(true)})}catch(e){}
+function adv(on){document.body.classList.toggle('showadv',on);try{localStorage.setItem('showadv',on?'1':'')}catch(e){}}
+// What each slow action is, in the user's terms, and how long it usually takes. Keyed by the same
+// string spin() already uses, so adding an action means adding a line here and nothing else.
+// Without this the panel's answer to "did my click do anything" was a disabled button and, minutes
+// later, a log tail under Activity - which is not an answer.
+const JOBS_SAY={
+ deploy:['Installing the stack','Downloads the engine, the router and the chat UI - about 1.5 GB. Several minutes on a first run.'],
+ restart:['Restarting','A few seconds. The chat UI takes longer than the router.'],
+ stop:['Stopping',''],
+ download:['Downloading a model','Multi-GB. Safe to interrupt - it resumes where it stopped.'],
+ llmfit:['Installing the model picker','About 5 MB.'],
+ inspect:['Reading the model listing','Metadata only, no weights. Around 40 seconds.'],
+ unload:['Freeing VRAM',''],
+ vercheck:['Checking for newer versions','Asks GitHub and nodejs.org.'],
+ opencode:['The local agent is working','It edits files in your project directly.'],
+ delegate:['The local model is reading your file','Long files are split into chunks and answered in turn.']
+};
+function jobSay(k){
+ const base=k.split(/[:\-]/)[0], who=k.slice(base.length+1);
+ if(base==='load')  return ['Loading '+who,'Reading multi-GB weights into VRAM. Ten seconds to a minute.'];
+ if(base==='edit')  return ['Saving settings for '+who,''];
+ if(base==='autotune')return['Measuring what fits for '+who,'Loads the model repeatedly at different settings. Several minutes.'];
+ const e=JOBS_SAY[base]||JOBS_SAY[k];
+ if(e)return [e[0]+(who&&who!=='all'?' ('+who+')':''),e[1]];
+ return [k,''];
+}
+let ACTHID=0;
+function actHide(){ACTHID=Date.now();document.getElementById('act').classList.remove('on')}
+// Rendered from busy() - the same source the buttons use - so the card appears on the click that
+// starts something, not on the poll that eventually notices it.
+function activity(dls){
+ const keys=[...new Set([...Object.keys(PEND),...JOBS.filter(j=>j.running).map(j=>j.name)])].filter(busy);
+ const card=document.getElementById('act');
+ if(!keys.length){card.classList.remove('on');ACTHID=0;return}
+ if(ACTHID){card.classList.remove('on');return}
+ card.classList.add('on');
+ document.getElementById('actt').textContent=keys.length>1?keys.length+' things running':'Working';
+ document.getElementById('actb').innerHTML=keys.map(k=>{
+  const [title,note]=jobSay(k);
+  const j=JOBS.find(x=>x.running&&x.name===k);
+  const line=(j&&j.tail||'').split('\n').filter(t=>t.trim()).pop()||'';
+  // A download knows its real percentage, so it gets a real bar; everything else gets a moving
+  // one, which says "alive" without claiming to know how far along it is.
+  const d=k==='download'&&dls.length?dls[0]:null;
+  const pct=d&&d.total?Math.min(100,d.bytes*100/d.total):null;
+  return `<div class="job"><b>${esc(title)}</b>
+   ${note?`<div class="note">${esc(note)}</div>`:''}
+   <div class="bar${pct===null?' indet':''}"><i${pct===null?'':` style="width:${pct.toFixed(1)}%"`}></i></div>
+   ${line?`<pre>${esc(line).slice(0,200)}</pre>`:''}</div>`
+ }).join('');
+}
+let DLP={};
+function gb(b){return (b/1073741824).toFixed(2)+' GB'}
+function downloads(rows){
+ const box=document.getElementById('dlbox');
+ box.style.display=rows.length?'':'none';
+ if(!rows.length){DLP={};return}
+ const now=Date.now();
+ document.getElementById('dlrows').innerHTML=rows.map(d=>{
+  const prev=DLP[d.file];
+  let rate=0;
+  if(prev&&now>prev.t&&d.bytes>prev.b)rate=(d.bytes-prev.b)/((now-prev.t)/1000);
+  DLP[d.file]={t:now,b:d.bytes,rate:rate||(prev?prev.rate:0)};
+  const r=DLP[d.file].rate;
+  // total is 0 for a bare .gguf URL, where nothing announced a size - show what has arrived
+  // rather than a percentage that would have to be invented.
+  const pct=d.total?Math.min(100,d.bytes*100/d.total):null;
+  const eta=(r>0&&d.total&&d.total>d.bytes)?Math.round((d.total-d.bytes)/r):null;
+  const stalled=d.idle>90;
+  const right=stalled?'<span class="miss">no data for '+Math.round(d.idle/60)+' min - it may have died; re-run the download, it resumes</span>'
+   :[pct!==null?pct.toFixed(1)+'%':'size unknown',
+     gb(d.bytes)+(d.total?' of '+gb(d.total):''),
+     r>0?(r/1048576).toFixed(1)+' MB/s':'',
+     eta!==null?'about '+(eta>=3600?Math.round(eta/3600)+' h':eta>=60?Math.round(eta/60)+' min':eta+' s')+' left':''
+    ].filter(Boolean).join(' &middot; ');
+  return `<div style="margin-bottom:9px">
+   <div style="display:flex;gap:10px;justify-content:space-between;font-size:12px"><b>${esc(d.file)}</b>
+    <span style="color:var(--dim)">${right}</span></div>
+   <div class="bar" style="height:7px"><i style="width:${pct===null?100:pct}%;background:${stalled?'var(--warn)':'var(--ok)'};${pct===null?'opacity:.35':''}"></i></div></div>`
+ }).join('');
+}
 async function dl(repo,quant){spin('download',3600000);await post('/api/download',{model:repo,quant});document.getElementById('insp').innerHTML='<div class="hint">Download started - watch Activity below.</div>';setTimeout(tick,800)}
 async function tick(){
  try{S=await (await fetch('/api/status')).json()}catch(e){return}
+ // Stale page check, first thing: if the server is running different code than served this page,
+ // nothing rendered below can be trusted to match it. Covers the ordinary restart too, since the
+ // window survives the server it was opened from.
+ if(!BUILD)BUILD=S.build; else if(S.build!==BUILD){location.reload();return}
  // Jobs before anything renders: every button's busy state is derived from this list.
  try{JOBS=await (await fetch('/api/jobs')).json()}catch(e){}
  // A finished job clears its optimistic mark. Without this the mark would hold the button
@@ -1311,7 +1272,12 @@ async function tick(){
     // An unmanaged entry is a CLI you invoke per task, not a service - calling it "stopped", in
     // red, reads as a fault when nothing is wrong and there is no button that would fix it.
     :!s.managed?'<span style="color:var(--dim)">available</span>'
-    :s.up?'<span class="on2">running</span>'
+    // Running but not ticked has to say so. The tick is a selection for Start/Stop, not an
+    // on/off switch, so unticking leaves the service serving - and the header dot ignores it,
+    // because health is judged against ticked services only. Reported as plain "running" that
+    // is a service nothing on this page accounts for.
+    :s.up?(s.selected?'<span class="on2">running</span>'
+                     :'<span class="on2">running</span> <span style="color:var(--dim)">(not selected)</span>')
     :s.selected?'<span class="miss">stopped</span>'
     :'<span style="color:var(--dim)">stopped (not selected)</span>'}</td>
   <td>${s.url&&s.up?`<a href="${s.url}" target="_blank"><button class="gh">Open</button></a>`:''}</td></tr>`).join('');
@@ -1330,7 +1296,11 @@ async function tick(){
  else if(fresh) g='<div class="hint"><b>Step 1 of 3.</b> Nothing is installed yet. Press <b>Start</b> - it downloads the inference engine, the router and the chat UI (about 1.5 GB) and takes several minutes on a first run. Progress shows under <b>Engine</b>.</div>';
  else if(!up) g='<div class="hint">Nothing is running. Press <b>Start</b>.</div>';
  else if(up<need) g='<div class="hint">Only part of your stack is up. <b>Restart</b> brings the rest back.</div>';
- else if(noModels) g='<div class="hint"><b>Step 2 of 3.</b> The stack is running but has no models. Open <b>Models</b>, paste a Hugging Face GGUF repo (try <code>unsloth/gpt-oss-20b-GGUF</code>), press <b>Inspect</b>, and download a variant it says fits your card.</div>';
+ // Step 2 used to be four manual instructions ending in "download a variant it says fits your
+ // card", which is the step a first-time user is least equipped to judge. It is now one button
+ // that opens Models and runs the picker against this machine's own VRAM.
+ else if(noModels) g='<div class="hint"><b>Step 2 of 3.</b> The stack is running but has no models yet. '
+  +'<button class="act" onclick="firstModel()">Find one that fits this PC</button></div>';
  else if(noWeights) g='<div class="hint">Models are configured but none of their weight files are on disk. Download one from <b>Models</b>, or delete the entries that point at weights you do not have.</div>';
  // Step 3 is keyed on "no model has ever been used", not on "nothing loaded right now" - models
  // unload on their idle timer all day, and a banner that returns every time would be noise.
@@ -1384,6 +1354,8 @@ async function tick(){
    : 'No model has both its weights and an engine yet, so there is nothing to request.';
  }
  try{M=await (await fetch('/api/models')).json()}catch(e){}
+ downloads(M.downloads||[]);
+ activity(M.downloads||[]);
  if(M.models){
   document.getElementById('mt').innerHTML=M.models.map(m=>{
    const on=S.loaded===m.id;
@@ -1394,8 +1366,9 @@ async function tick(){
    return `<tr>
    <td>${dot}${m.id} ${m.prism?'<span class="tag">prism</span>':''}</td>
    <td>${m.present?m.sizeGb+' GB':'<span class="miss">no weights</span>'}</td>
-   <td>${m.ctx||'-'}</td><td>${m.kv||'-'}</td><td>${m.moe!==null?m.moe:'-'}</td>
-   <td style="color:var(--dim)">${m.lastUsed||'-'}</td><td>${m.loads||0}</td>
+   <td>${chat(m.ctx)}</td>
+   <td class="adv">${m.ctx||'-'}</td><td class="adv">${m.kv||'-'}</td><td class="adv">${m.moe!==null?m.moe:'-'}</td>
+   <td class="adv" style="color:var(--dim)">${m.lastUsed||'-'}</td><td class="adv">${m.loads||0}</td>
    <td>${!m.engineOk?'<span class="miss">engine missing</span>':(on?'<span class="on2">loaded</span>':(loading?'<span style="color:var(--warn)">loading</span>':(m.present?'ready':'-')))}</td>
    <td>${m.present?B('gh','load:'+m.id,`load('${m.id}')`,'Load')+' '+
                    B('gh','edit:'+m.id,`edit('${m.id}')`,'Edit')+' '+
@@ -1410,7 +1383,7 @@ async function tick(){
  // and adding a seventh call to a 3s tick was enough to saturate it - /api/ping, which does no
  // work at all, was taking a second. Sessions change on the timescale of starting a project, so
  // once every 30s is plenty.
- if(document.getElementById('p3').classList.contains('on')){agents();sessions()}
+ if(document.getElementById('p3').classList.contains('on'))agents()
  const md=document.getElementById('mdir');
  if(M.settings&&document.activeElement!==md){md.value=M.settings.modelsDir;
   document.getElementById('st').innerHTML=`<span>llama-swap</span><div>127.0.0.1:${M.settings.swapPort}</div><span>Chat UI</span><div>127.0.0.1:${M.settings.webuiPort}</div><span>This panel</span><div>127.0.0.1:${location.port}</div>`;}
@@ -1492,29 +1465,6 @@ try {
                 '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/agents$'  { $body = Get-Agents | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/endpoints$' { $body = Get-Endpoints | ConvertTo-Json -Depth 5 -Compress }
-                '^/api/sessions$' {
-                    $r = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['refresh'] -eq '1'
-                    $body = ConvertTo-Json -InputObject @(Get-ClaudeSessions -Refresh:$r) -Depth 4 -Compress
-                }
-                '^/api/launch-claude$' {
-                    # Claude Code is a terminal UI, so this is the one thing the panel cannot run
-                    # for you - it opens a console window and hands over. Not a job: a job is
-                    # hidden with its output redirected, which is exactly wrong for something you
-                    # are about to type into.
-                    $p = Read-Body $req
-                    if (-not $p.dir) { throw "Pick a project directory first." }
-                    if (-not (Test-Path $p.dir)) { throw "'$($p.dir)' does not exist." }
-                    Set-Settings ([pscustomobject]@{ projectDir = $p.dir }) | Out-Null
-                    # Arguments go as an array, never a concatenated string, so a path with a
-                    # space or a quote in it cannot turn into extra arguments.
-                    $a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                           (Join-Path $root 'claude-local.ps1'), '-Directory', $p.dir)
-                    if ($p.model)     { $a += @('-Model', $p.model) }
-                    if ($p.sessionId) { $a += @('-SessionId', $p.sessionId) }
-                    elseif ($p.resume) { $a += '-Resume' }
-                    Start-Process powershell -ArgumentList $a
-                    $body = '{"ok":true}'
-                }
                 '^/api/run-local$' {
                     # opencode and local-llm both run to completion and print an answer, so they
                     # are jobs like everything else and read out in Activity.
@@ -1533,18 +1483,13 @@ try {
                     }
                     $body = '{"ok":true}'
                 }
-                '^/api/agent-check$' {
-                    # A real end-to-end probe: it swaps a model in and calls /v1/messages, so it can
-                    # take a minute. A job, therefore - the result reads out in Activity, and the
-                    # button spins off the same job list as everything else.
-                    $p = Read-Body $req
-                    $a = @('-Check')
-                    if ($p -and $p.model) { $a += @('-Model', $p.model) }
-                    Start-Job2 'agentcheck' $a (Join-Path $root 'claude-local.ps1') | Out-Null
+                '^/api/install-picker$' {
+                    Start-Job2 'llmfit' @('-Action', 'install-llmfit') $startPs | Out-Null
                     $body = '{"ok":true}'
                 }
                 '^/api/models$' {
-                    $body = @{ models = @(Get-ConfiguredModels); orphans = @(Get-OrphanModels); settings = (Get-Settings) } | ConvertTo-Json -Depth 6 -Compress
+                    $body = @{ models = @(Get-ConfiguredModels); orphans = @(Get-OrphanModels)
+                               downloads = @(Get-Downloads); settings = (Get-Settings) } | ConvertTo-Json -Depth 6 -Compress
                 }
                 # ConvertTo-Json on an empty array yields nothing at all, not "[]", so the
                 # array is forced with a leading comma to keep it an array of one dimension.
@@ -1608,10 +1553,15 @@ try {
                     # llmfit is offline and answers in a couple of seconds, so this runs inline
                     # rather than as a job - the whole point is a list you act on immediately.
                     $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                    if (-not (Test-Path (Join-Path $root 'llmfit\llmfit.exe'))) { $body = '{"needInstall":true}' }
+                    else {
                     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs,
                            '-Action', 'suggest', '-Json', '-Top', '8')
                     if ($q['usecase']) { $a += @('-UseCase', $q['usecase']) }
-                    if ($q['tools'] -eq '0') { $a += @('-Capability', '') }
+                    if ($q['tools'] -ne '1') { $a += @('-Capability', 'any') }
+                    # Loosening the fit threshold is the panel's escape hatch from an empty list.
+                    # Whitelisted rather than passed through, since it lands on a command line.
+                    if ($q['minfit'] -in 'good', 'marginal', 'poor') { $a += @('-MinFit', $q['minfit']) }
                     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
                     $out = try { & powershell @a 2>&1 | ForEach-Object { "$_" } } finally { $ErrorActionPreference = $old }
                     $line = $out | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -First 1
@@ -1620,6 +1570,7 @@ try {
                         $res.StatusCode = 500
                         $msg = ($out | Where-Object { $_.Trim() -and $_ -notmatch '^\s*(\+|At line|At C:)' } | Select-Object -First 1)
                         $body = @{ error = ("$msg" -replace '^powershell(\.exe)?\s*:\s*', '').Trim() } | ConvertTo-Json -Compress
+                    }
                     }
                 }
                 '^/api/inspect$' {

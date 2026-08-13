@@ -171,9 +171,9 @@ $menu.Add_Opening({
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void](Add-MenuItem 'Open logs folder'         { Start-Process explorer.exe $script:logDir })
 
-# Reloading just llama-swap is the common case: it only reads config.yaml at startup, so a model
-# added while the stack is up isn't routable until it bounces - and open-webui has no reason to.
-[void](Add-MenuItem 'Reload models (restart llama-swap)' { Start-Detached @('-Action', 'restart', '-Component', 'swap') })
+# There is no "Reload models" item any more: llama-swap is launched with -watch-config, so a model
+# added or edited while the stack is up is routable within ~2s on its own. The Restart submenu
+# below still has 'llama-swap only' for the case where something genuinely needs bouncing.
 
 $miRestart = New-Object System.Windows.Forms.ToolStripMenuItem 'Restart'
 [void]$menu.Items.Add($miRestart)

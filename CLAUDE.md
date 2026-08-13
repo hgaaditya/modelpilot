@@ -40,7 +40,7 @@ models:
 - `${PORT}` is assigned automatically by llama-swap per model instance — never hardcode a port in a model's `cmd`.
 - MoE models can use `--n-cpu-moe <N>` to offload N expert layers to CPU (see the `scout-moe` entry) when VRAM is tight.
 - Model `.gguf` files referenced in `config.yaml` must already exist under `llama.cpp\models\`.
-- **llama-swap only reads this file at startup.** After editing it, `-Action restart -Component swap` makes the change live without bouncing open-webui. Check it first with `-Action check-config` — most config mistakes don't fail at startup, they fail as a connection error the first time you pick that model.
+- **llama-swap re-reads this file on its own.** It is launched with `-watch-config`, which polls the file every 2s and reloads it in place — verified against v244, a model appended while it was running appeared in `/v1/models` within 5s. No restart is needed to add, remove or retune a model. What a reload does *not* do is re-spawn a `llama-server` that is already up: that process keeps the `-c`/`-ctk` it was started with until it unloads, so evict it (the panel does this for you, or `POST /api/models/unload`) if you changed the model you are currently using. Check an edit with `-Action check-config` — most config mistakes don't fail at load, they fail as a connection error the first time you pick that model.
 - Context costs VRAM. On a 12 GB card, weights plus KV cache plus compute buffers have to fit, so a Q6_K quant of a 9 GB model leaves almost nothing for `-c`; dropping to Q4_K_M buys back roughly 3 GB of context headroom. `-ctk`/`-ctv` at `q4_0` halve the KV cache versus `q8_0` at some cost to long-context recall.
 
 ## Running the stack
@@ -86,8 +86,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Model '<
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 ```
 
-- **stop** / **restart** — kills `llama-swap`, any spawned `llama-server`, and the open-webui backend. The backend is matched by `python.exe` whose `ExecutablePath` is under the repo root, so a machine's other interpreters are never touched. `-Component swap|webui` acts on one half only — `swap` also takes down the `llama-server` processes it spawned, since they're its children. `-Action restart -Component swap` is the cheap way to pick up a `config.yaml` edit: llama-swap reads its config only at startup, and open-webui has no reason to bounce (nor to lose its warm embedding model). A failed health check rolls back only what that call started.
-- **tray** — (re)starts just the notification-area indicator, `tray.ps1`. It comes up automatically after a successful launch; `-NoTray` suppresses that. A coloured dot polls `/health` on both services every 5s — green for both up, yellow for one, red for neither — with the currently loaded model in the tooltip (from llama-swap's `/running`). Double-click opens the chat UI; right-click gives open/logs, a top-level **Reload models (restart llama-swap)** for the common post-`add-model` case, **Restart** and **Stop** submenus offering whole-stack or either component alone, plus a **Models** submenu listing everything in `config.yaml` — the loaded one marked, any whose `.gguf` is missing greyed out with the absent path in the tooltip, and a click on any other sending a one-token completion to swap it in (fire-and-forget, since waiting on a multi-GB load would freeze the tray). The submenu is rebuilt when the menu opens rather than on the status timer, so models added by `add-model` while the tray is running show up without a restart. It raises a balloon when the stack drops on its own, which is the point: a backend that dies unattended is otherwise invisible until you next try to use it. Icons are drawn at runtime rather than shipped as `.ico` files, and a named mutex keeps it to one instance no matter how often `start.ps1` fires it off. Exiting the tray leaves the stack running; `uninstall` kills it.
+- **stop** / **restart** — kills `llama-swap`, any spawned `llama-server`, and the open-webui backend. The backend is matched by `python.exe` whose `ExecutablePath` is under the repo root, so a machine's other interpreters are never touched. `-Component swap|webui` acts on one half only — `swap` also takes down the `llama-server` processes it spawned, since they're its children. `-Component swap` exists for a genuinely wedged router, not for config edits — those are picked up by `-watch-config` without a restart. A failed health check rolls back only what that call started.
+- **tray** — (re)starts just the notification-area indicator, `tray.ps1`. It comes up automatically after a successful launch; `-NoTray` suppresses that. A coloured dot polls `/health` on both services every 5s — green for both up, yellow for one, red for neither — with the currently loaded model in the tooltip (from llama-swap's `/running`). Double-click opens the chat UI; right-click gives open/logs, **Restart** and **Stop** submenus offering whole-stack or either component alone, plus a **Models** submenu listing everything in `config.yaml` — the loaded one marked, any whose `.gguf` is missing greyed out with the absent path in the tooltip, and a click on any other sending a one-token completion to swap it in (fire-and-forget, since waiting on a multi-GB load would freeze the tray). The submenu is rebuilt when the menu opens rather than on the status timer, so models added by `add-model` while the tray is running show up without a restart. It raises a balloon when the stack drops on its own, which is the point: a backend that dies unattended is otherwise invisible until you next try to use it. Icons are drawn at runtime rather than shipped as `.ico` files, and a named mutex keeps it to one instance no matter how often `start.ps1` fires it off. Exiting the tray leaves the stack running; `uninstall` kills it.
 - **add-model** — fetch a model and register it, in one command. `-Model` takes whatever you have to hand: a Hugging Face repo id (`bartowski/Qwen_Qwen3-8B-GGUF`, optionally suffixed `:Q4_K_M`), a `huggingface.co` URL of either a repo or a single file (`/blob/` and `/resolve/` both work), or any other direct `.gguf` URL.
 
   ```powershell
@@ -99,7 +99,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
   Downloads run through `curl.exe -L -C -` (ships with Windows 10+; `Invoke-WebRequest` has neither resume nor progress, which makes it useless for a multi-GB file), staging to `<name>.part` and renaming only on success, so an interrupted pull resumes on re-run and a partial file is never mistaken for a complete model.
 
-  On success it appends an entry to `llamaswap\config.yaml` in the file's existing style, saving the previous version as `config.yaml.bak`. The id defaults to the file name lowercased (`-Id` overrides), context to 16384 (`-Context`). An id that already exists is left untouched rather than duplicated. `-NoConfig` downloads without touching the config. llama-swap reads its config at startup, so the new model needs `-Action restart` before it's routable.
+  On success it appends an entry to `llamaswap\config.yaml` in the file's existing style, saving the previous version as `config.yaml.bak`. The id defaults to the file name lowercased (`-Id` overrides), context to 16384 (`-Context`). An id that already exists is left untouched rather than duplicated. `-NoConfig` downloads without touching the config. llama-swap picks the new entry up within a couple of seconds via `-watch-config`, so it is routable without a restart.
 - **install-prism** — installs [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) into `llama.cpp-prism\`, **alongside** the stock build, never over it. Deliberately not part of `deploy`: it's ~620 MB of downloads that only matters if you run a low-bit model, and every other model in `config.yaml` depends on the stock binary. Prebuilt Windows CUDA binaries come straight off the fork's releases (`-Latest` takes the newest, otherwise `$VER.prism`), so no CMake/CUDA-toolkit/MSVC install is needed. The Windows CUDA asset is named off the kernel build (`llama-prism-b1-…`) rather than the release tag, so the asset is matched by shape, not by tag string. Point a model at it with the `llama-server-prism` macro in `config.yaml`.
 
   Why it exists: ternary/low-bit GGUFs such as `prism-ml/Ternary-Bonsai-27B-gguf` store weights in ggml tensor types **42** (`Q2_0`, `Q2_g64`) or **142** (`PQ2_0`), and stock llama.cpp b10155 stops at type 41 — those models fail at load on the normal binary regardless of configuration. The repo's `dspark-*` files are a separate thing again: a speculative-decoding drafter with its own architecture (`dspark`), which stock llama.cpp rejects as an unknown architecture.
@@ -163,6 +163,14 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
   route through it — because the server being down does **not** mean no window is open: restarting
   the server leaves the old window pointing at a dead port, and it reconnects by itself once the
   server is back. Extras found are collapsed to one rather than left for the user to close by hand.
+- **The page reloads itself when the server's code changes.** Closing the panel window is a
+  minimise, so one window can outlive many server restarts — and it kept running the markup and JS
+  it was first served, which is why an edit to `ui.ps1` only showed up after reopening it by hand.
+  Worse, and silently: `$script:csrfToken` is a fresh guid per server start, so an old window's
+  token is dead after a restart and *every* `/api/*` call it makes 403s. `/api/status` now carries
+  a `build` stamp (this file's mtime); the page remembers the first one it sees and calls
+  `location.reload()` when the server reports a different one. During the restart itself `tick()`
+  bails on the failed fetch, so the reload lands on the first tick after the server is back.
 - `/api/ping` is **deliberately exempt** from the CSRF gate that covers every other `/api/*` path.
   It's how a second launch discovers a panel is already up, and that check runs before any token
   exists to send. Gating it broke single-instance detection outright — every launch believed
@@ -208,35 +216,106 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
 - **Models → Edit** changes `-c` and `-ctk`/`-ctv` through `start.ps1 -Action set-tuning`, the same
   `Set-ModelTuning` that `autotune -Apply` writes with. Weight quantisation (Q4_K_M vs Q6_K) is
   deliberately *not* editable here: that's a different file and means a download, not a flag.
-- **Coding agents tab** — the handoff surface (see the next section). One project directory and one
-  model dropdown at the top, then the three modes, each a single line of behaviour and its buttons.
-  The model is a **choice, not an auto-pick**: the auto-pick sorts on `-c` and cannot know whether a
-  model can drive an agent loop at all (`bonsai-27b` has the largest context here and fails
-  outright), so the tab says as much and offers **Test it** per model.
-  - `/api/agents` is cheap enough to poll: CLIs on PATH, which models qualify, last project.
-  - **`/api/sessions` reads Claude Code's own history**, so handing a project over doesn't start by
-    asking you to remember a path. Claude Code stores every conversation as
-    `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, and `-r/--resume <id>` takes it straight
-    back — so **Hand over** reopens that exact conversation on a local model.
-    - The **directory name is not usable as the path**: it replaces both `:` and `\` with `-`, so
-      `C:\Users\me\pc-debugging` and `C:\Users\me\pc\debugging` encode identically. The records
-      inside carry the real `cwd`, and that's what's read.
-    - **One row per project, not per session.** A directory accumulates dozens of sessions and
-      eight identical one-shot runs would crowd out eight real projects. Files are walked newest
-      first, so the first hit for a `cwd` is that project's latest — the same one `--continue`
-      would pick. For an older session, run `claude --resume` inside the project.
-    - A session id alone resumes nothing: Claude Code scopes sessions to a directory, so the
-      handoff sets **both** `-Directory` and `-SessionId`.
-    - Cached 30s server-side. Each row is a bounded head-read, but there are already 68 session
-      files on this machine and the tab re-renders every 3s.
-  - `/api/launch-claude` is the one thing that is **not** a job. Claude Code is a terminal UI, so it
-    opens a console and hands over; a job is hidden with its output redirected, which is exactly
-    wrong for something you are about to type into. opencode and `local-llm.ps1` do run to
-    completion, so those stay jobs and read out in Activity.
-  - Arguments are passed as an array, never a concatenated string, so a project path containing a
-    space or a quote cannot become extra arguments.
-  - The dropdown is rebuilt only when the set of options actually changes, or the 3s poll would
-    reset a selection mid-use.
+  It used to end by asking for a llama-swap restart; with `-watch-config` it doesn't, and the only
+  thing left to handle is the model that is loaded *right now* — a config reload doesn't re-spawn a
+  live `llama-server` — so that one is unloaded and the dialog says so.
+- **The service tick boxes are a selection, not a power switch.** They decide what Start, Stop and
+  the header health dot act on. Unticking a service therefore leaves it serving on its port *and*
+  drops it out of the summary, which is the one state nobody expects — an install was found with
+  `useWebui: false` and open-webui answering on :8080 regardless. So a running-but-unticked service
+  now reads `running (not selected)` rather than plain `running`, and unticking one that is up
+  offers to stop it instead of the checkbox silently doing half of what it looks like it does.
+- **Anything slow says what it is doing, in a card that appears on the click.** Every long action
+  in this panel starts a detached job and returns immediately, so the answer to "did that work"
+  used to be a disabled button and, minutes later, a log tail under Activity. A fixed card now
+  names the action in the user's terms, says how long it usually takes, shows the job's latest
+  output line, and carries a progress bar — a real one for downloads, which know their size, and a
+  moving one for everything else, which says *alive* without claiming to know how far along it is.
+
+  It renders from `busy()`, the same state the buttons already use, so it appears on the click that
+  starts something rather than on the poll that eventually notices — and adding an action means
+  adding one line to `JOBS_SAY`, not a second bookkeeping system. Dismissing it is per-action: the
+  next `spin()` clears the dismissal, because silencing one job should not silence the next.
+
+- **`-Action check-ui` parses the panel's JavaScript.** The whole page is one PowerShell
+  here-string, so a JS typo is invisible to PowerShell's parser — `ui.ps1` starts, serves, the page
+  renders, and every button is dead. Two such typos shipped in a single editing session: a quote
+  that closed an `onclick` attribute early, and a real newline where `'
+'` was meant. Node is
+  already vendored for the frontend build, so the check is free. Run it after touching the page.
+
+- **Downloads report progress, not a log tail.** `Get-BigFile` stages every weight to
+  `<name>.part` and now writes `<name>.part.json` beside it carrying the expected size (the HF file
+  tree already knows it; a bare `.gguf` URL doesn't, and that case renders as bytes-so-far rather
+  than an invented percentage). `Get-Downloads` reads the pair, so progress is bytes-on-disk over
+  total. The alternative — parsing curl's `--progress-bar` output — is carriage-return redraws on
+  stderr, which is exactly why a 5 GB download used to render in Activity as `running` plus noise
+  for ten minutes with no percent, no speed and no way to tell a slow download from a dead one.
+  Speed and ETA are derived in the page from consecutive polls, like the Monitoring tab's min/max,
+  so the server keeps no per-session history. A `.part` untouched for 90s is called out as probably
+  dead, since re-running resumes it.
+
+  The sidecar deliberately survives a failed download: a resumed run still knows what it is aiming
+  at. It is deleted on success, along with the rename.
+
+- **The Models table speaks English by default.** `-c`, `-ctk`/`-ctv` and `--n-cpu-moe` are now
+  behind *Show the raw llama.cpp settings* (remembered in `localStorage`); what's left is Model,
+  Size, **Conversation length** and State. Context is rendered as a band plus a word count
+  (`very long ~98k words`) because a token budget means nothing to someone picking their first
+  model, and words are the unit they think in. `Tune` is the button that sets it properly.
+
+- **First run ends at a model, not at instructions.** Step 2 of the dashboard walkthrough used to
+  read "open Models, paste a Hugging Face GGUF repo, press Inspect, download a variant it says fits
+  your card" — five manual steps ending in the judgement call a first-time user is least equipped
+  to make. It is now one button that switches to Models and runs the picker against this machine's
+  own VRAM.
+
+  Two fixes were needed under it. `--capability tool_use` was llmfit's default here because this
+  stack used to sell a coding-agent handoff, which it no longer does, so it became a tick box that
+  is off by default. And "install llmfit first" was an error string telling you to go and run a CLI
+  action, which is the friction the panel exists to remove; `/api/suggest` returns
+  `{"needInstall":true}` and the page offers the button that does it.
+
+  **The filters are not monotonic, and an empty result is usually one of them rather than the
+  hardware.** Measured across the full grid on this box:
+
+  | use case | tool filter off | on |
+  | --- | --- | --- |
+  | (any) | 4 | 4 |
+  | coding | 2 | 2 |
+  | reasoning | 2 | 1 |
+  | general | **0** | 1 |
+  | chat | 2 | 3 |
+
+  `general` with the tool filter *off* is the empty one — turning a filter **on** produces results
+  where off produced none, because each filter changes llmfit's ranking rather than just narrowing
+  its output. So "Nothing fits this machine with those filters" was both a dead end and misleading:
+  it named the hardware for what is a filter artifact. The empty state now says so and carries the
+  buttons that undo each filter, plus `-MinFit marginal` behind *Include tighter fits*. `-MinFit`
+  is whitelisted server-side to `good|marginal|poor`, since it lands on a command line.
+
+  `-Capability any` is how the filter is dropped, not `-Capability ''`: an empty string through
+  `powershell -File` is a parameter with no value, and it took the whole call down as a 500.
+
+- **Coding agents tab — the Claude Code handoff was removed from it.** Measured on this box, and
+  the measurement is the whole reason: a *fresh* session (no resume, no images, plugins off, MCP
+  off, `project docs: ~109 tokens`), gemma4-v2 at `-c 131072`, asked to make `load_items` skip
+  blank lines in a 12-line file. It ran **219 tool calls over 29 minutes** — 101 `Bash`, 59 `Grep`,
+  23 `Read`, 12 `Edit` — emitted **zero assistant text blocks**, left the file byte-identical, and
+  died when the model unloaded. Every previous failure here had a harness cause (resume, images,
+  plugins, `Start-Process` quoting, the attribution header); this one had none left. It does not
+  converge, so the tab no longer offers a session it cannot finish.
+
+  Second finding, worth more than the first: **`-Check` passes this same model in 33 seconds.** One
+  tool call and one answer does not predict an agent loop, so the probe — and the
+  `.agent-compat.json` verdict built on it — was measuring something that doesn't generalise. That
+  is the third time a confident verdict about a model came from the harness rather than the model,
+  and the first time it pointed the optimistic way.
+
+  Gone with it: the model dropdown, `Test it`, the session list, `/api/sessions`,
+  `/api/launch-claude`, `/api/agent-check` and `Get-ClaudeSessions`. What stays is **Delegate the
+  reading** (`local-llm.ps1`), which is one request and one answer with no loop, and opencode.
+  `claude-local.ps1` is still installed for `-Prompt` questions from a terminal.
 
 ## Using the local models from Claude Code
 
@@ -252,10 +331,27 @@ The use case that shapes it: you are mid-project, your quota is gone, and you wa
 .\claude-local.ps1 -Prompt "what does build.ps1 do?"        # one-shot, prints and exits
 ```
 
-- **Context is a gate, but a softer one than this file used to claim.** Claude Code's own overhead measured **~1.1k tokens per request**, not the 15–25k asserted here before (see the measurement below). `$MIN_AGENT_CTX` is 32768 as a "you won't spend the session compacting" line — a coding session fills a window fast with file contents and tool output — not as a measured requirement; 32768 passes the probe directly. With no `-Model` the script picks the **largest context among runnable models**, deliberately not the biggest model.
+- **Context is a gate, but a softer one than this file used to claim.** Claude Code's own overhead measured **~1.1k tokens per request**, not the 15–25k asserted here before (see the measurement below). `$MIN_AGENT_CTX` is 32768 as a "you won't spend the session compacting" line — a coding session fills a window fast with file contents and tool output — not as a measured requirement; 32768 passes the probe directly. With no `-Model` the script picks the **largest context among runnable models**, deliberately not the biggest model — but ranked by compatibility first: a model `.agent-compat.json` records as failing is never picked, and a verified one beats an untested one at equal standing. Context alone was the whole ranking, and since llama-swap lists models alphabetically, that handed every session to whichever id sorted first among those tied at the top.
+- **The launch says what it is waiting on.** After the cheap checks it sends one `/v1/messages` request, and *that* request is what makes llama-swap spawn `llama-server` and read the weights — so on a cold start it is where all the time goes. It printed nothing, so the console the handoff had just opened sat blank for tens of seconds and read as hung. Its timeout is 300s, matching `healthCheckTimeout` in `config.yaml`, not the 60s it was: a 27B loading from a cold page cache overran that and the launch aborted reporting a broken endpoint for a model that was simply still loading.
+- **Inherited Claude Code session markers are cleared, or the handoff leaves no trace.** Claude Code stamps every process it spawns with `CLAUDE_CODE_CHILD_SESSION`, and a session carrying that marker **does not write a transcript** — it warns `Transcript saving is off - inherited CLAUDE_CODE_CHILD_SESSION marker`. The marker is inherited by anything launched from a Claude Code session, so it reaches this script, the control panel, and the terminal the panel opens. That is not an edge case: launching the handoff *from the session whose quota just ran out* is the exact scenario this exists for. And the panel's **Hand over** list is read from those `.jsonl` transcripts, so a local session started that way silently never appears in it — the next handoff cannot resume the work the last one did. `Set-LocalEnv` clears it, along with `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_HOST_SESSION_ID`, since a new independent session must not claim the id of the one that launched it. Cleared for this process only, like everything else there.
+- **A resumed conversation containing an image cannot run on these models, and the error names nothing.** Claude Code replays the whole history on resume. These GGUFs are text-only, so llama-server answers `500 image input is not supported` and the client **retries it ten times**, because a 500 reads as transient. The session never recovers either — the images are in the history, so every turn resends them. Found the first time **Hand over** was pointed at a real conversation: this repo's own latest session, which had 11 pasted screenshots in it. Any cloud session you pasted a screenshot into has the same problem, which makes it common rather than exotic. `-SessionId` now scans that transcript for image blocks (a line scan, not a parse — these files are megabytes of tool output and the only question is whether the marker appears; 173 ms on a 12 MB transcript) and warns before handing over, pointing at **Start a session** in the same directory instead: same files, only the chat history is lost. The session id alone locates the file, so the unreversible `:`/`\`-to-`-` directory encoding never has to be reconstructed.
 - **Runnable means weights on disk and an engine to run them**, not just "listed by `/v1/models`" — llama-swap lists every configured id whether or not it can start. Caught in testing: the first pick was a model with no `.gguf`, which fails as a 500 a minute later.
 - **`-Check` runs Claude Code itself and makes it use a tool**, after the cheap checks pass. The tool part is not optional: an earlier probe asked only *"reply with the word ok"*, which needs no tool, so it never reached the code that builds the tool-call grammar — and it stamped a model **verified** that then died instantly on real work. A false "verified" is worse than no check. The probe now writes a scratch file with a deliberately unguessable function name and requires Claude Code to read it and return that name, under a timeout, so all three failure modes are caught: template rejection, grammar failure, and never converging. It is also the only probe that tells the truth about *which* model works — `bonsai-27b` answers *every* synthetic payload (plain, system as string, system as two blocks, `cache_control`, tools, content as blocks, a prior assistant turn, echoed `thinking`, a full `tool_use`/`tool_result` round trip — all 200, and the round trip answers correctly) and then fails Claude Code with `400 ... Jinja Exception: System message must be at the beginning`. Whatever llama-swap produces from Claude Code's real request isn't reachable from the obvious shapes, so guessing was abandoned in favour of running the real thing. Costs a model load and ~30–75s; catches both known failures.
 - **The verdict is remembered** in `.agent-compat.json` (gitignored — it depends on the local build and installed models). The panel drops a model that has failed from its dropdown entirely rather than offering it with a caveat, keeps untested ones marked so a fresh install still offers something, and prefers a verified one when selecting a default.
+- **A real session costs far more than the probe, and `-Bare` is the lever.** Every overhead figure this file publishes for Claude Code (~1.1k tokens per request) came from `-Check`, which runs `--bare` — so all of them exclude precisely what a real session loads. Measured against this repo through `/v1/messages/count_tokens`: the `CLAUDE.md` chain alone is **13,742 tokens — 34% of `qwen3-30b-moe`'s 40960 window**, and there are 136 `SKILL.md` files on this machine whose descriptions come to another ~7,000. A handoff into this repo therefore opened with roughly 40–55% of the window already spent and reported `Context limit reached` before its first message — which reads as the model, or the handoff, being broken. It is neither.
+
+  So the launch now **counts it and says so**, warning above 25%, and `-Bare` passes `--bare` to leave the whole lot out (`CLAUDE.md`, hooks, plugins, skills) for when the window is tight. Two things worth knowing about that measurement: `@imports` inside a `CLAUDE.md` are not followed, so the number is a floor; and the body goes over the wire as explicit UTF-8 bytes, because PowerShell 5.1 encodes a string body as Latin-1 and a `CLAUDE.md` full of em dashes then arrives as ill-formed UTF-8 — llama-swap answers **500 with an error object rather than an HTTP failure**, so it doesn't even throw, it just yields a null count. `local-llm.ps1` already carried the fix; this is the second place to need it.
+- **Third-party plugins are off by default (`-NoPlugins`), and this is a correctness fix before it is a context one.** A local session was asked about this repo and answered with a July crash-triage walkthrough — MemTest86, PSU rails, `Win32_PnpController` — none of which had been mentioned. It was not confusion: the `claude-mem` plugin's `SessionStart` hook injects an index of **every past conversation on this machine**, 18,407 tokens by its own banner, and a 27B model cannot reliably tell background context from the task in front of it. `caveman` and `ponytail` add their whole style documents on top. Seven plugins are enabled here machine-wide.
+
+  The lever is `--setting-sources project,local`, which drops the **user** settings file — that is where `enabledPlugins` lives. Deliberately *not* `--bare` or `--safe-mode`: both also throw out the project's `CLAUDE.md`, which is the thing a handoff most needs. Verified by capturing the real `/v1/messages` with a local recording listener and counting it through llama-swap's own `count_tokens`, in this repo, with the other defaults (`--strict-mcp-config` and the `-Tools` list) already applied:
+
+  | | tokens before you type | of `gemma4-v2`'s 131072 |
+  | --- | --- | --- |
+  | plugins on | 44,284 | 34% |
+  | **plugins off** | **29,231** | **22%** |
+
+  The captured request confirms what goes: the project `CLAUDE.md` is still in it, `caveman`/`ponytail`/`RTK.md` are not. The global `~/.claude/CLAUDE.md` goes too, since it rides on the same settings source — that file is this machine's preferences for cloud sessions, not anything about the repo. Built-in tools and skills are untouched. `-NoPlugins:$false` restores everything.
+
 - **`-Resume` and `-Prompt` are switches, not passthrough**, and that's not stylistic. `powershell -File script.ps1 -- --continue` fails before the script runs — `--` parses as an empty parameter name — and PowerShell prefix-matches, so claude's own `-p` binds to this script's `-Port` and dies with a type error about `Int32`. Both were live bugs in the documented invocation. `-ClaudeArgs` still exists for anything else but is only reliable from a PowerShell session.
 - `-SmallModel` (default `qwen2.5-0.5b-instruct-q4_k_m`) backs `ANTHROPIC_SMALL_FAST_MODEL`, which Claude Code uses for background work like conversation titles. Pointing it at the main model makes every trivial call trigger a multi-GB swap. If it isn't configured the script warns and falls back to the main model rather than refusing to start — it's a convenience, not a requirement.
 - **`CLAUDE_CODE_ATTRIBUTION_HEADER=0`, passed via `--settings`. This is the single biggest thing on this page.** Claude Code injects an `x-anthropic-billing-header` string as a text block at the *front* of the system prompt, and its `cch=` segment changes on every request. llama.cpp's prompt cache matches on a prefix, so a prefix that differs every turn means the cache never hits and the whole 20k+ token system prompt is reprocessed from scratch **every turn**. Measured here, same model and same task, before and after: turns of `3m58s, 3m54s, 37s, 31s, 31s, 13s, 9s` became `2.1s, 1.8s, 1.6s, 1.7s, 1.4s, 2.5s`. Every earlier conclusion in this repo about local models being "too slow for agentic work" was really this.
@@ -273,10 +369,28 @@ On this box, with every fix above in place:
 | --- | --- |
 | `qwen3-30b-moe` at `-c 40960` | **works** — real tool call, right answer, 74s. `--n-cpu-moe 14`, 40.3 tok/s, 10648 MiB. |
 | `qwen3-30b-moe` at `-c 32768` | **works** — 110s, `--n-cpu-moe 13`, 29.1 tok/s. |
+| `gemma4-v2` at `-c 131072` | **works** — 9476 MiB, 2535 MiB free, loads in 6s. The window that makes a real session viable. |
 | `gemma4-v2` at `-c 65536` | **works** — 33s. |
 | `bonsai-27b` at `-c 65536` | **works.** |
 
 **Every model on this box works.** Worth stating loudly, because each of the three was at some point confidently declared incapable during development — one for "not converging", one for a "wrong answer", one for a chat-template rejection that looked completely unambiguous. All three verdicts were harness bugs. `bonsai-27b`'s `Jinja Exception: System message must be at the beginning` was the most convincing of them, and it disappeared once the probe stopped dragging the user's own `CLAUDE.md` and `SessionStart` hook output into the request.
+
+### Context is the constraint, and gemma4 is why it's solvable
+
+The handoff kept dying with `Context limit reached` before its first message, and the instinct — *get a model with a bigger window* — is right but points at the wrong model. `llmfit -Action suggest` offers 7B coders at a **trained** 32768; that is worse than what is already installed. The window was here all along:
+
+| `-c` | VRAM used | free | `CLAUDE.md` as % of window |
+| --- | --- | --- | --- |
+| 40960 (`qwen3-30b-moe`) | 10648 MiB | — | **33.5%** |
+| 65536 (`gemma4-v2`, the old default) | — | — | 21.0% |
+| **131072 (`gemma4-v2`, now)** | **9476 MiB** | **2535 MiB** | **10.5%** |
+| 196608 (`gemma4-v2`) | 10213 MiB | 1798 MiB | 7.0% |
+
+`gemma4-v2` was pinned at 65536 as a speed/headroom choice, never a limit. Measured here, **65536 more tokens of context cost only 737 MiB** — 5 of every 6 gemma4 layers use a 1024-token sliding window, so only 8 of its 48 layers grow KV at all. 196608 loads and runs, but the config's own budget note records the Windows desktop using 970–1463 MiB, and 1798 MiB of headroom does not survive that with a browser open. **131072 is the number**: it triples the room for actual work versus 40960, with a margin that holds.
+
+The lesson generalises past this box: on a 12 GB card the useful lever was **attention architecture, not parameter count or a download**. Sliding-window models buy context at a fraction of what full-attention models charge — `qwen3-14b` costs ~7x more per token than gemma4 for exactly this reason, and it is why the answer to "I need a bigger window" was a one-line config edit rather than a new model.
+
+One caveat found while measuring: gemma4 logs `KV cache shifting is not supported for this context, disabling KV cache shifting`, so `--context-shift` — this stack's safety net against a hard error past `-c` — **does not apply to it**. That makes `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (set from the model's own `-c`) load-bearing rather than merely helpful: the client pruning first is the only thing standing between a long session and a hard failure.
 
 ### How much context Claude Code actually costs — measured
 

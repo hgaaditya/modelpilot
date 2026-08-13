@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -84,7 +84,9 @@ param(
     # uninstall: also delete the multi-GB .gguf weights (kept by default - they're slow to re-fetch).
     [switch]$IncludeModels,
 
-    # suggest: narrow llmfit's recommendations. Capability defaults to tool_use because a model
+    # suggest: narrow llmfit's recommendations. 'any' drops the filter - an empty string cannot,
+    # because `-Capability ''` through `powershell -File` is a parameter with no value and fails
+    # before the script runs. Capability defaults to tool_use because a model
     # that cannot call tools is useless for the coding-agent path, which is the reason most people
     # are picking a model here at all - and it is the property they otherwise find out last.
     [ValidateSet('general', 'coding', 'reasoning', 'chat', 'multimodal', 'embedding')]
@@ -168,19 +170,28 @@ function Initialize-SwapConfig {
 # Weights are multi-GB: Invoke-WebRequest has no resume and no progress, curl.exe (ships with
 # Windows 10+) has both. Downloads to <out>.part and only renames on success, so an interrupted
 # pull resumes on re-run and a partial file is never mistaken for a complete model.
-function Get-BigFile($url, $out) {
+# $total is the expected size when the caller knows it (the HF file tree carries it). It is
+# written to <out>.part.json so a reader - the control panel - can turn bytes-on-disk into a
+# percentage. The alternative was parsing curl's progress meter, which is carriage-return redraws
+# on stderr: it tails into a log as noise, which is exactly how a 5 GB download came to look like
+# a stalled job for ten minutes. The sidecar survives a failure on purpose, so a resumed download
+# still knows what it is aiming at.
+function Get-BigFile($url, $out, [long]$total = 0) {
     $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
     if (-not (Test-Path $curl)) {
         $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
         if (-not $curl) { throw "curl.exe not found - it ships with Windows 10+; install it or download $url manually into $modelsDir." }
     }
     $part = "$out.part"
+    @{ total = $total; url = $url; started = (Get-Date).ToString('o') } |
+        ConvertTo-Json -Compress | Set-Content -Path "$part.json" -Encoding utf8
     & $curl -L -C - --fail --progress-bar -o $part $url
     if ($LASTEXITCODE -ne 0) {
         $resume = if (Test-Path $part) { " Partial file kept at $part - re-run to resume." } else { "" }
         throw "Download failed (curl exit $LASTEXITCODE).$resume"
     }
     Move-Item $part $out -Force
+    Remove-Item "$part.json" -Force -ErrorAction SilentlyContinue
 }
 
 function Read-Stamp {
@@ -634,8 +645,15 @@ function Start-Stack($webui, $component = 'all') {
 
     if ($component -ne 'webui') {
         Write-Host "Starting llama-swap on :$swapPort ..."
+        # -watch-config: llama-swap polls config.yaml every 2s and reloads it in place. Without it
+        # every edit - add-model, set-tuning, the panel's Models > Edit - needed a restart, which
+        # meant the panel asking for one and the tray carrying a "Reload models" item for the
+        # common case. Verified against v244: appending a model made it appear in /v1/models
+        # within 5s, logging "reloading configuration" / "configuration reloaded".
+        # A model already running keeps the flags it was spawned with until it unloads - a reload
+        # rewrites the routing table, it does not restart a live llama-server.
         $swapProc = Start-Process -FilePath (Join-Path $llamaSwapDir 'llama-swap.exe') `
-            -ArgumentList '--config', $swapConfig, '--listen', ":$swapPort" `
+            -ArgumentList '--config', $swapConfig, '--listen', ":$swapPort", '-watch-config' `
             -WorkingDirectory $llamaSwapDir -NoNewWindow -PassThru `
             -RedirectStandardOutput $swapLogs[1] -RedirectStandardError $swapLogs[0]
     }
@@ -1077,6 +1095,29 @@ if ($Action -eq 'install-llmfit') {
     return
 }
 
+# The panel is one PowerShell here-string containing the whole page, so a typo in its JavaScript
+# is invisible to PowerShell's parser: ui.ps1 starts, serves, and the page renders with every
+# button dead. Two such typos shipped in one editing session - a quote closed early inside an
+# onclick attribute, and a real newline where an escaped one was meant - and both looked exactly
+# like "the feature didn't work". Node is already vendored for the frontend build, so the check
+# costs nothing to run.
+if ($Action -eq 'check-ui') {
+    $node = Get-ChildItem (Join-Path $root 'open-webui-*\.node-runtime') -Recurse -Filter 'node.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+    if (-not $node) { throw "Node isn't vendored yet - run a deploy first (it lands in open-webui-*\.node-runtime\)." }
+    $html = Get-Content (Join-Path $root 'ui.ps1') -Raw
+    $js = [regex]::Matches($html, '(?s)<script>(.*?)</script>') | ForEach-Object { $_.Groups[1].Value }
+    if (-not $js) { throw "No <script> block found in ui.ps1 - has the page been restructured?" }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) "localllm-ui-$PID.js"
+    ($js -join "`n").Replace('@@TOKEN@@', 'x') | Set-Content $tmp -Encoding utf8
+    & $node --check $tmp
+    $rc = $LASTEXITCODE
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    if ($rc -ne 0) { throw "ui.ps1's JavaScript does not parse - see above. The panel would load with every button dead." }
+    Write-Host "ui.ps1 JavaScript parses."
+    return
+}
+
 if ($Action -eq 'suggest') {
     # Complements '-Action inspect' rather than replacing it. inspect answers "which quant of THIS
     # repo fits"; suggest answers "which model at all", which is the question a new install
@@ -1089,7 +1130,7 @@ if ($Action -eq 'suggest') {
     # background web server, which this is not asking for.
     $a = @('recommend', '--runtime', 'llamacpp', '--min-fit', $MinFit, '-n', "$Top", '--no-dashboard')
     if ($UseCase)    { $a += @('--use-case', $UseCase) }
-    if ($Capability) { $a += @('--capability', $Capability) }
+    if ($Capability -and $Capability -ne 'any') { $a += @('--capability', $Capability) }
 
     Write-Host "Asking llmfit what fits this machine..."
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -1171,7 +1212,7 @@ if ($Action -eq 'install-prism') {
 
     foreach ($a in @($main, $cudart) | Where-Object { $_ }) {
         $zip = Join-Path $dl $a.name
-        if (-not (Test-Path $zip)) { Get-BigFile $a.browser_download_url $zip } else { Write-Host "$($a.name) already downloaded." }
+        if (-not (Test-Path $zip)) { Get-BigFile $a.browser_download_url $zip $a.size } else { Write-Host "$($a.name) already downloaded." }
         Write-Host "Extracting $($a.name) ..."
         Expand-Archive -Path $zip -DestinationPath $llamaPrism -Force
     }
@@ -1191,7 +1232,7 @@ if ($Action -eq 'install-prism') {
     Write-Host "      -m `"$modelsDir\<file>.gguf`""
     Write-Host '      -c 16384 -ctk q4_0 -ctv q4_0'
     Write-Host '    ttl: 600'
-    Write-Host "`nThen '.\start.ps1 -Action restart -Component swap'."
+    Write-Host "`nllama-swap watches config.yaml, so it becomes routable a couple of seconds after you save it."
     return
 }
 
@@ -1255,7 +1296,7 @@ if ($Action -eq 'autotune') {
     if ($Apply) {
         if (Set-ModelTuning $id $best.Ctx $best.Kv $best.NCpuMoe) {
             Write-Host "written to $swapConfig (previous kept as config.yaml.bak)."
-            Write-Host "Run '.\start.ps1 -Action restart -Component swap' to pick it up."
+            Write-Host "llama-swap re-reads the file within a couple of seconds. A model that is loaded right now keeps the settings it was spawned with until it unloads."
         } else {
             # No entry to rewrite - autotune doesn't invent one, since it can't know which macro
             # the model needs (a low-bit model has to use llama-server-prism).
@@ -1370,14 +1411,14 @@ if ($Action -eq 'add-model') {
         Write-Host "Selected $($v.Name)  [$($v.Quant), $(Format-Size $v.Bytes), $($v.Parts.Count) file(s)]"
         foreach ($p in $v.Parts) {
             # Split parts live in a subfolder upstream but must sit side by side locally.
-            $downloads += @{ Url = "https://huggingface.co/$($spec.Repo)/resolve/main/$($p.path)"; File = (Split-Path $p.path -Leaf) }
+            $downloads += @{ Url = "https://huggingface.co/$($spec.Repo)/resolve/main/$($p.path)"; File = (Split-Path $p.path -Leaf); Size = [long]$p.size }
         }
         if (-not $Id) { $Id = $v.Name.ToLower() }
     }
     else {
         $file = if ($Name) { $Name } else { Split-Path ($spec.Url -split '\?')[0] -Leaf }
         if ($file -notlike '*.gguf') { throw "'$file' is not a .gguf - pass -Name <file>.gguf if the URL doesn't end in one." }
-        $downloads += @{ Url = $spec.Url; File = $file }
+        $downloads += @{ Url = $spec.Url; File = $file; Size = 0 }   # a bare URL tells us nothing until it arrives
         if (-not $Id) { $Id = [IO.Path]::GetFileNameWithoutExtension($file).ToLower() }
     }
 
@@ -1387,7 +1428,7 @@ if ($Action -eq 'add-model') {
         $dest = Join-Path $modelsDir $d.File
         if (Test-Path $dest) { Write-Host "[$i/$($downloads.Count)] $($d.File) already present - skipping."; continue }
         Write-Host "[$i/$($downloads.Count)] Fetching $($d.File) (resumable - safe to interrupt and re-run)..."
-        Get-BigFile $d.Url $dest
+        Get-BigFile $d.Url $dest $d.Size
     }
 
     # llama.cpp loads a split model from its first part and finds the rest itself.
@@ -1399,8 +1440,8 @@ if ($Action -eq 'add-model') {
     }
     elseif (Add-ModelToConfig $Id $primary $Context) {
         Write-Host "Registered in $swapConfig as `"$Id`" (context $Context, previous config saved as config.yaml.bak)."
-        # llama-swap only reads config.yaml at startup, but open-webui has no reason to bounce.
-        Write-Host "Run '.\start.ps1 -Action restart -Component swap' to make it routable."
+        # No restart: llama-swap runs with -watch-config and polls the file every 2s.
+        Write-Host "llama-swap picks it up within a couple of seconds - it is routable without a restart."
     }
     return
 }
@@ -1431,7 +1472,7 @@ switch ($Action) {
         if (Set-ModelTuning $Id $Context $Kv $moe) {
             Write-Host "$Id -> -c $Context -ctk $Kv -ctv $Kv$(if ($null -ne $moe) { " --n-cpu-moe $moe" })"
             Write-Host "written to $swapConfig (previous kept as config.yaml.bak)."
-            Write-Host "Run '.\start.ps1 -Action restart -Component swap' to pick it up."
+            Write-Host "llama-swap re-reads the file within a couple of seconds. A model that is loaded right now keeps the settings it was spawned with until it unloads."
         } else {
             throw "No entry called '$Id' in config.yaml."
         }
