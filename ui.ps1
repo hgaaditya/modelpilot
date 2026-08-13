@@ -527,10 +527,44 @@ function Start-Job2($name, $argList, $script) {
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) + $argList
     $p = Start-Process powershell -WindowStyle Hidden -ArgumentList $a -PassThru `
              -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    # Below-normal priority so the panel keeps its own thread. Moving the work out of the request
+    # stopped it blocking structurally, but a CPU-bound job (llmfit scoring, a model load) still
+    # starved the listener enough to push /api/ping from under a millisecond to several seconds -
+    # which the user sees as the whole window going unresponsive while something runs.
+    try { $p.PriorityClass = 'BelowNormal' } catch { }
     # The pid is what makes "is this still running" answerable. Without it the page can only see
     # that a log file exists, which is true forever, so a button could never stop spinning.
     Set-Content -Path (Join-Path $jobDir "$id.pid") -Value $p.Id -Encoding ascii
     $id
+}
+
+# This listener handles one request at a time, so anything that shells out for tens of seconds
+# blocks everything else while it runs - the page's 3s poll, the header health dot, /api/ping, and
+# the activity card that is supposed to be describing the very action in progress. The UI freezes
+# at exactly the moment it is meant to be reassuring. `-Action inspect` reads a model's metadata
+# over the network (~40s) and `-Action suggest` scores the catalogue (~30-60s), so both run as
+# jobs and the page polls for the answer.
+#
+# Keyed by the question asked, so a stale answer to a different question is never handed back.
+$script:asyncJobs = @{}
+function Start-Async($name, $key, $argList) {
+    $id = Start-Job2 $name $argList
+    $script:asyncJobs[$name] = @{ key = $key; id = $id }
+}
+# $null = nothing has been asked, or what is on file answers a different question.
+function Get-Async($name, $key) {
+    $j = $script:asyncJobs[$name]
+    if (-not $j -or $j.key -ne $key) { return $null }
+    $log = Join-Path $jobDir "$($j.id).log"
+    $pidFile = Join-Path $jobDir "$($j.id).pid"
+    if (Test-Path $pidFile) {
+        $jobPid = (Get-Content $pidFile -Raw).Trim()
+        if (Get-Process -Id $jobPid -ErrorAction SilentlyContinue) { return @{ running = $true } }
+    }
+    $err = if (Test-Path "$log.err") { (Get-Content "$log.err" -Raw) } else { '' }
+    @{ running = $false
+       out = $(if (Test-Path $log) { Get-Content $log } else { @() })
+       err = "$err" }
 }
 
 # Installed / pinned / newest-upstream, straight from `start.ps1 -Action status`. The -Latest
@@ -1077,6 +1111,18 @@ async function del(id,gb){
 function fmt(mb){return (mb/1024).toFixed(1)+' GB'}
 // minfit is only ever set by the "include tighter fits" button on an empty result - the default
 // is llmfit's 'good', and quietly starting from 'marginal' would recommend models that thrash.
+// The server answers {running:true} until the job it started has finished. Polling here rather
+// than holding the request open is the whole point: the listener stays free, so the page keeps
+// updating and the activity card can animate while the work runs.
+async function waitFor(url,ms){
+ const until=Date.now()+(ms||180000);
+ for(;;){
+  const d=await (await fetch(url)).json();
+  if(!d.running)return d;
+  if(Date.now()>until)return {error:'Gave up waiting. It may still be running - see Activity.'};
+  await new Promise(r=>setTimeout(r,1500));
+ }
+}
 function relaxUse(){document.getElementById('sgcase').value='';suggest()}
 function relaxTools(on){document.getElementById('sgtools').checked=on;suggest()}
 async function suggest(minfit){
@@ -1084,8 +1130,10 @@ async function suggest(minfit){
  const use=document.getElementById('sgcase').value, tools=document.getElementById('sgtools').checked;
  document.getElementById('sgmsg').textContent='scoring models against this hardware...';
  try{
-  const d=await (await fetch('/api/suggest?usecase='+encodeURIComponent(use)
-    +'&tools='+(tools?'1':'0')+(minfit?'&minfit='+minfit:''))).json();
+  const qs='/api/suggest?usecase='+encodeURIComponent(use)+'&tools='+(tools?'1':'0')+(minfit?'&minfit='+minfit:'');
+  spin('suggest',180000);
+  const started=await (await fetch(qs+'&run=1')).json();
+  const d=started.needInstall?started:await waitFor(qs,180000);
   // The picker is a separate 5 MB binary. Telling someone to go and run a CLI action is exactly
   // the friction this panel exists to remove, so the error turns into the button that fixes it.
   if(d.needInstall){document.getElementById('sug').innerHTML=
@@ -1110,7 +1158,7 @@ async function suggest(minfit){
     +'</div><div class="note" style="margin-top:6px">These filters do not simply narrow the list - each one changes how models are ranked, so turning one <i>on</i> can produce results where <i>off</i> produced none.</div></div>';
   document.getElementById('sgmsg').textContent='';
  }catch(e){document.getElementById('sug').innerHTML='<div class="hint miss">'+e+'</div>'}
- finally{b.classList.remove('busy');b.disabled=false;document.getElementById('sgmsg').textContent=''}
+ finally{b.classList.remove('busy');b.disabled=false;document.getElementById('sgmsg').textContent='';delete PEND['suggest'];activity([])}
 }
 // Straight from the dashboard into the picker, with the tab switched for them. The nav button
 // is found by its label rather than threaded through, because tab() wants the element it marks.
@@ -1130,13 +1178,15 @@ async function inspect(){
  const r=document.getElementById('repo').value.trim(); if(!r)return;
  spin('inspect',120000);
  document.getElementById('insp').innerHTML='<div class="hint">Reading metadata over the network - a few MB, no weights. This takes ~40s.</div>';
- try{const d=await (await fetch('/api/inspect?model='+encodeURIComponent(r))).json();
+ try{const qs='/api/inspect?model='+encodeURIComponent(r);
+  await fetch(qs+'&run=1');
+  const d=await waitFor(qs,180000);
   if(d.error){document.getElementById('insp').innerHTML='<div class="hint miss">'+d.error+'</div>';return}
   document.getElementById('insp').innerHTML='<div class="hint">'+d.summary+'</div><table><thead><tr><th>Variant</th><th>Size</th><th>Verdict</th><th></th></tr></thead><tbody>'+
    d.variants.map(v=>`<tr><td>${v.name}</td><td>${v.size}</td><td>${v.fits?'<span class="on2">'+v.verdict+'</span>':'<span class="miss">'+v.verdict+'</span>'}</td>
    <td><button class="gh" onclick="dl('${d.repo}','${v.quant}')">Download</button></td></tr>`).join('')+'</tbody></table>';
  }catch(e){document.getElementById('insp').innerHTML='<div class="hint miss">'+e+'</div>'}
- delete PEND['inspect'];
+ delete PEND['inspect'];activity([]);
 }
 async function mkLnk(){
  document.getElementById('lnk').textContent='working...';
@@ -1168,6 +1218,7 @@ const JOBS_SAY={
  download:['Downloading a model','Multi-GB. Safe to interrupt - it resumes where it stopped.'],
  llmfit:['Installing the model picker','About 5 MB.'],
  inspect:['Reading the model listing','Metadata only, no weights. Around 40 seconds.'],
+ suggest:['Scoring models against this PC','Ranks the catalogue against your RAM, VRAM and memory bandwidth. Up to a minute.'],
  unload:['Freeing VRAM',''],
  vercheck:['Checking for newer versions','Asks GitHub and nodejs.org.'],
  opencode:['The local agent is working','It edits files in your project directly.'],
@@ -1550,48 +1601,65 @@ try {
                     $body = '{"ok":true}'
                 }
                 '^/api/suggest$' {
-                    # llmfit is offline and answers in a couple of seconds, so this runs inline
-                    # rather than as a job - the whole point is a list you act on immediately.
                     $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                    $key = "$($q['usecase'])|$($q['tools'])|$($q['minfit'])"
                     if (-not (Test-Path (Join-Path $root 'llmfit\llmfit.exe'))) { $body = '{"needInstall":true}' }
                     else {
-                    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs,
-                           '-Action', 'suggest', '-Json', '-Top', '8')
-                    if ($q['usecase']) { $a += @('-UseCase', $q['usecase']) }
-                    if ($q['tools'] -ne '1') { $a += @('-Capability', 'any') }
-                    # Loosening the fit threshold is the panel's escape hatch from an empty list.
-                    # Whitelisted rather than passed through, since it lands on a command line.
-                    if ($q['minfit'] -in 'good', 'marginal', 'poor') { $a += @('-MinFit', $q['minfit']) }
-                    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-                    $out = try { & powershell @a 2>&1 | ForEach-Object { "$_" } } finally { $ErrorActionPreference = $old }
-                    $line = $out | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -First 1
-                    if ($line) { $body = $line }
-                    else {
-                        $res.StatusCode = 500
-                        $msg = ($out | Where-Object { $_.Trim() -and $_ -notmatch '^\s*(\+|At line|At C:)' } | Select-Object -First 1)
-                        $body = @{ error = ("$msg" -replace '^powershell(\.exe)?\s*:\s*', '').Trim() } | ConvertTo-Json -Compress
-                    }
+                        # run=1 is the button; every other request is the page polling for the answer.
+                        if ($q['run'] -eq '1') {
+                            $a = @('-Action', 'suggest', '-Json', '-Top', '8')
+                            if ($q['usecase']) { $a += @('-UseCase', $q['usecase']) }
+                            if ($q['tools'] -ne '1') { $a += @('-Capability', 'any') }
+                            # Whitelisted rather than passed through, since it lands on a command line.
+                            if ($q['minfit'] -in 'good', 'marginal', 'poor') { $a += @('-MinFit', $q['minfit']) }
+                            Start-Async 'suggest' $key $a
+                            $body = '{"running":true}'
+                        } else {
+                            $st = Get-Async 'suggest' $key
+                            if (-not $st)        { $body = '{"running":true}' }
+                            elseif ($st.running) { $body = '{"running":true}' }
+                            else {
+                                $line = $st.out | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -First 1
+                                if ($line) { $body = $line }
+                                else {
+                                    $msg = @($st.out) + @($st.err -split "`r?`n") |
+                                           Where-Object { $_ -and $_.Trim() -and $_ -notmatch '^\s*(\+|At line|At C:)' } |
+                                           Select-Object -Last 1
+                                    $body = @{ error = ("$msg" -replace '^powershell(\.exe)?\s*:\s*', '').Trim() } | ConvertTo-Json -Compress
+                                }
+                            }
+                        }
                     }
                 }
                 '^/api/inspect$' {
-                    # Runs inline: it is the one action the user is actively waiting on, and its
-                    # output is the whole point rather than a side effect.
-                    $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['model']
-                    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $startPs -Action inspect -Model $q 2>&1 | Out-String
-                    $lines = $out -split "`r?`n"
-                    $summary = ($lines | Where-Object { $_ -match '^arch ' } | Select-Object -First 1)
-                    $variants = @()
-                    foreach ($l in $lines) {
-                        if ($l -match '^(\S+)\s+([\d.]+ GB)\s+(\S+)\s+(\S+)\s+(.+?)\s*$' -and $l -notmatch '^variant') {
-                            $verdict = $Matches[5].Trim()
-                            $quant = if ($Matches[1] -match '(?i)[-_.]((?:IQ|Q|UD-Q)\d[A-Z0-9_]*|BF16|F16|F32)$') { $Matches[1] } else { '' }
-                            $variants += @{ name = $Matches[1]; size = $Matches[2]; verdict = $verdict
-                                            fits = ($verdict -notmatch 'needs >|will not fit'); quant = $quant }
+                    $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                    $model = $q['model']
+                    if ($q['run'] -eq '1') {
+                        Start-Async 'inspect' $model @('-Action', 'inspect', '-Model', $model)
+                        $body = '{"running":true}'
+                    } else {
+                        $st = Get-Async 'inspect' $model
+                        if (-not $st -or $st.running) { $body = '{"running":true}' }
+                        else {
+                            $lines = @($st.out)
+                            $summary = ($lines | Where-Object { $_ -match '^arch ' } | Select-Object -First 1)
+                            $variants = @()
+                            foreach ($l in $lines) {
+                                if ($l -match '^(\S+)\s+([\d.]+ GB)\s+(\S+)\s+(\S+)\s+(.+?)\s*$' -and $l -notmatch '^variant') {
+                                    $verdict = $Matches[5].Trim()
+                                    $quant = if ($Matches[1] -match '(?i)[-_.]((?:IQ|Q|UD-Q)\d[A-Z0-9_]*|BF16|F16|F32)$') { $Matches[1] } else { '' }
+                                    $variants += @{ name = $Matches[1]; size = $Matches[2]; verdict = $verdict
+                                                    fits = ($verdict -notmatch 'needs >|will not fit'); quant = $quant }
+                                }
+                            }
+                            $repo = if ($model -match 'huggingface\.co/([^/]+/[^/?#]+)') { $Matches[1] } else { $model }
+                            if (-not $variants) {
+                                $msg = (@($lines) + @($st.err -split "`r?`n") | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3) -join ' '
+                                $body = @{ error = "$msg" } | ConvertTo-Json -Compress
+                            }
+                            else { $body = @{ repo = $repo; summary = $summary; variants = $variants } | ConvertTo-Json -Depth 5 -Compress }
                         }
                     }
-                    $repo = if ($q -match 'huggingface\.co/([^/]+/[^/?#]+)') { $Matches[1] } else { $q }
-                    if (-not $variants) { $body = @{ error = ($out.Trim() -split "`r?`n" | Select-Object -Last 3) -join ' ' } | ConvertTo-Json -Compress }
-                    else { $body = @{ repo = $repo; summary = $summary; variants = $variants } | ConvertTo-Json -Depth 5 -Compress }
                 }
                 '^/api/settings$' {
                     $p = Read-Body $req

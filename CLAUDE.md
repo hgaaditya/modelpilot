@@ -225,6 +225,21 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
   `useWebui: false` and open-webui answering on :8080 regardless. So a running-but-unticked service
   now reads `running (not selected)` rather than plain `running`, and unticking one that is up
   offers to stop it instead of the checkbox silently doing half of what it looks like it does.
+- **Nothing slow runs inside a request, and jobs run below normal priority.** The listener is
+  single-threaded, so `/api/suggest` (30–60s of llmfit scoring) and `/api/inspect` (~40s of network
+  metadata reads) blocked *everything* while they ran — the 3s poll, the header health dot,
+  `/api/ping`, and the activity card that exists to describe the very action in progress. The
+  window froze at exactly the moment it was meant to be reassuring.
+
+  Both now start a job and answer `{"running":true}`; the page polls until the answer is there.
+  `Start-Async`/`Get-Async` key the job by the question asked, so a stale answer to a different
+  question is never handed back, and `run=1` distinguishes the button press from the polls.
+
+  That alone was not enough. With the work out of the request, a CPU-bound job still starved the
+  listener: `/api/ping` measured **3–6 seconds, or outright timeouts**, while llmfit scored. One
+  line — `$p.PriorityClass = 'BelowNormal'` in `Start-Job2` — took the same measurement to **max
+  9 ms, median 1 ms**. Both halves are needed; either alone leaves the panel feeling hung.
+
 - **Anything slow says what it is doing, in a card that appears on the click.** Every long action
   in this panel starts a detached job and returns immediately, so the answer to "did that work"
   used to be a disabled button and, minutes later, a log tail under Activity. A fixed card now

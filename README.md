@@ -4,8 +4,9 @@
 ![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078d4)
 ![No Docker](https://img.shields.io/badge/Docker-not%20required-lightgrey)
 
-**Run large language models on your own Windows machine — and hand your Claude Code sessions over
-to them when your quota runs out.** Nothing leaves the box.
+**Run large language models on your own Windows machine, without assembling the stack yourself.**
+One download instead of four, and it picks the model, the quantisation and the settings to match
+your card. Nothing leaves the box.
 
 **Unzip it, double-click one file, press Start.** No Docker, no WSL, no Python or Node to install
 first, no admin rights, and nothing added to your PATH or registry.
@@ -82,10 +83,12 @@ you, and it measures rather than guesses.
 - **Tunes by measurement.** `-Action autotune` loads the model and times it. On the development
   machine, that setting was the difference between **15 and 47 tokens/sec** — the same model,
   the same card, one flag.
-- **Hands Claude Code to a local model**, resuming the exact conversation you were in, with four
-  non-obvious client bugs already worked around.
-- **Verifies instead of assuming.** Launches are health-checked, configs are validated against
-  disk, and a model is only offered to a coding agent after it has actually driven one.
+- **Never leaves you guessing.** Anything slow says what it is doing, how long it usually takes
+  and how far along it is — a real percentage for downloads, which is the step you spend the most
+  time watching.
+- **Verifies instead of assuming.** Launches are health-checked and model configs are validated
+  against what is actually on disk, so a broken entry is caught before it becomes a connection
+  error mid-chat.
 
 ## What you need
 
@@ -100,42 +103,24 @@ you, and it measures rather than guesses.
   frontend is built. Your existing Python and Node are never touched, and `-Action uninstall`
   removes all of it because none of it was installed system-wide.
 
-## Running out of Claude quota mid-project
+## Offloading heavy reading from Claude Code
 
-Claude Code can be pointed at a model running here instead of at Anthropic, on the same repo, with
-your files and history intact and nothing uploaded.
+Keep Claude Code on the cloud model and hand only the token-heavy reading to a local one, so a
+200,000-token log costs nothing against your quota:
 
-The **Coding agents** tab lists your recent Claude Code projects — read from Claude Code's own
-session history, so there's no path to remember — and **Hand over** reopens that exact
-conversation on a local model.
+```bash
+powershell -ExecutionPolicy Bypass -File .\local-llm.ps1 -Prompt "List every distinct error and its frequency" -File logs\app.log
+```
 
-<!-- SCREENSHOT: the Coding agents tab showing the session list with Hand over buttons.
-     Blur or crop the paths if any are private. Suggested filename: docs/img/coding-agents.png -->
-![Handing a project to a local model](docs/img/coding-agents.png)
+Only the answer comes back. The **Tools** tab in the panel does the same thing with two boxes.
 
-Only that process is redirected; your normal `claude` sessions still go to Anthropic. Press
-**Test it** before you rely on a model — it runs Claude Code for real, makes it use a tool, and
-remembers the answer. A model that happily answers a chat message can still fail the moment tools
-are involved, and the tab only offers ones that have actually passed.
-
-**What to expect.** Measured here, a 30B sparse-MoE model read a file with a tool and answered
-correctly in 74 seconds at about 40 tokens/sec. Slower than the hosted model, and it won't carry a
-long unattended refactor — but it keeps a session moving.
-
-Getting there meant working around four things that are not the model's fault, and are documented
-in [CLAUDE.md](CLAUDE.md) so you don't have to rediscover them:
-
-- Claude Code injects a per-request billing header **at the front of the system prompt**, which
-  invalidates llama.cpp's prompt cache and re-processes the entire context every turn. Turn times
-  went from **3m58s to 2.1s** once it was disabled.
-- Its built-in `Workflow` tool declares `maxLength: 524288`, which llama.cpp turns into a GBNF
-  repetition that blows its own grammar parser — every request 400s, and it reads like a broken
-  model.
-- It assumes a 200k context window for models it doesn't recognise, and compacts against that.
-- Its background requests go to a Haiku model id that doesn't exist locally unless you map it.
-
-The other direction works too: keep Claude Code on the cloud model and hand only the token-heavy
-reading to a local one, so a 200k-token log costs nothing against your quota.
+**Running whole Claude Code sessions on a local model is not offered.** It was, and it was removed
+after measuring it: on a 12 GB card, a fresh session asked to make a one-line change to a 12-line
+file ran **219 tool calls over 29 minutes**, never replied, and changed nothing. The plumbing is
+fine — single requests and single tool calls work — but a model this size does not converge on a
+multi-step agent loop, and a button that cannot finish is worse than no button. `claude-local.ps1`
+is still in the repo for one-shot questions; [CLAUDE.md](CLAUDE.md) has the measurements, and the
+client bugs found along the way.
 
 ## Monitoring
 
@@ -160,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Model 'u
 ```
 
 `-Action` also takes `stop`, `restart`, `status`, `upgrade`, `autotune`, `bench`, `check-config`,
-`suggest`, `install-llmfit`, `install-prism` and `uninstall`. `-Action status` shows what's
+`check-ui`, `suggest`, `install-llmfit`, `install-prism` and `uninstall`. `-Action status` shows what's
 installed against what's pinned; `-Action check-config` validates your model config before you
 restart anything.
 
