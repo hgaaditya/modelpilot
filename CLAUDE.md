@@ -66,6 +66,25 @@ On a clean machine it bootstraps everything (skipping any step whose artifact al
 7. Writes `open-webui-0.11.0\.env` from `.env.example` with `OPENAI_API_BASE_URL` pointed at llama-swap and `ENABLE_OLLAMA_API=false` (this stack doesn't use Ollama, despite `.env.example`'s default framing around it)
 8. Launches `llama-swap.exe` (`:9292`) and the open-webui backend (`:8080`), both detached with output redirected to `logs\`
 
+**The first-run path is separately fragile, and was measured by wiping this install and rebuilding
+it.** Every deploy step is guarded by *skip if the artifact exists*, so a machine that is already
+deployed never runs them again - which is exactly how five bugs survived in the path every new user
+takes, and none in the path developers take. Found by deploying a clean clone, then by
+`-Action uninstall` (weights kept) followed by a full rebuild:
+
+| what broke | why it never showed up here |
+| --- | --- |
+| the asset regex `-bin-win-cuda-.*-x64.zip$` also matched `cudart-llama-bin-win-cuda-12.4-x64.zip`, which sorts first - so deploy fetched cudart twice (746 MB) and never fetched the binaries at all | `llama-server.exe` already existed, so step 1 was skipped |
+| `vite build` peaked at 3.8 GB and hit node's ~4 GB default heap cap | `build\` already existed, so step 7 was skipped |
+| `Invoke-Deploy` ended with `$webui`, but a PowerShell function returns its whole output stream - and it runs npm, uv and tar | on a re-run those steps print nothing, so the caller received just the path |
+| `-Action uninstall` printed `uv\`, `.python\` and `.uv-cache\` in its "will permanently delete" list and never deleted them | nobody had run uninstall and then looked |
+| open-webui's health budget was a flat 180s; a first boot runs ~60 alembic migrations on an empty database and fetches embedding weights, and was killed mid-migration by the rollback | every later boot has both already, and answers in seconds |
+
+Measured on the rebuild, weights kept: **20 minutes to deploy, 2 minutes to first boot, ~850 MB
+downloaded, 4,103 MB on disk** excluding `.gguf` files - the figure the README now quotes, and it
+is after the `.uv-cache` prune reclaims 2.2 GB. Re-run that rebuild before a release; nothing else
+exercises these paths.
+
 Version pins live in the `$VER` hashtable at the top of `start.ps1` — that's the one place to edit them. Ports are `$swapPort` / `$webuiPort` right below it; changing `$swapPort` only affects a `.env` that doesn't exist yet, so an already-provisioned install also needs its `OPENAI_API_BASE_URL` updated by hand.
 
 Launching is verified, not assumed. Before starting anything it warns about every model in `config.yaml` whose `.gguf` is missing (otherwise the only symptom is a `connection refused` proxy error when that model is first selected, because its `llama-server` died on spawn). After starting, it polls `/health` on both services — 20s for llama-swap, 180s for open-webui, whose first boot downloads sentence-transformers embedding weights — and bails early if a process exits. On failure it prints the tail of that component's logs (**both** `.log` and `.err.log`: llama-swap writes everything to stdout, so a stderr-only tail is empty exactly when it matters), tears down whatever did start, and exits non-zero. Re-running while the stack is up refuses rather than spawning a duplicate that loses the port bind.
