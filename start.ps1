@@ -866,10 +866,16 @@ function Get-FittedContext($ggufPath, $kvType = 'q4_0') {
     # A low-bit model only loads on the fork, so fit it with the fork's own binary.
     if ((Test-Path $prismExe) -and -not (Test-Path $exe)) { $exe = $prismExe }
     if (-not (Test-Path $exe)) { return $null }
+    # llama-fit-params writes its progress to stderr, and this script runs with
+    # $ErrorActionPreference = 'Stop' - so a bare `2>$null` turns that output into a terminating
+    # NativeCommandError and the whole call lands in the catch. It did: this function returned
+    # $null for every model, which is why autotune's ladder always started from its hardcoded
+    # 16384 fallback rather than from the fitter it prints in the same breath.
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
         $out = & $exe -m $ggufPath -ctk $kvType -ctv $kvType -fa on 2>$null | Select-Object -Last 1
         if ($out -match '-c\s+(\d+)') { return [int]$Matches[1] }
-    } catch { }
+    } catch { } finally { $ErrorActionPreference = $old }
     $null
 }
 
@@ -1435,11 +1441,36 @@ if ($Action -eq 'add-model') {
     $primary = Join-Path $modelsDir $downloads[0].File
     Write-Host "`nSaved to $modelsDir"
 
+    # A freshly downloaded model used to land at a flat -c 16384 whatever card it was going onto,
+    # which is the number the panel then reports as its conversation length - so every new model
+    # read as "short" until someone ran Tune. llama.cpp ships its own fitter, which reads the file
+    # and the free VRAM and prints the -c that fits; on this box it answers 36608 for a 14B at
+    # Q4_K_M against that same 16384. It sizes to VRAM free at the instant it runs, so it is a
+    # good starting point rather than a measurement - `-Action autotune` is what measures - and it
+    # is capped at what the model was actually trained for, since asking for more buys nothing.
+    $ctxToUse = $Context
+    if (-not $PSBoundParameters.ContainsKey('Context')) {
+        $fit = Get-FittedContext $primary
+        if ($null -ne $fit) {
+            $trained = try { (Get-GgufInfo -Path $primary).TrainCtx } catch { 0 }
+            # The fitter prints `-c 0` when the whole trained window fits - 0 is also what llama.cpp
+            # itself reads as "use the model's own maximum". Resolve it to the real number, because
+            # 0 in config.yaml tells the panel nothing about how long a conversation can get.
+            if ($fit -le 0) { $fit = $trained }
+            if ($trained -gt 0 -and $fit -gt $trained) { $fit = $trained }
+            if ($fit -gt 0) {
+                $ctxToUse = [math]::Max(8192, [int]([math]::Floor($fit / 1024) * 1024))
+                Write-Host "context: $ctxToUse, sized to this card by llama-fit-params (-Context overrides; -Action autotune measures)."
+            }
+        }
+    }
+
     if ($NoConfig) {
         Write-Host "Skipped config.yaml (-NoConfig). Register it as '$Id' pointing at $primary when you're ready."
     }
-    elseif (Add-ModelToConfig $Id $primary $Context) {
-        Write-Host "Registered in $swapConfig as `"$Id`" (context $Context, previous config saved as config.yaml.bak)."
+    elseif (Add-ModelToConfig $Id $primary $ctxToUse) {
+        Write-Host "Registered in $swapConfig as `"$Id`" (context $ctxToUse, previous config saved as config.yaml.bak)."
+
         # No restart: llama-swap runs with -watch-config and polls the file every 2s.
         Write-Host "llama-swap picks it up within a couple of seconds - it is routable without a restart."
     }
