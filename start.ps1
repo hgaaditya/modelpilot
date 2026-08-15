@@ -707,6 +707,14 @@ function Start-Stack($webui, $component = 'all') {
     }
 
     if ($component -ne 'swap') {
+        # A first boot is a different animal from every later one: open-webui runs ~60 alembic
+        # migrations against an empty SQLite file and downloads its sentence-transformers
+        # embedding weights before it answers /health. Measured on a clean install here, 180s was
+        # not close - the health check timed out mid-migration and rolled back a launch that was
+        # working perfectly, which reads as a broken install at the end of a 25-minute setup.
+        # Every later boot has the db and the weights already, so it keeps the tighter budget.
+        $webuiFirstBoot = -not (Test-Path (Join-Path $webui 'backend\data\webui.db'))
+        if ($webuiFirstBoot) { Write-Host "  (first boot: migrating the database and fetching embedding weights - this one takes a few minutes)" }
         Write-Host "Starting open-webui on :$webuiPort ..."
         $webuiProc = Start-Process -FilePath (Join-Path $webui '.venv\Scripts\python.exe') `
             -ArgumentList '-m', 'uvicorn', 'open_webui.main:app', '--host', '0.0.0.0', '--port', "$webuiPort", '--forwarded-allow-ips', "'*'", '--ws', 'auto' `
@@ -721,7 +729,7 @@ function Start-Stack($webui, $component = 'all') {
     try {
         if ($swapProc)  { Wait-Healthy 'llama-swap' "http://127.0.0.1:$swapPort/health" $swapProc $swapLogs 20 }
         # Generous budget: open-webui's first boot downloads sentence-transformers embedding weights.
-        if ($webuiProc) { Wait-Healthy 'open-webui' "http://127.0.0.1:$webuiPort/health" $webuiProc $webuiLogs 180 }
+        if ($webuiProc) { Wait-Healthy 'open-webui' "http://127.0.0.1:$webuiPort/health" $webuiProc $webuiLogs $(if ($webuiFirstBoot) { 900 } else { 180 }) }
     } catch {
         Write-Host "`nRolling back the partial launch..."
         Stop-Stack $component
@@ -1725,6 +1733,13 @@ switch ($Action) {
         Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $stampFile -Force -ErrorAction SilentlyContinue
         Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
+        # These three are printed in the "will permanently delete" list above and were never
+        # actually deleted - a fresh uninstall left uv.exe and its siblings sitting there, 47 MB
+        # of a tool the user was told had been removed. An uninstaller that overstates what it
+        # removed is worse than one that removes less and says so.
+        Remove-Item $uvDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $root '.python') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $root '.uv-cache') -Recurse -Force -ErrorAction SilentlyContinue
 
         Write-Host "`nUninstalled. Re-run '.\start.ps1' to rebuild from scratch."
     }
