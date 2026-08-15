@@ -85,6 +85,25 @@ downloaded, 4,103 MB on disk** excluding `.gguf` files - the figure the README n
 is after the `.uv-cache` prune reclaims 2.2 GB. Re-run that rebuild before a release; nothing else
 exercises these paths.
 
+**llama-swap is pinned to v244 deliberately - v250 does not work here.** Bumping the pin and
+running `-Action upgrade` installed v250 cleanly and both services passed their health checks, so
+everything *looked* right. The first real completion killed it: llama-swap crashed outright, and
+its last words were
+
+```
+[INFO] <qwen2.5-0.5b-...> Health check passed on http://localhost:5804/health
+http: proxy error: dial tcp [::1]:5804: connectex: ... actively refused
+```
+
+v250 addresses its upstreams as `localhost`, which resolves to `::1` first on Windows, while the
+`llama-server` macro binds `--host 127.0.0.1`. That is the same IPv6 mismatch this file warns about
+for every URL here, arriving this time from inside a dependency. Re-test with a real completion,
+not `/health`, before moving the pin again.
+
+The wider lesson, and the reason this was found four hours late: **`/health` returning 200 proves a
+process is listening, not that a model can answer.** A wipe, a rebuild, an upgrade and a retune all
+passed on health checks alone while the stack could not actually serve a token.
+
 Version pins live in the `$VER` hashtable at the top of `start.ps1` — that's the one place to edit them. Ports are `$swapPort` / `$webuiPort` right below it; changing `$swapPort` only affects a `.env` that doesn't exist yet, so an already-provisioned install also needs its `OPENAI_API_BASE_URL` updated by hand.
 
 Launching is verified, not assumed. Before starting anything it warns about every model in `config.yaml` whose `.gguf` is missing (otherwise the only symptom is a `connection refused` proxy error when that model is first selected, because its `llama-server` died on spawn). After starting, it polls `/health` on both services — 20s for llama-swap, 180s for open-webui, whose first boot downloads sentence-transformers embedding weights — and bails early if a process exits. On failure it prints the tail of that component's logs (**both** `.log` and `.err.log`: llama-swap writes everything to stdout, so a stderr-only tail is empty exactly when it matters), tears down whatever did start, and exits non-zero. Re-running while the stack is up refuses rather than spawning a duplicate that loses the port bind.

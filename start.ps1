@@ -114,7 +114,7 @@ $ErrorActionPreference = 'Stop'
 # Bump these and run `-Action upgrade` to move the stack forward deterministically.
 $VER = @{
     llamaCpp  = 'b10155'
-    llamaSwap = 'v250'
+    llamaSwap = 'v244'
     openWebUI = '0.11.0'      # open-webui pins requires-python <3.13 and node <=22.x
     node      = 'v22.23.1'
     cuda      = 'cuda-13.3'   # only a fallback - the exact CUDA asset is resolved from the release
