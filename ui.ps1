@@ -447,7 +447,12 @@ function Get-Sensors {
         }
     }
     try {
-        $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        # NOT Win32_Processor. Measured on this box: Win32_Processor's LoadPercentage costs
+        # 1,031-1,047 ms every call, which was the entire cost of this endpoint - nvidia-smi,
+        # twelve sensors and all, is 55 ms. The Monitoring tab polls once a second, so the
+        # listener spent essentially all of its time inside WMI and every other request in the
+        # panel queued behind it. The perf-counter class answers the same question in 275 ms.
+        $cpu = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
         [void]$out.Add(@{ name = 'CPU Load'; value = [math]::Round($cpu, 0); unit = '%' })
         $os = Get-CimInstance Win32_OperatingSystem
         [void]$out.Add(@{ name = 'System RAM Used'
@@ -1004,9 +1009,21 @@ async function runLocal(kind){
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
 function monReset(){MON={};monN=0;document.getElementById('sens').innerHTML=''}
+// Sampling schedules itself instead of running on a fixed 1 Hz interval, and that is a
+// correctness fix rather than tuning. /api/sensors spawns nvidia-smi and reads WMI: measured
+// here it takes 1,128-1,641 ms, so setInterval(mon,1000) asked for work faster than it could
+// ever be finished. Against a single-threaded listener the requests piled up, and everything
+// else in the panel - the 3s status poll, the health dot, every button - queued behind that
+// backlog. The next sample is now scheduled only once the last one has come back.
 function monRun(on){
- if(on&&!monTimer){mon();monTimer=setInterval(mon,1000)}
- if(!on&&monTimer){clearInterval(monTimer);monTimer=null}
+ if(on&&!monTimer){monTimer=1;monTick()}
+ if(!on&&monTimer){clearTimeout(monTimer);monTimer=null}
+}
+async function monTick(){
+ const t0=Date.now();
+ try{await mon()}catch(e){}
+ // one second is a floor, not a promise: a card that takes 1.6s to read is sampled every 1.6s.
+ if(monTimer!==null)monTimer=setTimeout(monTick,Math.max(1000,Date.now()-t0));
 }
 async function mon(){
  let d;try{d=await (await fetch('/api/sensors')).json()}catch(e){return}

@@ -225,6 +225,24 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
   then, not at the generous ceiling that exists for the job which never starts. Panels re-render
   every poll, so per-button state is re-derived at render time via `B()` rather than set on the
   element; the header buttons are static markup and are synced by hand in `tick()`.
+- **The Monitoring tab used to make the whole panel stutter, and it was one WMI call.** Measured:
+  `/api/sensors` took **1,128-1,641 ms**, and the tab polled it on a fixed `setInterval(mon,1000)` -
+  asking for work faster than it could ever be finished, so requests piled up and everything else
+  (the 3s status poll, the health dot, every button) queued behind the backlog. `/api/ping` spiked
+  to 730-1,158 ms.
+
+  The cost was not nvidia-smi, which reads all twelve GPU sensors in **55 ms**. It was
+  `Get-CimInstance Win32_Processor` for one number, CPU load: **1,031-1,047 ms, every call**.
+  `Win32_PerfFormattedData_PerfOS_Processor` answers the same question in 275 ms. Two fixes, both
+  needed: the counter swap took the endpoint to **352-495 ms**, and sampling now schedules the next
+  read only when the last has returned (floor of one second), so a slow card can never build a
+  queue. `/api/ping` under a live Monitoring poll is now **max 127 ms, median 1 ms**.
+
+  Worth knowing for anything else polled here: a bad client is *not* the hazard. A half-open
+  request and a client that never reads the response were both tried against this listener and
+  neither delayed it past 58 ms - HTTP.sys buffers both. The hazard is always work done inside the
+  request.
+
 - **Monitoring tab** — GPU-Z's sensor layout (name, current, min, max, average) over one
   `nvidia-smi` call plus a WMI read. Min/max/average are accumulated in the page, not the server:
   the samples are already there and the server would otherwise hold per-session history for a

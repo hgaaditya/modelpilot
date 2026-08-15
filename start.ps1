@@ -1178,7 +1178,11 @@ if ($Action -eq 'install-llmfit') {
 if ($Action -eq 'check-ui') {
     $node = Get-ChildItem (Join-Path $root 'open-webui-*\.node-runtime') -Recurse -Filter 'node.exe' -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
-    if (-not $node) { throw "Node isn't vendored yet - run a deploy first (it lands in open-webui-*\.node-runtime\)." }
+    # The vendored Node is deleted once the frontend is built, so on a normal install there is
+    # none - which made this check unrunnable exactly where it matters. Any node will parse
+    # JavaScript, so fall back to one on PATH before giving up.
+    if (-not $node) { $node = (Get-Command node -ErrorAction SilentlyContinue).Source }
+    if (-not $node) { throw "No node available. Install Node, or re-provision with -KeepBuildDeps, or run this from a clone that has just been built." }
     $html = Get-Content (Join-Path $root 'ui.ps1') -Raw
     $js = [regex]::Matches($html, '(?s)<script>(.*?)</script>') | ForEach-Object { $_.Groups[1].Value }
     if (-not $js) { throw "No <script> block found in ui.ps1 - has the page been restructured?" }
