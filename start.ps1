@@ -1486,12 +1486,16 @@ if ($Action -eq 'add-model') {
         if (-not $match) {
             Write-Host "`nNo '$wanted' in $($spec.Repo). Available:`n"
             $variants | ForEach-Object { Write-Host ("  {0,-12} {1,10}   {2}" -f $_.Quant, (Format-Size $_.Bytes), $_.Name) }
-            throw "Pick one with -Quant <label>."
+            # Not an error worth a stack trace: listing a repo with a label that matches nothing
+            # is the documented way to browse it. Say what to do and leave with a non-zero code.
+            Write-Host "Pick one with -Quant <label>."
+            exit 1
         }
         if ($match.Count -gt 1) {
             Write-Host "`n'$wanted' matches more than one variant:`n"
             $match | ForEach-Object { Write-Host ("  {0,-40} {1,10}" -f $_.Name, (Format-Size $_.Bytes)) }
-            throw "Narrow it down with -Quant <label>."
+            Write-Host "Narrow it down with -Quant <label>."
+            exit 1
         }
 
         $v = $match[0]
