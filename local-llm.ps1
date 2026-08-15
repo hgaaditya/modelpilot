@@ -40,7 +40,12 @@ $base = "http://127.0.0.1:$Port"
 # U+FFFD and stripping the result keeps the JSON body well-formed - llama-server rejects the
 # whole request with a parse error otherwise.
 function Read-AsCleanText($path) {
-    $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($path))
+    # Share ReadWrite+Delete: the obvious input for this tool is a log a process is still writing
+    # to, and ReadAllBytes asks for a share mode the live writer already denies - it fails with
+    # "being used by another process" on exactly the files this exists for.
+    $fs = [IO.File]::Open((Resolve-Path $path), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite,Delete')
+    $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
+    try { $text = $sr.ReadToEnd() } finally { $sr.Dispose(); $fs.Dispose() }
     ($text -replace '�', '') -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ''
 }
 
