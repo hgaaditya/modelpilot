@@ -1122,7 +1122,16 @@ function Invoke-Autotune {
 # These don't touch versions at all - handle them before any stamp/release resolution.
 if ($Action -eq 'stop') { Stop-Stack $Component; return }
 
-if ($Action -eq 'tray') { Start-Tray; Write-Host "Tray indicator started (look in the notification area)."; return }
+# A named mutex keeps the tray to one instance, so firing this at an already-running tray
+# does nothing - and it used to report that it had started one anyway.
+if ($Action -eq 'tray') {
+    $already = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -like "*tray.ps1*" }).Count
+    Start-Tray
+    if ($already) { Write-Host 'Tray indicator was already running (one instance only).' }
+    else { Write-Host 'Tray indicator started (look in the notification area).' }
+    return
+}
 
 if ($Action -eq 'install-llmfit') {
     # llmfit is a single 24 MB exe, MIT-licensed, and answers a question nothing else here does:

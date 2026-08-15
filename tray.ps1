@@ -94,10 +94,17 @@ function Get-ConfiguredModels {
     $out = @()
     for ($i = 1; $i -lt $parts.Count; $i += 2) {
         $m = [regex]::Match($parts[$i + 1], '-m\s+"?([^"\r\n]+?\.gguf)"?')
+        # A model can also be unrunnable because its *engine* is missing: a prism-backed entry
+        # with no llama.cpp-prism installed dies on spawn exactly as an absent .gguf does. The
+        # panel and -Action check-config both report that; the tray offered it as a normal choice
+        # and the click then did nothing at all.
+        $needsPrism = $parts[$i + 1] -match 'llama-server-prism'
+        $engineOk   = (-not $needsPrism) -or (Test-Path (Join-Path $root 'llama.cpp-prism\llama-server.exe'))
         $out += [pscustomobject]@{
             Id      = $parts[$i]
             Path    = if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
-            Present = $m.Success -and (Test-Path $m.Groups[1].Value.Trim())
+            Present       = $m.Success -and (Test-Path $m.Groups[1].Value.Trim()) -and $engineOk
+            EngineMissing = -not $engineOk
         }
     }
     $out
@@ -155,11 +162,13 @@ $menu.Add_Opening({
     foreach ($m in $models) {
         $label = $m.Id
         if ($m.Id -eq $loaded) { $label = "* $label  (loaded)" }
+        elseif ($m.EngineMissing) { $label = "$label  (engine not installed)" }
         elseif (-not $m.Present) { $label = "$label  (file missing)" }
         $item = $script:miModels.DropDownItems.Add($label)
         if (-not $m.Present) {
             $item.Enabled = $false
-            $item.ToolTipText = "Not on disk: $($m.Path)"
+            $item.ToolTipText = if ($m.EngineMissing) { "Needs the PrismML fork - run: start.ps1 -Action install-prism" }
+                                else { "Not on disk: $($m.Path)" }
         } else {
             $id = $m.Id   # capture per iteration, not by reference to the loop variable
             $item.ToolTipText = $m.Path
