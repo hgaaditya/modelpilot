@@ -341,8 +341,12 @@ function Update-Usage($loaded) {
 # way the Monitoring tab accumulates its own samples: the server holds no per-session history.
 function Get-Downloads {
     $s = Get-Settings
-    if (-not (Test-Path $s.modelsDir)) { return @() }
-    Get-ChildItem (Join-Path $s.modelsDir '*.part') -ErrorAction SilentlyContinue | ForEach-Object {
+    # Weights land in the models directory; the install downloads - open-webui's source, the
+    # llama.cpp build, Node, uv - stage in a shared cache under TEMP. Both are things the user is
+    # sitting and waiting for, and the first run is entirely the second kind.
+    $dirs = @($s.modelsDir, (Join-Path $env:TEMP 'localllm-dl')) | Where-Object { $_ -and (Test-Path $_) }
+    if (-not $dirs) { return @() }
+    Get-ChildItem ($dirs | ForEach-Object { Join-Path $_ '*.part' }) -ErrorAction SilentlyContinue | ForEach-Object {
         $total = 0
         $meta = "$($_.FullName).json"
         if (Test-Path $meta) {

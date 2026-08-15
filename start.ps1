@@ -148,9 +148,24 @@ $dl           = Join-Path $env:TEMP 'localllm-dl'
 $swapPort     = 9292
 $webuiPort    = 8080
 
+# Every install download comes through here - open-webui's source, the llama.cpp build, Node, uv -
+# and it used to be one Invoke-WebRequest with a single "Downloading ..." line and nothing after
+# it. That is the 1.5 GB first run the README describes as "a few minutes": on a slow link the
+# console, the job log and the panel all sit on that one line for the whole of it, with no way to
+# tell a slow download from a dead one. Routed through Get-BigFile, these now stage to <name>.part
+# with the expected size beside them, so they resume and the panel can show a real bar.
 function Get-File($url, $out) {
     Write-Host "Downloading $url"
-    Invoke-WebRequest -Uri $url -OutFile $out
+    $total = 0
+    # A HEAD is cheap, but only some of these answer with a Content-Length: nodejs.org does,
+    # GitHub's release/codeload redirects do not. 0 is the honest answer there - progress then
+    # reads as bytes-so-far rather than an invented percentage.
+    try {
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $total = [long]((Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 20).Headers['Content-Length']) }
+        finally { $ErrorActionPreference = $old }
+    } catch { }
+    Get-BigFile $url $out $total
 }
 
 # config.yaml carries absolute paths to llama-server.exe and to every .gguf, so it can't be
@@ -306,6 +321,9 @@ function Stop-Stack($component = 'all') {
 # ==========================================================================
 #  deploy - every step is skipped once its artifact exists
 # ==========================================================================
+# Returns nothing on purpose. This runs npm, uv and tar, all of which write to stdout, and a
+# PowerShell function returns everything on its output stream - so a caller assigning the result
+# gets the entire build transcript rather than a path. Callers derive the directory instead.
 function Invoke-Deploy($ver) {
     $webui    = Join-Path $root "open-webui-$($ver.openWebUI)"
     $venv     = Join-Path $webui '.venv'
@@ -336,7 +354,13 @@ function Invoke-Deploy($ver) {
         # The CUDA toolkit version is baked into the asset name and changes between releases,
         # so read it off the release rather than guessing; $VER.cuda is only the offline fallback.
         $rel = Get-GitHubRelease 'ggml-org/llama.cpp' $ver.llamaCpp
-        $pat = if ($hasGpu) { '-bin-win-cuda-.*-x64\.zip$' } else { '-bin-win-cpu-x64\.zip$' }
+        # Anchored on the leading `llama-`, and this is load-bearing: the release also carries
+        # `cudart-llama-bin-win-cuda-12.4-x64.zip`, which an unanchored pattern matches first
+        # because the cudart assets sort ahead of the binaries. The result was that a clean install
+        # downloaded cudart twice (373 MB each), never fetched the 235 MB binaries at all, and
+        # ended up with no llama-server.exe - so nothing could run, after a 25-minute install.
+        # The prism installer below already got this right with a -notmatch '^cudart'.
+        $pat = if ($hasGpu) { '^llama-.*-bin-win-cuda-.*-x64\.zip$' } else { '^llama-.*-bin-win-cpu-x64\.zip$' }
         $url = $null
         if ($rel) { $url = ($rel.assets | Where-Object { $_.name -match $pat } | Select-Object -First 1).browser_download_url }
         if (-not $url) {
@@ -423,8 +447,18 @@ function Invoke-Deploy($ver) {
         Push-Location $webui
         & $npmCmd install
         if ($LASTEXITCODE -ne 0) { Pop-Location; throw "npm install failed" }
+        # vite/rollup peaked at 3.8 GB building this frontend and died on `node`'s default
+        # old-space cap of roughly 4 GB: "FATAL ERROR: Ineffective mark-compacts near heap limit".
+        # Found by deploying a clean clone on a 16 GB machine - it failed at the last step of a
+        # 25-minute install, which is the worst possible place for a first run to break. The cap is
+        # a v8 default, not a memory shortage: there were 7 GB free at the time. Set for this
+        # process only, so nothing else on the machine inherits it.
+        $oldNodeOpts = $env:NODE_OPTIONS
+        $env:NODE_OPTIONS = '--max-old-space-size=6144'
         & $npmCmd run build
-        if ($LASTEXITCODE -ne 0) { Pop-Location; throw "npm run build failed" }
+        $buildRc = $LASTEXITCODE
+        $env:NODE_OPTIONS = $oldNodeOpts
+        if ($buildRc -ne 0) { Pop-Location; throw "npm run build failed" }
         Pop-Location
 
         # The frontend build is static: the Python backend serves build\ and never invokes node.
@@ -463,8 +497,6 @@ function Invoke-Deploy($ver) {
 
         Set-Content -Path $envFile -Value $content
     }
-
-    $webui
 }
 
 # uv (astral-sh/uv, MIT/Apache-2.0): one static binary that installs its own CPython and resolves
@@ -1541,8 +1573,10 @@ switch ($Action) {
     }
 
     'deploy' {
-        $webui = Invoke-Deploy $target
+        Invoke-Deploy $target
         Write-Stamp $target
+        # Derived, never returned - see the note on Invoke-Deploy.
+        $webui = Join-Path $root "open-webui-$($target.openWebUI)"
         # Honour -Component here too: provisioning still covers everything, but a caller who only
         # wants the router running should get only the router started.
         Start-Stack $webui $Component
@@ -1611,8 +1645,9 @@ switch ($Action) {
             Remove-Item (Join-Path $oldWebui 'build') -Recurse -Force -ErrorAction SilentlyContinue
         }
 
-        $webui = Invoke-Deploy $target
+        Invoke-Deploy $target
         Write-Stamp $target
+        $webui = Join-Path $root "open-webui-$($target.openWebUI)"
 
         # Only now that the new tree built and booted-ready is the old one disposable.
         if ($webuiChanged -and $oldWebui -and $oldWebui -ne $webui -and (Test-Path $oldWebui)) {
