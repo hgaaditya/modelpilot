@@ -37,7 +37,8 @@ you'll do everything from here on.
 ### 3. Press the **Start** button
 
 This is the bit that installs everything: the engine that runs the models, the router that loads
-them on demand, and the chat page. It's about **1.5 GB** and takes a few minutes on a normal
+them on demand, and the chat page. It downloads about **850 MB** and unpacks to roughly **4 GB**
+on disk, most of which is the chat UI's Python dependencies. Budget **20-30 minutes** on a normal
 connection. You only ever do this once.
 
 You don't need Python, Node, Docker, WSL, or a package manager. If they're missing, it fetches its
@@ -96,7 +97,7 @@ you, and it measures rather than guesses.
 - **An NVIDIA GPU is strongly recommended.** The installer picks a CUDA build when it finds one and
   falls back to CPU-only otherwise, which works but is slow. 8 GB of VRAM runs a useful model;
   12 GB runs a good one.
-- **Disk:** about 3 GB for the stack, plus model weights (2–20 GB each).
+- **Disk:** about 4 GB for the stack once installed, plus model weights (2-20 GB each).
 - **Nothing needs to be preinstalled.** No Python, no Node, no Docker, no WSL, no package manager,
   no admin rights. Python arrives as a private copy inside the install folder (via
   [uv](https://github.com/astral-sh/uv)), Node is fetched the same way and deleted once the

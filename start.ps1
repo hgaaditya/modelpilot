@@ -430,10 +430,26 @@ function Invoke-Deploy($ver) {
         Write-Host "Installing backend dependencies (127 packages, several GB with torch) ..."
         & $uvExe pip install --python $venvPy -r (Join-Path $webui 'backend\requirements.txt')
         if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
+
+        # uv's wheel cache measured 2,189 MB on a clean install here - every one of those wheels
+        # is already unpacked into .venv, so it is the same dead weight the frontend build's
+        # node_modules was, and it was being kept for the life of the install. Same trade as that
+        # deletion: an upgrade re-downloads, which it would have had to do anyway.
+        if (-not $KeepBuildDeps) {
+            $cache = $env:UV_CACHE_DIR
+            if ($cache -and (Test-Path $cache)) {
+                $mb = [int]((Get-ChildItem $cache -Recurse -File -ErrorAction SilentlyContinue |
+                             Measure-Object Length -Sum).Sum / 1MB)
+                Write-Host "Removing uv's wheel cache ($mb MB) - the venv already holds everything it unpacked."
+                Remove-Item $cache -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     # --- 6. isolated Node (open-webui .npmrc has engine-strict=true, pins <=22.x) ---
-    if (-not (Test-Path $nodeExe)) {
+    # Only needed to build the frontend, and step 7 deletes it again once the build exists - so
+    # without the build guard every later deploy re-downloaded 34 MB of Node it would never use.
+    if (-not (Test-Path (Join-Path $webui 'build')) -and -not (Test-Path $nodeExe)) {
         New-Item -ItemType Directory -Force -Path $nodeRoot | Out-Null
         Write-Host "Fetching Node.js $($ver.node) (isolated - your global Node install is untouched)..."
         $nodeZip = Join-Path $dl "node-$($ver.node)-win-x64.zip"
