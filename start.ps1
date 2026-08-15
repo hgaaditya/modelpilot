@@ -114,7 +114,7 @@ $ErrorActionPreference = 'Stop'
 # Bump these and run `-Action upgrade` to move the stack forward deterministically.
 $VER = @{
     llamaCpp  = 'b10155'
-    llamaSwap = 'v244'
+    llamaSwap = 'v250'
     openWebUI = '0.11.0'      # open-webui pins requires-python <3.13 and node <=22.x
     node      = 'v22.23.1'
     cuda      = 'cuda-13.3'   # only a fallback - the exact CUDA asset is resolved from the release
@@ -668,7 +668,7 @@ function Wait-Healthy($label, $url, $proc, $logFiles, $timeoutSec) {
     throw "$label failed its health check."
 }
 
-function Start-Stack($webui, $component = 'all') {
+function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
     if (Test-ComponentRunning $component) {
         $what = if ($component -eq 'all') { 'Stack' } else { $component }
         Write-Host "$what is already running - use '-Action restart' to bounce it, or '-Action stop' to stop it."
@@ -713,7 +713,11 @@ function Start-Stack($webui, $component = 'all') {
         # not close - the health check timed out mid-migration and rolled back a launch that was
         # working perfectly, which reads as a broken install at the end of a 25-minute setup.
         # Every later boot has the db and the weights already, so it keeps the tighter budget.
-        $webuiFirstBoot = -not (Test-Path (Join-Path $webui 'backend\data\webui.db'))
+        # A boot is slow when either the database has to be built or the tree is new - an upgrade
+        # copies the database into a freshly built venv, so 'the db exists' alone says nothing.
+        # Measured: that upgrade boot took 86 of the 180 seconds, which passes here and would not
+        # on a slower disk. $freshTree is what the caller knows and this function cannot.
+        $webuiFirstBoot = $freshTree -or -not (Test-Path (Join-Path $webui 'backend\data\webui.db'))
         if ($webuiFirstBoot) { Write-Host "  (first boot: migrating the database and fetching embedding weights - this one takes a few minutes)" }
         Write-Host "Starting open-webui on :$webuiPort ..."
         $webuiProc = Start-Process -FilePath (Join-Path $webui '.venv\Scripts\python.exe') `
@@ -1055,7 +1059,15 @@ function Invoke-Autotune {
     # 25% and turned a hand-measured 20480 into 12288 for no reason a measurement supported.
     $ctxLadder = if ($Ctx) { @($Ctx) } else {
         $fit = Get-FittedContext $Gguf $Kv
-        if (-not $fit) { $fit = 16384 }
+        # llama-fit-params prints `-c 0` when the whole trained window fits, and `-not 0` is true
+        # in PowerShell - so that answer was being read as no answer, and the ladder started from
+        # a flat 16384. It only ever steps *down*, so the starting rung is a ceiling: measured on
+        # qwen2.5-0.5b it settled at -c 16384 with 10,625 MiB still free, and Tune in the panel
+        # would therefore have cut a model that add-model had correctly set to 32768.
+        if ($null -eq $fit -or $fit -le 0) {
+            $trained = try { (Get-GgufInfo -Path $Gguf).TrainCtx } catch { 0 }
+            $fit = if ($trained -gt 0) { $trained } else { 16384 }
+        }
         Write-Host "ctx   : llama-fit-params suggests $fit; trying that first, stepping down if headroom is short"
         @(1.0, 0.75, 0.5, 0.35) | ForEach-Object { [int]([math]::Floor($fit * $_ / 1024) * 1024) } |
             Where-Object { $_ -ge 2048 } | Select-Object -Unique
@@ -1597,13 +1609,14 @@ switch ($Action) {
     }
 
     'deploy' {
+        $freshWebuiTree = -not (Test-Path (Join-Path $root "open-webui-$($target.openWebUI)"))
         Invoke-Deploy $target
         Write-Stamp $target
         # Derived, never returned - see the note on Invoke-Deploy.
         $webui = Join-Path $root "open-webui-$($target.openWebUI)"
         # Honour -Component here too: provisioning still covers everything, but a caller who only
         # wants the router running should get only the router started.
-        Start-Stack $webui $Component
+        Start-Stack $webui $Component $freshWebuiTree
     }
 
     'upgrade' {
@@ -1680,7 +1693,7 @@ switch ($Action) {
             Move-Item $oldWebui $keep -Force
         }
 
-        Start-Stack $webui
+        Start-Stack $webui 'all' $webuiChanged
     }
 
     'uninstall' {
