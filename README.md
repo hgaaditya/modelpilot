@@ -146,9 +146,21 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Model 'u
 ```
 
 `-Action` also takes `stop`, `restart`, `status`, `upgrade`, `autotune`, `bench`, `check-config`,
-`check-ui`, `suggest`, `install-llmfit`, `install-prism` and `uninstall`. `-Action status` shows what's
-installed against what's pinned; `-Action check-config` validates your model config before you
-restart anything.
+`check-ui`, `suggest`, `install-llmfit`, `install-prism`, `autostart` and `uninstall`. `-Action status`
+shows what's installed against what's pinned; `-Action check-config` validates your model config
+before you restart anything.
+
+To have the stack come back by itself after a restart, tick **Start the stack when I log in** in
+Settings, or:
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action autostart
+```
+
+That drops a shortcut in your Startup folder — so it needs no admin rights, and you can switch it
+off again in Task Manager > Startup apps like any other startup item. It starts llama-swap, the
+chat UI and the tray indicator; the control panel stays on demand. `-Action autostart -Remove`
+undoes it, and `uninstall` removes it for you.
 
 ## Using the models from other tools
 

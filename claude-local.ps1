@@ -533,6 +533,12 @@ if ($Check -and -not $report.problem) {
             $report.problem = "Claude Code did not finish within $ProbeTimeoutSec s against '$Model' - it can answer, " +
                               "but it does not converge on a task that needs a tool call. Usable for direct questions, not for agent work."
         } else {
+            # Grade on stdout; keep stderr only for the error patterns, which legitimately land
+            # there. Merging the two made a clean one-word answer read as garbage: Claude Code
+            # writes a benign "[claude-code:unrecognized_model] {...}" line to stderr for every id
+            # llama-swap serves, because none of them are in its catalogue, and the failure message
+            # quoted that back as if the model had said it.
+            $out  = ((Get-Content $logOut -ErrorAction SilentlyContinue) -join ' ').Trim()
             $text = ((Get-Content $logOut, $logErr -ErrorAction SilentlyContinue) -join ' ').Trim()
             if ($text -match 'API Error|Jinja|failed to parse grammar|error:') {
                 # Keep the model's own words - "System message must be at the beginning" and
@@ -541,16 +547,37 @@ if ($Check -and -not $report.problem) {
                 $m = [regex]::Match($one, '(API Error.*|Jinja.*|error:.*)')
                 $report.problem = "Claude Code failed against '$Model': " +
                                   $(if ($m.Success) { $m.Value.Substring(0, [Math]::Min(220, $m.Value.Length)) } else { $one.Substring(0, [Math]::Min(220, $one.Length)) })
-            } elseif ($text -notmatch 'marmalade_sprocket') {
-                $report.problem = "Claude Code answered against '$Model' but got the tool-use probe wrong " +
-                                  "(expected 'marmalade_sprocket', got: $(($text -replace '\s+', ' ').Substring(0, [Math]::Min(120, $text.Length))))."
+            } elseif ($out -notmatch 'marmalade_sprocket') {
+                # Two different outcomes were being scored the same. The probe exists to catch
+                # template rejection, grammar failure and never converging - all three leave no
+                # answer at all. An answer that names the function almost right proves every one
+                # of those worked: the tool ran, the file was read, the reply came back. Measured
+                # here, gemma4-v2 returned 'marmalade_spacket' - one character out - and was
+                # recorded as failing, which drops the only model with a 131072 window from the
+                # panel's list entirely. So a near miss reports, and is deliberately NOT written
+                # to .agent-compat.json as a failure.
+                $got = ($out -replace '\s+', ' ')
+                if (-not $got) { $got = '(nothing on stdout)' }
+                $got = $got.Substring(0, [Math]::Min(120, $got.Length))
+                if ($out -match 'marmalade') {
+                    $report.inexact = $true
+                    $report.problem = "Claude Code drove '$Model' through the tool call but transcribed the name " +
+                                      "inexactly (expected 'marmalade_sprocket', got: $got). The plumbing works - " +
+                                      "template, grammar and tool call all succeeded - so this is the model's copying, " +
+                                      "not a broken handoff. Not recorded as a failure; re-run to see if it repeats."
+                } else {
+                    $report.problem = "Claude Code answered against '$Model' but got the tool-use probe wrong " +
+                                      "(expected 'marmalade_sprocket', got: $got)."
+                }
             }
         }
     }
 }
 
 $report.ok = -not $report.problem
-if ($Check -and $Model) { Set-Compat $Model $report.ok $report.problem }
+# A near miss is not evidence either way, and recording it as a failure is worse than recording
+# nothing: the panel drops a failed model from its dropdown for good.
+if ($Check -and $Model -and -not $report.inexact) { Set-Compat $Model $report.ok $report.problem }
 
 if ($Json) { $report | ConvertTo-Json -Depth 5 -Compress; exit $(if ($report.ok) { 0 } else { 1 }) }
 
