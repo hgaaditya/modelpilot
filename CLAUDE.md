@@ -35,7 +35,7 @@ models:
     ttl: 600   # seconds idle before auto-unload
 ```
 
-- The `llama-server` macro at the top already carries `--host 127.0.0.1 --port ${PORT} -fa on -ngl 99 -np 1 --context-shift` (flash attention, full GPU offload, one slot, sliding context). Don't repeat those flags per-model.
+- The `llama-server` macro at the top already carries `--host 127.0.0.1 --port ${PORT} -fa on -np 1 --context-shift` (flash attention, one slot, sliding context). Don't repeat those flags per-model. `-ngl` is deliberately **not** in the macro: pinning it at 99 forces every layer onto the GPU, which for a model that doesn't fit is an impossible placement rather than an instruction. This build defaults to `auto` and fits what the card holds; a model wanting a specific split sets `-ngl` or `--n-cpu-moe` in its own `cmd` (which is what `-Action autotune` measures and writes).
 - `--context-shift` matters: it defaults to **disabled** in this llama.cpp build, and without it `llama-server` hard-errors the moment a conversation exceeds `-c` instead of dropping the oldest tokens. That surfaces in a client as "context limit exceeded" a few messages into a session. It's a safety net, not the fix — the client should prune first, which it can only do if it knows the budget (`contextLength` in continue.dev, and the equivalent in open-webui) and that budget matches the model's `-c` here.
 - `${PORT}` is assigned automatically by llama-swap per model instance — never hardcode a port in a model's `cmd`.
 - MoE models can use `--n-cpu-moe <N>` to offload N expert layers to CPU (see the `scout-moe` entry) when VRAM is tight.
