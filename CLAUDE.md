@@ -117,6 +117,8 @@ Same script, `-Action`:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action stop
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action restart
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action autostart          # start at logon
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action autostart -Remove
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action tray
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action status -Latest
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action upgrade
@@ -170,7 +172,12 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
   | duplicate model id | YAML keeps the last, so the earlier entry silently does nothing — including one you just edited |
 
   It **warns and never blocks**, including on the launch path. An entry whose weights or engine aren't installed yet is a legitimate state, and refusing to start over one bad entry would take the other nine models down with it. The panel shows the engine half of this as `engine missing` in the Models table.
-- **status** — installed vs. pinned versions; `-Latest` adds the newest upstream release of each component (GitHub releases API + nodejs.org dist index).
+- **autostart** — write a `LocalLLM.lnk` into the user's Startup folder so the stack comes back at logon; `-Remove` takes it away. Deliberately a Startup shortcut rather than a scheduled task or a service: no admin, nothing to migrate on upgrade, and it appears in **Task Manager > Startup apps**, which is where people already go to turn a startup item off. It launches `start.ps1` (which brings the tray up with it), **not** the control panel — the panel is on demand, and what's missed after an unplanned reboot is a stack that answers on its ports. Re-running it while the stack is already up is safe: `Start-Stack`'s own double-launch guard refuses rather than spawning a second llama-swap.
+
+  A `.lnk` that exists can still be switched off in Task Manager, which records that in `HKCU\...\Explorer\StartupApproved\StartupFolder` and leaves the file alone — so `Test-Path` on its own would report autostart as on for a machine where it will never run. `-Action status` reads both and says `set, but switched off in Task Manager > Startup apps` for that case. `uninstall` deletes the shortcut; left behind it runs a deleted `start.ps1` at every logon.
+
+  This matters more here than on a healthy box: `.\diagnose.ps1` records 40 unexpected shutdowns, five of them after the 2026-08-11 stability fix, and nothing brought the stack back on its own.
+- **status** — installed vs. pinned versions; `-Latest` adds the newest upstream release of each component (GitHub releases API + nodejs.org dist index). Also reports whether autostart is set.
 - **upgrade** — moves to the versions in the `$VER` table at the top of `start.ps1`, or to the newest upstream releases with `-Latest`. Stops the stack, deletes only the artifacts whose version actually changed, re-runs the deploy steps, relaunches. `llama.cpp\models\` and `llamaswap\config.yaml` are never touched. An open-webui version bump lands in a new `open-webui-<ver>\` directory with `backend\data\` (the `webui.db` holding users/chats/settings) and `.env` (holding `WEBUI_SECRET_KEY`) copied over; the previous directory is parked as `_old-open-webui-<ver>\` rather than deleted, so delete it manually once the upgrade is confirmed good.
 - **uninstall** — prints exactly what it will delete, then requires typing `yes` (`-Force` skips). Removes binaries, the open-webui tree, logs, the version stamp and the download cache. Keeps `.gguf` weights unless `-IncludeModels` is passed, and always keeps `start.ps1`, `CLAUDE.md`, `llamaswap\config.yaml`.
 
@@ -222,6 +229,11 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
 - `-Install`, and the **Settings → Desktop integration** button that calls the same
   `Install-Shortcuts`, write a desktop and start-menu `.lnk`. The panel exists so that nothing
   requires opening a terminal; a Settings tab that tells you to run a PowerShell command defeats it.
+  The same fieldset's **Start the stack when I log in** tick box is `-Action autostart` behind
+  `/api/autostart`, which reads state on every visit to the tab rather than remembering it — the
+  shortcut can be deleted in Explorer or switched off in Task Manager without this page hearing
+  about it. `-Install` used to *print* a `schtasks` command for the user to run by hand, which is
+  exactly the friction this rule is about, and it pointed at the panel rather than the stack.
 - **`127.0.0.1`, never `localhost`.** Not interchangeable on Windows: `localhost` can resolve to
   `::1` first, and llama-swap and open-webui bind IPv4 only. This repo's own logs carry
   `dial tcp [::1]:5800 ... actively refused` from exactly that mismatch. Keep the literal IP in

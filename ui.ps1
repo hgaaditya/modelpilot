@@ -181,11 +181,8 @@ function Install-Shortcuts {
 
 if ($Install) {
     Install-Shortcuts | ForEach-Object { Write-Host "shortcut -> $_" }
-    $target = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $argline = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     Write-Host ""
-    Write-Host "Start with Windows (run once):"
-    Write-Host "  schtasks /Create /TN LocalLLM /TR `"$target $argline`" /SC ONLOGON /F"
+    Write-Host "Start the stack at logon:  .\start.ps1 -Action autostart   (or the tick box in Settings)"
     return
 }
 
@@ -890,6 +887,9 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
   <div class="row"><button class="gh" onclick="mkLnk()">Create desktop &amp; start-menu shortcut</button>
    <span id="lnk" style="color:var(--dim);font-size:11px"></span></div>
   <div class="hint" style="margin-top:8px">Otherwise the panel is opened by double-clicking <code>LocalLLM.cmd</code> in the install folder.</div>
+  <div class="row" style="margin-top:10px"><label><input type="checkbox" id="autost" onchange="setAuto(this.checked)"> Start the stack when I log in</label>
+   <span id="autoss" style="color:var(--dim);font-size:11px"></span></div>
+  <div class="hint">Brings llama-swap, the chat UI and the tray indicator back on their own after a restart or a crash. The panel itself stays on demand.</div>
  </fieldset>
 </div>
 </main>
@@ -987,7 +987,10 @@ function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
  monRun(i===4);
- if(i===3)agents()}
+ if(i===3)agents();
+ // Read the real state when the tab comes up rather than tracking it: the shortcut can be
+ // removed in Explorer or switched off in Task Manager without this page hearing about it.
+ if(i===6)auto()}
 // ---- coding agents
 let AG={};
 function pdir(){return document.getElementById('pdir').value.trim()}
@@ -1209,6 +1212,14 @@ async function inspect(){
  }catch(e){document.getElementById('insp').innerHTML='<div class="hint miss">'+e+'</div>'}
  delete PEND['inspect'];activity([]);
 }
+async function auto(set){
+ const box=document.getElementById('autost'), note=document.getElementById('autoss');
+ if(set!==undefined) note.textContent='working...';
+ try{const d=await (await fetch('/api/autostart',{method:'POST',body:JSON.stringify(set===undefined?{}:{set:set})})).json();
+  box.checked=!!d.on; note.textContent=(set===undefined)?'':(d.on?'on':'off');
+ }catch(e){note.textContent=''+e}
+}
+const setAuto=v=>auto(v);
 async function mkLnk(){
  document.getElementById('lnk').textContent='working...';
  try{const d=await (await fetch('/api/shortcuts',{method:'POST'})).json();
@@ -1705,6 +1716,24 @@ try {
                 '^/api/shortcuts$' {
                     # Fast enough to run inline - it writes two .lnk files and nothing else.
                     $body = @{ ok = $true; paths = @(Install-Shortcuts) } | ConvertTo-Json -Compress
+                }
+                '^/api/autostart$' {
+                    # POST with no 'set' reads; with one it writes. The write goes through
+                    # start.ps1 rather than dropping a second .lnk-writing implementation here -
+                    # uninstall has to delete that file, and only the CLI half is told about it.
+                    # That costs a spawn inside the request: /api/ping measured 830 ms while a
+                    # set was in flight. Deliberate, and the exception to the rule above rather
+                    # than an oversight - this is one click, not a poll, and the alternatives are
+                    # a duplicate .lnk writer that can drift from the CLI's, or answering with the
+                    # state we intended instead of the one on disk. The read costs nothing.
+                    $p = Read-Body $req
+                    if ($null -ne $p.set) {
+                        $a2 = @('-Action', 'autostart') + $(if (-not $p.set) { @('-Remove') } else { @() })
+                        Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList (
+                            @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $a2)
+                    }
+                    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'LocalLLM.lnk'
+                    $body = @{ ok = $true; on = (Test-Path $lnk) } | ConvertTo-Json -Compress
                 }
                 '^/api/delete-model$' {
                     $p = Read-Body $req

@@ -28,7 +28,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -39,8 +39,8 @@ param(
     [switch]$NoTray,
 
     # stop/restart: act on one half of the stack only. 'swap' also takes down the llama-server
-    # processes it spawned. Restarting 'swap' alone is how a newly added model becomes routable,
-    # since llama-swap only reads config.yaml at startup.
+    # processes it spawned. This is for a wedged router, not for config edits - llama-swap runs
+    # with -watch-config and picks those up within a couple of seconds without a restart.
     [ValidateSet('all', 'swap', 'webui')]
     [string]$Component = 'all',
 
@@ -102,6 +102,9 @@ param(
     # deploy: keep node_modules and the private Node runtime after the frontend is built. They are
     # ~1.1 GB and are only needed to rebuild it, so they are deleted by default.
     [switch]$KeepBuildDeps,
+
+    # autostart: take the logon shortcut away instead of putting it there.
+    [switch]$Remove,
 
     # uninstall: skip the confirmation prompt.
     [switch]$Force
@@ -1133,6 +1136,48 @@ if ($Action -eq 'tray') {
     return
 }
 
+# Autostart is a shortcut in the user's Startup folder - not a scheduled task, not a service.
+# It needs no admin, survives an upgrade untouched, and appears in Task Manager > Startup apps,
+# which is where people already go to turn a startup item off. It launches the stack rather than
+# the control panel: the panel is on-demand, and the thing that is missed after an unplanned
+# reboot is a stack that answers on its ports. Start-Stack brings the tray up with it.
+function Get-StartupShortcut { Join-Path ([Environment]::GetFolderPath('Startup')) 'LocalLLM.lnk' }
+
+# A .lnk that is present can still be switched off in Task Manager, which records that in the
+# registry and leaves the file alone - so Test-Path on its own would report autostart as on for
+# a machine where it will never run.
+# ponytail: byte 0 odd = disabled is the documented shape of this value; read the whole struct
+# only if Microsoft ever gives it more meanings.
+function Test-StartupEnabled {
+    if (-not (Test-Path (Get-StartupShortcut))) { return $false }
+    $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+    $v = (Get-ItemProperty $k -Name 'LocalLLM.lnk' -ErrorAction SilentlyContinue).'LocalLLM.lnk'
+    -not ($v -and ($v[0] % 2))
+}
+
+if ($Action -eq 'autostart') {
+    $lnk = Get-StartupShortcut
+    if ($Remove) {
+        if (Test-Path $lnk) { Remove-Item $lnk -Force; Write-Host "Autostart removed ($lnk)." }
+        else { Write-Host 'Autostart was not set.' }
+        return
+    }
+    $ws = New-Object -ComObject WScript.Shell
+    $s = $ws.CreateShortcut($lnk)
+    $s.TargetPath       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $s.Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $s.WorkingDirectory = $root
+    $s.Description      = 'Start the LocalLLM stack at logon'
+    $s.IconLocation     = "$env:SystemRoot\System32\shell32.dll,15"
+    $s.Save()
+    Write-Host "Autostart set -> $lnk"
+    if (-not (Test-StartupEnabled)) {
+        Write-Warning "The shortcut is there but Windows has it switched off - re-enable LocalLLM under Task Manager > Startup apps."
+    }
+    Write-Host "The stack, and its tray indicator, will start at logon. Undo with '-Action autostart -Remove'."
+    return
+}
+
 if ($Action -eq 'install-llmfit') {
     # llmfit is a single 24 MB exe, MIT-licensed, and answers a question nothing else here does:
     # which model to get in the first place. Separate from deploy because the stack works fine
@@ -1622,6 +1667,7 @@ switch ($Action) {
         Write-Host "prism fork:     $(if (Test-Path (Join-Path $llamaPrism 'llama-server.exe')) { "installed ($llamaPrism)" } else { "not installed (-Action install-prism)" })"
         Write-Host "llama-swap:     $(if (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe')) { 'installed' } else { 'missing' })"
         Write-Host "running:        $((@(Get-Process -Name llama-swap, llama-server -ErrorAction SilentlyContinue)).Count) llama process(es)"
+        Write-Host "autostart:      $(if (Test-Path (Get-StartupShortcut)) { if (Test-StartupEnabled) { 'on' } else { 'set, but switched off in Task Manager > Startup apps' } } else { 'off (-Action autostart)' })"
         if (-not $Latest) { Write-Host "`n(add -Latest to also show newest upstream releases)" }
     }
 
@@ -1720,6 +1766,7 @@ switch ($Action) {
         if (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe')) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
         Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
+        if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
         if (Test-Path $logDir)    { $targets += $logDir }
         if (Test-Path $stampFile) { $targets += $stampFile }
         if (Test-Path $dl)        { $targets += $dl }
@@ -1760,6 +1807,8 @@ switch ($Action) {
         Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like 'open-webui-*' -or $_.Name -like '_old-open-webui-*' } |
             Remove-Item -Recurse -Force
+        # Left behind, this runs a deleted start.ps1 at every logon.
+        Remove-Item (Get-StartupShortcut) -Force -ErrorAction SilentlyContinue
         Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $stampFile -Force -ErrorAction SilentlyContinue
         Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
