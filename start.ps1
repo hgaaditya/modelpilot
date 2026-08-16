@@ -1607,14 +1607,14 @@ switch ($Action) {
     'status' {
         $latestVer = if ($Latest) { $target } else { $null }
         Write-Host ""
-        Write-Host ("{0,-12} {1,-14} {2,-14} {3}" -f 'component', 'installed', 'pinned', 'latest')
+        Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f 'component', 'installed', 'pinned', 'latest')
         foreach ($k in 'llamaCpp', 'llamaSwap', 'openWebUI', 'node') {
             $inst = if ($installed -and $installed.ContainsKey($k)) { $installed[$k] } else { '(unstamped)' }
             $lat  = if ($latestVer) { $latestVer[$k] } else { '-' }
-            Write-Host ("{0,-12} {1,-14} {2,-14} {3}" -f $k, $inst, $VER[$k], $lat)
+            Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f $k, $inst, $VER[$k], $lat)
         }
         $pi = if ($installed -and $installed.ContainsKey('prism')) { $installed['prism'] } else { '(not installed)' }
-        Write-Host ("{0,-12} {1,-14} {2,-14} {3}" -f 'prism fork', $pi, $VER['prism'], '-')
+        Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f 'prism fork', $pi, $VER['prism'], '-')
         $wd = Find-WebuiDir
         Write-Host ""
         Write-Host "open-webui dir: $(if ($wd) { $wd } else { '(none)' })"
