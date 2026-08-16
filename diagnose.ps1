@@ -164,10 +164,59 @@ Get-PhysicalDisk -ErrorAction SilentlyContinue | ForEach-Object {
 }
 $c = Get-PSDrive C
 Add-Line ("  C: {0:N0} GB free of {1:N0} GB" -f ($c.Free/1GB), (($c.Free + $c.Used)/1GB))
+# SMART. Both routes to it - Get-StorageReliabilityCounter and the root\wmi failure-prediction
+# classes - are admin-only and fail with "Access to a CIM resource was not available" otherwise.
+# Unelevated they return an object with every field empty, which prints as a clean bill of health
+# for a drive nothing was ever read from. So the report says which of the two it is; a blank row
+# here would be the most dangerous line in the file.
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Add-Line "  SMART: not read - needs an elevated shell. Re-run from an admin PowerShell for"
+    Add-Line "         wear, power-on hours and uncorrected read/write errors per drive."
+} else {
+    $predict = @{}
+    Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue |
+        ForEach-Object { $predict[$_.InstanceName] = $_.PredictFailure }
+    foreach ($d in Get-PhysicalDisk -ErrorAction SilentlyContinue) {
+        $c = $d | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+        if (-not $c) { Add-Line ("  SMART {0,-24} unavailable (the drive reports no counters)" -f $d.FriendlyName); continue }
+        Add-Line ("  SMART {0,-24} wear {1} | {2} h | uncorrected read {3} write {4} | {5} C" -f
+            $d.FriendlyName,
+            $(if ($null -ne $c.Wear) { "$($c.Wear)%" } else { 'n/a' }),
+            $(if ($null -ne $c.PowerOnHours) { $c.PowerOnHours } else { 'n/a' }),
+            $(if ($null -ne $c.ReadErrorsUncorrected) { $c.ReadErrorsUncorrected } else { 'n/a' }),
+            $(if ($null -ne $c.WriteErrorsUncorrected) { $c.WriteErrorsUncorrected } else { 'n/a' }),
+            $(if ($null -ne $c.Temperature) { $c.Temperature } else { 'n/a' }))
+    }
+    $failing = @($predict.GetEnumerator() | Where-Object { $_.Value })
+    if ($failing) {
+        Add-Line "  SMART FAILURE PREDICTED on: $(($failing | ForEach-Object { $_.Key }) -join ', ')"
+        Add-Line "  -> back up now; a drive saying this is the whole diagnosis."
+    } elseif ($predict.Count) {
+        Add-Line "  SMART failure prediction: none of $($predict.Count) drive(s) reporting a problem"
+    }
+}
+
 $diskErr = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='disk','stornvme','storahci','Ntfs'} -MaxEvents 20 -ErrorAction SilentlyContinue |
     Where-Object { $_.LevelDisplayName -in 'Error','Warning' })
 Add-Line "  disk/NTFS errors or warnings logged: $($diskErr.Count)"
 $diskErr | Select-Object -First 6 | ForEach-Object { Add-Line ("    {0} id={1} {2}" -f $_.TimeCreated, $_.Id, (($_.Message -split "`n")[0].Trim())) }
+
+# When they started matters more than what the last six say, and a tail hides it. Measured here:
+# all 16 controller resets in a 41-day log fall on two days, none before the day the BIOS settings
+# were changed - which a six-line tail showed as "recent disk errors" and nothing more. The log's
+# own start date is printed too, because "none before X" means nothing without knowing whether
+# the log reaches back past X.
+# Its own query, uncapped: $diskErr is the last 20 events for the tail above, and counting a
+# 41-day total out of a 20-event window would quietly understate it on any busier machine.
+$resets = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='disk','stornvme','storahci'; Id=129} -ErrorAction SilentlyContinue)
+if ($resets.Count -gt 1) {
+    $oldestLog = (Get-WinEvent -LogName System -MaxEvents 1 -Oldest -ErrorAction SilentlyContinue).TimeCreated
+    Add-Line ("    -> {0} controller resets between {1:yyyy-MM-dd} and {2:yyyy-MM-dd}; System log starts {3:yyyy-MM-dd}" -f
+        $resets.Count, $resets[-1].TimeCreated, $resets[0].TimeCreated, $oldestLog)
+    $days = @($resets | ForEach-Object { $_.TimeCreated.ToString('yyyy-MM-dd') } | Sort-Object -Unique)
+    Add-Line ("    -> on {0} distinct day(s): {1}" -f $days.Count, ($days -join ', '))
+}
 
 Add-Section "GPU"
 $smi = nvidia-smi --query-gpu=name,driver_version,temperature.gpu,power.draw,power.limit,clocks.sm,clocks.max.sm,memory.used --format=csv,noheader 2>$null
@@ -206,7 +255,9 @@ Add-Line @'
        day. If crashes stop, suspect power delivery, not the GPU itself.
 
   4. STORAGE  (0x133 is often a stalled storage driver)
-     - "chkdsk C: /scan" and check SMART with CrystalDiskInfo.
+     - Re-run this script from an ADMIN PowerShell: SMART wear, power-on hours and
+       uncorrected errors need elevation, and are blank above without it.
+     - "chkdsk C: /scan"; CrystalDiskInfo if you want the vendor attributes too.
      - Both drives here are budget brands; a failing boot NVMe can hang a cold boot and
        stall DPCs.
 
