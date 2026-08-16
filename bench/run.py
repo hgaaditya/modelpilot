@@ -249,7 +249,7 @@ def run_one(base, model, task, timeout):
     # bonsai-27b and qwen3-14b "failure" in the first full run was exactly this.
     if not text.strip() and used >= budget:
         return {"skipped": True, "ok": False,
-                "note": "ran out of tokens while reasoning (raise max_tokens)",
+                "note": "no answer within %d tokens - all of it went to reasoning" % budget,
                 "gen_tps": round(t.get("predicted_per_second", 0), 1),
                 "prompt_tps": round(t.get("prompt_per_second", 0), 1),
                 "completion_tokens": used, "empty": True}
