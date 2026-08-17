@@ -143,12 +143,12 @@ $uvDir        = Join-Path $root 'uv'          # provides Python; nothing is inst
 $llmfitDir    = Join-Path $root 'llmfit'
 $llmfitExe    = Join-Path $llmfitDir 'llmfit.exe'
 $llamaSwapDir = Join-Path $root 'llamaswap'
-# Windows ships bsdtar at this exact path since 1809, and it understands C:\... paths. A bare
-# `tar` does not resolve to it if Git for Windows' usr\bin is ahead on PATH - GNU tar reads
-# "C:\LocalLLM" as host:path and dies with "Cannot connect to C: resolve failed", which killed a
-# clean rebuild at the open-webui step. Same rule this repo already applies to 127.0.0.1 over
-# localhost: name the thing you mean instead of letting resolution order pick for you.
-$tarExe       = Join-Path $env:SystemRoot 'System32\tar.exe'
+
+# Everything that differs between Windows and macOS lives in platform.ps1 and nowhere else - see
+# the header there for why that rule is enforced in CI rather than trusted.
+. (Join-Path $PSScriptRoot 'platform.ps1')
+Assert-SupportedPlatform
+$tarExe       = Get-TarExe
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
 $logDir       = Join-Path $root 'logs'
@@ -282,15 +282,9 @@ function Resolve-Latest($ver) {
 
 # open-webui's backend: only the python.exe running out of our own venv, never a user's other
 # interpreter. Both Stop-Stack and Test-ComponentRunning key off this.
-function Get-WebuiProcess {
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }
-}
+function Get-WebuiProcess { Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $root }
 
-function Get-TrayProcess {
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -match 'tray\.ps1' }
-}
+function Get-TrayProcess { Get-ProcessByCommandLine 'tray\.ps1' }
 
 # The tray script self-deduplicates via a named mutex, so firing this off unconditionally is safe.
 function Start-Tray {
@@ -371,7 +365,7 @@ function Invoke-Deploy($ver) {
     # --- 1. llama.cpp binaries ---
     if (-not (Test-Path (Join-Path $llamaCpp 'llama-server.exe'))) {
         New-Item -ItemType Directory -Force -Path $llamaCpp | Out-Null
-        $hasGpu = [bool](Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+        $hasGpu = (Get-AcceleratorInfo).Present
         Write-Host "Fetching llama.cpp $($ver.llamaCpp) ($(if ($hasGpu) { 'CUDA' } else { 'CPU' }))..."
 
         # The CUDA toolkit version is baked into the asset name and changes between releases,
@@ -1020,7 +1014,7 @@ function Test-ModelLoad {
 
     $log = Join-Path $env:TEMP "autotune-$Port.log"
     Remove-Item $log, "$log.out" -ErrorAction SilentlyContinue
-    $baseline = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "`n")[0]
+    $baseline = (Get-AcceleratorInfo).UsedMib
 
     $a = @('-m', $Gguf, '-c', "$Ctx", '-ctk', $Kv, '-ctv', $Kv, '-fa', 'on', '-np', '1',
            '--host', '127.0.0.1', '--port', "$Port")
@@ -1039,8 +1033,8 @@ function Test-ModelLoad {
     $res = @{ Ok = $false; VramMib = 0; GenTps = 0; Why = '' }
     if ($ok) {
         Start-Sleep -Seconds 2
-        $res.VramMib = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "`n")[0]
-        $res.FreeMib = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits) -split "`n")[0]
+        $res.VramMib = (Get-AcceleratorInfo).UsedMib
+        $res.FreeMib = (Get-AcceleratorInfo).FreeMib
         try {
             $body = @{ model = 'x'; messages = @(@{ role = 'user'; content = 'Count to five.' }); max_tokens = 64 } | ConvertTo-Json -Depth 5
             $r = Invoke-RestMethod "http://127.0.0.1:$Port/v1/chat/completions" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 180
@@ -1070,7 +1064,7 @@ function Invoke-Autotune {
         if (Test-Path $prism) { $exe = $prism }
     }
 
-    $total = [int]((nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits) -split "`n")[0]
+    $total = (Get-AcceleratorInfo).TotalMib
     Write-Host ""
     Write-Host "model : $(Split-Path $Gguf -Leaf)  ($('{0:N1}' -f $sizeGb) GB)"
     Write-Host "arch  : $($info.Arch), $($info.Blocks) blocks, $(if ($info.Experts -gt 0) { "MoE $($info.Experts)e/$($info.ExpertsUsed)a" } else { 'dense' })"
@@ -1148,8 +1142,7 @@ if ($Action -eq 'stop') { Stop-Stack $Component; return }
 # A named mutex keeps the tray to one instance, so firing this at an already-running tray
 # does nothing - and it used to report that it had started one anyway.
 if ($Action -eq 'tray') {
-    $already = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.CommandLine -like "*tray.ps1*" }).Count
+    $already = @(Get-TrayProcess).Count
     Start-Tray
     if ($already) { Write-Host 'Tray indicator was already running (one instance only).' }
     else { Write-Host 'Tray indicator started (look in the notification area).' }
@@ -1161,38 +1154,25 @@ if ($Action -eq 'tray') {
 # which is where people already go to turn a startup item off. It launches the stack rather than
 # the control panel: the panel is on-demand, and the thing that is missed after an unplanned
 # reboot is a stack that answers on its ports. Start-Stack brings the tray up with it.
-function Get-StartupShortcut { Join-Path ([Environment]::GetFolderPath('Startup')) 'LocalLLM.lnk' }
+function Get-StartupShortcut { Get-AutostartPath }
 
 # A .lnk that is present can still be switched off in Task Manager, which records that in the
 # registry and leaves the file alone - so Test-Path on its own would report autostart as on for
 # a machine where it will never run.
 # ponytail: byte 0 odd = disabled is the documented shape of this value; read the whole struct
 # only if Microsoft ever gives it more meanings.
-function Test-StartupEnabled {
-    if (-not (Test-Path (Get-StartupShortcut))) { return $false }
-    $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
-    $v = (Get-ItemProperty $k -Name 'LocalLLM.lnk' -ErrorAction SilentlyContinue).'LocalLLM.lnk'
-    -not ($v -and ($v[0] % 2))
-}
+function Test-StartupEnabled { Test-AutostartEnabled }
 
 if ($Action -eq 'autostart') {
-    $lnk = Get-StartupShortcut
     if ($Remove) {
-        if (Test-Path $lnk) { Remove-Item $lnk -Force; Write-Host "Autostart removed ($lnk)." }
+        if (Disable-Autostart) { Write-Host "Autostart removed ($(Get-AutostartPath))." }
         else { Write-Host 'Autostart was not set.' }
         return
     }
-    $ws = New-Object -ComObject WScript.Shell
-    $s = $ws.CreateShortcut($lnk)
-    $s.TargetPath       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $s.Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    $s.WorkingDirectory = $root
-    $s.Description      = 'Start the LocalLLM stack at logon'
-    $s.IconLocation     = "$env:SystemRoot\System32\shell32.dll,15"
-    $s.Save()
+    $lnk = Enable-Autostart $PSCommandPath $root
     Write-Host "Autostart set -> $lnk"
-    if (-not (Test-StartupEnabled)) {
-        Write-Warning "The shortcut is there but Windows has it switched off - re-enable LocalLLM under Task Manager > Startup apps."
+    if (-not (Test-AutostartEnabled)) {
+        Write-Warning "It is written but the system has it switched off - re-enable LocalLLM under Task Manager > Startup apps (Windows) or System Settings > General > Login Items (macOS)."
     }
     Write-Host "The stack, and its tray indicator, will start at logon. Undo with '-Action autostart -Remove'."
     return
@@ -1475,10 +1455,10 @@ if ($Action -eq 'inspect') {
     $spec = Resolve-ModelSpec $Model
 
     $vramMib = 0
-    try { $vramMib = [int]((nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits) -split "`n")[0] } catch { }
+    try { $vramMib = (Get-AcceleratorInfo).TotalMib } catch { }
     $freeMib = 0
-    try { $freeMib = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits) -split "`n")[0] } catch { }
-    $ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+    try { $freeMib = (Get-AcceleratorInfo).FreeMib } catch { }
+    $ramGb = Get-SystemMemoryGb
     Write-Host "`nthis machine: $vramMib MiB VRAM ($freeMib MiB free now), $ramGb GB system RAM`n"
 
     $targets = if ($spec.Repo) {
