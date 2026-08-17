@@ -143,6 +143,12 @@ $uvDir        = Join-Path $root 'uv'          # provides Python; nothing is inst
 $llmfitDir    = Join-Path $root 'llmfit'
 $llmfitExe    = Join-Path $llmfitDir 'llmfit.exe'
 $llamaSwapDir = Join-Path $root 'llamaswap'
+# Windows ships bsdtar at this exact path since 1809, and it understands C:\... paths. A bare
+# `tar` does not resolve to it if Git for Windows' usr\bin is ahead on PATH - GNU tar reads
+# "C:\LocalLLM" as host:path and dies with "Cannot connect to C: resolve failed", which killed a
+# clean rebuild at the open-webui step. Same rule this repo already applies to 127.0.0.1 over
+# localhost: name the thing you mean instead of letting resolution order pick for you.
+$tarExe       = Join-Path $env:SystemRoot 'System32\tar.exe'
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
 $logDir       = Join-Path $root 'logs'
@@ -222,6 +228,20 @@ function Read-Stamp {
 
 function Write-Stamp($ver) {
     $ver | ConvertTo-Json | Set-Content -Path $stampFile -Encoding utf8
+}
+
+# Deploy provisions llama.cpp, llama-swap, open-webui, node and uv. It does NOT install the prism
+# fork or llmfit - those are separate opt-in actions that stamp their own key when they run. So
+# stamping the whole $VER table recorded both as installed on a machine where neither existed, and
+# `-Action status` then printed a prism version in the installed column next to a directory that
+# was not there - while its own prose line two rows down correctly said "not installed". Merge
+# over whatever is already recorded instead, leaving the opt-in keys to their own installers.
+$DEPLOY_STAMPS_NOT = @('prism', 'llmfit')
+function New-DeployStamp($target) {
+    $s = Read-Stamp
+    if (-not $s) { $s = @{} }
+    foreach ($k in $target.Keys) { if ($k -notin $DEPLOY_STAMPS_NOT) { $s[$k] = $target[$k] } }
+    $s
 }
 
 # Existing open-webui checkout, whatever version it is (the dir name carries the version).
@@ -344,7 +364,7 @@ function Invoke-Deploy($ver) {
         Write-Host "Fetching open-webui v$($ver.openWebUI) source..."
         $owuiTar = Join-Path $dl "open-webui-v$($ver.openWebUI).tar.gz"
         Get-File "https://github.com/open-webui/open-webui/archive/refs/tags/v$($ver.openWebUI).tar.gz" $owuiTar
-        tar -xzf $owuiTar -C $root
+        & $tarExe -xzf $owuiTar -C $root
         if (-not (Test-Path $webui)) { throw "Extracted open-webui archive but $webui was not created - check the tarball's root folder name." }
     }
 
@@ -1658,7 +1678,10 @@ switch ($Action) {
             $lat  = if ($latestVer) { $latestVer[$k] } else { '-' }
             Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f $k, $inst, $VER[$k], $lat)
         }
-        $pi = if ($installed -and $installed.ContainsKey('prism')) { $installed['prism'] } else { '(not installed)' }
+        # Disk wins over the stamp here. Any stamp written before the fix above still claims a
+        # prism version, and a version number next to a missing directory is the more convincing
+        # of the two answers.
+        $pi = if ((Test-Path (Join-Path $llamaPrism 'llama-server.exe')) -and $installed -and $installed.ContainsKey('prism')) { $installed['prism'] } else { '(not installed)' }
         Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f 'prism fork', $pi, $VER['prism'], '-')
         $wd = Find-WebuiDir
         Write-Host ""
@@ -1674,7 +1697,7 @@ switch ($Action) {
     'deploy' {
         $freshWebuiTree = -not (Test-Path (Join-Path $root "open-webui-$($target.openWebUI)"))
         Invoke-Deploy $target
-        Write-Stamp $target
+        Write-Stamp (New-DeployStamp $target)
         # Derived, never returned - see the note on Invoke-Deploy.
         $webui = Join-Path $root "open-webui-$($target.openWebUI)"
         # Honour -Component here too: provisioning still covers everything, but a caller who only
@@ -1723,7 +1746,7 @@ switch ($Action) {
                 New-Item -ItemType Directory -Force -Path $dl | Out-Null
                 $tarPath = Join-Path $dl "open-webui-v$($target.openWebUI).tar.gz"
                 Get-File "https://github.com/open-webui/open-webui/archive/refs/tags/v$($target.openWebUI).tar.gz" $tarPath
-                tar -xzf $tarPath -C $root
+                & $tarExe -xzf $tarPath -C $root
                 if (-not (Test-Path $newWebui)) { throw "Extracted open-webui archive but $newWebui was not created." }
             }
             # backend/data holds webui.db (users, chats, settings); .env holds WEBUI_SECRET_KEY -
@@ -1746,7 +1769,7 @@ switch ($Action) {
         }
 
         Invoke-Deploy $target
-        Write-Stamp $target
+        Write-Stamp (New-DeployStamp $target)
         $webui = Join-Path $root "open-webui-$($target.openWebUI)"
 
         # Only now that the new tree built and booted-ready is the old one disposable.
@@ -1767,6 +1790,13 @@ switch ($Action) {
         Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
+        # llmfit is 23 MB this script downloaded and installed, and it survived a full uninstall
+        # silently - the same shape as uv and .python before it. .agent-compat.json goes too: it
+        # records which models Claude Code drove successfully *against this build*, and keeping it
+        # past a wipe lets a fresh install inherit a verdict about binaries that no longer exist.
+        if (Test-Path $llmfitDir) { $targets += $llmfitDir }
+        $compat = Join-Path $root '.agent-compat.json'
+        if (Test-Path $compat) { $targets += $compat }
         if (Test-Path $logDir)    { $targets += $logDir }
         if (Test-Path $stampFile) { $targets += $stampFile }
         if (Test-Path $dl)        { $targets += $dl }
@@ -1809,6 +1839,8 @@ switch ($Action) {
             Remove-Item -Recurse -Force
         # Left behind, this runs a deleted start.ps1 at every logon.
         Remove-Item (Get-StartupShortcut) -Force -ErrorAction SilentlyContinue
+        Remove-Item $llmfitDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $root '.agent-compat.json') -Force -ErrorAction SilentlyContinue
         Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $stampFile -Force -ErrorAction SilentlyContinue
         Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
