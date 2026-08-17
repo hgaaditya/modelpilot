@@ -85,6 +85,25 @@ downloaded, 4,103 MB on disk** excluding `.gguf` files - the figure the README n
 is after the `.uv-cache` prune reclaims 2.2 GB. Re-run that rebuild before a release; nothing else
 exercises these paths.
 
+**Run again 2026-08-17, and it found three more.** The gate keeps paying, and all three were
+invisible on this machine five minutes earlier:
+
+| what broke | why it never showed up here |
+| --- | --- |
+| `tar -xzf ... -C $root` resolved to Git for Windows' **GNU** tar when its `usr\bin` is ahead on PATH, which reads `C:\LocalLLM` as `host:path` and fails with `Cannot connect to C: resolve failed` - the open-webui extract died and the deploy stopped | `open-webui-0.11.0\` already existed, so the extract was skipped; and from Explorer or a plain PowerShell the bare name resolves to `System32\tar.exe`, which handles the path fine. Now called by absolute path |
+| `llmfit\` (23 MB) survived `-Action uninstall` entirely - no target entry, no delete | same as the `uv`/`.python` row above: nobody had uninstalled and then looked, and `install-llmfit` is opt-in so most installs don't have it |
+| deploy wrote `Write-Stamp $target`, the **whole** `$VER` table - including `prism` and `llmfit`, which deploy never installs. A fresh rebuild reported `prism fork  prism-b9599-9ca265a` in status's *installed* column with no `llama.cpp-prism\` on disk | the stamp is only written by deploy/upgrade, and on this box prism genuinely was installed every time anyone looked. Its own prose line two rows down said "not installed" - the table and the prose disagreed and nobody read both |
+
+That last one is the one to remember: **the version stamp is what `upgrade` uses to decide which
+artifacts are stale**, so a stamp claiming a component is installed is not a cosmetic error. Deploy
+now merges only the keys it provisions, and the status table checks disk before believing the
+stamp - every stamp written before this fix still carries the wrong claim.
+
+This run measured **8m54s from wipe to both services healthy**, against the 20 minutes above; the
+open-webui tarball was already in the download cache from the failed first attempt, and nothing
+else was. Verified afterwards with a real completion rather than `/health`, per the v250 lesson
+below: `gemma4-v2` answered correctly, cold, in 24s.
+
 **llama-swap is pinned to v244 deliberately - v250 does not work here.** Bumping the pin and
 running `-Action upgrade` installed v250 cleanly and both services passed their health checks, so
 everything *looked* right. The first real completion killed it: llama-swap crashed outright, and
