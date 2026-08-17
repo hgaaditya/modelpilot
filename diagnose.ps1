@@ -193,7 +193,17 @@ if (-not $isAdmin) {
         Add-Line "  SMART FAILURE PREDICTED on: $(($failing | ForEach-Object { $_.Key }) -join ', ')"
         Add-Line "  -> back up now; a drive saying this is the whole diagnosis."
     } elseif ($predict.Count) {
-        Add-Line "  SMART failure prediction: none of $($predict.Count) drive(s) reporting a problem"
+        # "none reporting a problem" reads as an all-clear, and on this box it covered 1 of 2
+        # drives - the missing one being the NVMe under suspicion. A drive that answers nothing
+        # has not been cleared, it has declined to say, and those are opposite conclusions. The
+        # failure-prediction classes are keyed by an instance name that does not map cleanly onto
+        # FriendlyName, so this compares counts rather than trying to match them up.
+        $diskCount = @(Get-PhysicalDisk -ErrorAction SilentlyContinue).Count
+        Add-Line "  SMART failure prediction: none of $($predict.Count) reporting drive(s) shows a problem"
+        if ($diskCount -gt $predict.Count) {
+            Add-Line "  -> but $($diskCount - $predict.Count) of $diskCount drive(s) report no prediction data at all."
+            Add-Line "     Silence is not a clean bill of health - check that one with the vendor's own tool."
+        }
     }
 }
 
