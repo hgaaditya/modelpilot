@@ -1678,10 +1678,16 @@ switch ($Action) {
             $lat  = if ($latestVer) { $latestVer[$k] } else { '-' }
             Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f $k, $inst, $VER[$k], $lat)
         }
-        # Disk wins over the stamp here. Any stamp written before the fix above still claims a
-        # prism version, and a version number next to a missing directory is the more convincing
-        # of the two answers.
-        $pi = if ((Test-Path (Join-Path $llamaPrism 'llama-server.exe')) -and $installed -and $installed.ContainsKey('prism')) { $installed['prism'] } else { '(not installed)' }
+        # Disk decides whether it is installed; the stamp only supplies the version string. Both
+        # halves are needed and each covers a real state: a stamp written before the fix above
+        # claims a prism version with no directory on disk, and a stamp written *after* it has no
+        # prism key at all even when the fork is installed, because only -Action install-prism
+        # records that. Reading either one alone put the table and the prose line four rows below
+        # into disagreement - in opposite directions.
+        $prismOnDisk = Test-Path (Join-Path $llamaPrism 'llama-server.exe')
+        $pi = if (-not $prismOnDisk) { '(not installed)' }
+              elseif ($installed -and $installed.ContainsKey('prism')) { $installed['prism'] }
+              else { 'installed (unstamped)' }
         Write-Host ("{0,-12} {1,-21} {2,-21} {3}" -f 'prism fork', $pi, $VER['prism'], '-')
         $wd = Find-WebuiDir
         Write-Host ""
