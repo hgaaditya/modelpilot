@@ -346,7 +346,7 @@ function Invoke-Deploy($ver) {
     $venv     = Join-Path $webui '.venv'
     $venvPy   = Join-Path $venv 'Scripts\python.exe'
     $nodeRoot = Join-Path $webui '.node-runtime'
-    $nodeDir  = Join-Path $nodeRoot "node-$($ver.node)-win-x64"
+    $nodeDir  = Join-Path $nodeRoot (Get-NodeDirName $ver)
     $nodeExe  = Join-Path $nodeDir 'node.exe'
     $npmCmd   = Join-Path $nodeDir 'npm.cmd'
 
@@ -403,10 +403,10 @@ function Invoke-Deploy($ver) {
     if (-not (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe'))) {
         New-Item -ItemType Directory -Force -Path $llamaSwapDir | Out-Null
         Write-Host "Fetching llama-swap $($ver.llamaSwap)..."
-        $num = $ver.llamaSwap -replace '^v', ''
-        $swapZip = Join-Path $dl "llama-swap-$($ver.llamaSwap).zip"
-        Get-File "https://github.com/mostlygeek/llama-swap/releases/download/$($ver.llamaSwap)/llama-swap_${num}_windows_amd64.zip" $swapZip
-        Expand-Archive -Path $swapZip -DestinationPath $llamaSwapDir -Force
+        $swapAsset = Get-ComponentAsset 'llamaSwap' $ver $false
+        $swapZip = Join-Path $dl (Get-ArchiveName 'llamaSwap' $ver)
+        Get-File $swapAsset.Url $swapZip
+        Expand-Download $swapZip $llamaSwapDir
     }
     # config.yaml isn't downloaded - it's generated from the tracked template with this clone's path.
     Initialize-SwapConfig
@@ -469,9 +469,9 @@ function Invoke-Deploy($ver) {
     if (-not (Test-Path (Join-Path $webui 'build')) -and -not (Test-Path $nodeExe)) {
         New-Item -ItemType Directory -Force -Path $nodeRoot | Out-Null
         Write-Host "Fetching Node.js $($ver.node) (isolated - your global Node install is untouched)..."
-        $nodeZip = Join-Path $dl "node-$($ver.node)-win-x64.zip"
-        Get-File "https://nodejs.org/dist/$($ver.node)/node-$($ver.node)-win-x64.zip" $nodeZip
-        Expand-Archive -Path $nodeZip -DestinationPath $nodeRoot -Force
+        $nodeZip = Join-Path $dl (Get-ArchiveName 'node' $ver)
+        Get-File (Get-ComponentAsset 'node' $ver $false).Url $nodeZip
+        Expand-Download $nodeZip $nodeRoot
     }
 
     # --- 7. frontend build (production single-port serving) ---
@@ -542,9 +542,9 @@ function Get-Uv {
     $zip = Join-Path $dl "uv-$($VER.uv).zip"
     if (-not (Test-Path $zip)) {
         Write-Host "Fetching uv $($VER.uv) (18 MB) - it provides Python, so nothing has to be installed system-wide..."
-        Get-File "https://github.com/astral-sh/uv/releases/download/$($VER.uv)/uv-x86_64-pc-windows-msvc.zip" $zip
+        Get-File (Get-ComponentAsset 'uv' $VER $false).Url $zip
     }
-    Expand-Archive -Path $zip -DestinationPath $uvDir -Force
+    Expand-Download $zip $uvDir
     if (-not (Test-Path $exe)) { throw "uv.exe missing after extracting $zip - check the asset layout." }
     $exe
 }
@@ -1196,7 +1196,7 @@ if ($Action -eq 'install-llmfit') {
     if (-not $rel) { throw "No release '$tag' in AlexsJones/llmfit." }
     # Matched by shape, not by a name built from the tag, so a changed naming scheme fails loudly
     # here rather than 404ing on a URL we guessed.
-    $asset = $rel.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
+    $asset = $rel.assets | Where-Object { $_.name -match (Get-ComponentAsset 'llmfit' $VER $false).Pattern } | Select-Object -First 1
     if (-not $asset) {
         Write-Host "`nNo Windows x64 asset in $tag. Available:"
         $rel.assets | ForEach-Object { Write-Host "  $($_.name)" }

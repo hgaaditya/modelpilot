@@ -19,8 +19,18 @@ on:
 
 jobs:
   powershell:
-    name: PowerShell parses and lints
-    runs-on: windows-latest
+    # Both platforms parse the same scripts. The macOS leg is not decoration: this codebase has to
+    # run on Windows PowerShell 5.1 *and* pwsh 7, and the only reliable way to catch a construct
+    # that one of them rejects is to hand the file to both.
+    name: PowerShell parses and lints (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +40,6 @@ jobs:
       # open-webui-*/node_modules with hundreds of vendored .ps1 shims; a bare -Recurse lints
       # those too, which is slow and reports other people's code as this project's problems.
       - name: Parse all scripts
-        shell: powershell
         run: |
           $bad = 0
           git ls-files '*.ps1' | ForEach-Object {
@@ -47,7 +56,6 @@ jobs:
           if ($bad) { exit 1 }
 
       - name: Install PSScriptAnalyzer
-        shell: powershell
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
 
       # Advisory for now - it reports, it does not fail the build. The rule set is deliberately not
@@ -59,7 +67,6 @@ jobs:
       # this is a real gate now - a new Error fails the build, while the existing warnings are
       # printed for whoever wants to work through them.
       - name: Lint
-        shell: powershell
         run: |
           $skip = @(
               'PSAvoidUsingWriteHost',            # console tool - the output is the point
@@ -98,6 +105,41 @@ jobs:
               try { $null = $_ | ConvertFrom-Json } catch { Write-Host "::error::tasks.jsonl line $n is not valid JSON"; exit 1 }
           }
           Write-Host "$n task(s) parse"
+
+  platform-layer:
+    name: Platform calls stay in platform.ps1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The macOS port works by putting every OS difference in platform.ps1 and nothing else.
+      # That is only true for as long as it is checked: the failure this project's notes describe
+      # most often is two implementations of one behaviour drifting apart, and a Windows fix that
+      # never reaches macOS because it was written above the seam is exactly that failure.
+      #
+      # Comment lines are excluded on purpose - the rule is about where the code runs, not where
+      # it is explained. diagnose.ps1 and tray.ps1 are exempt because they are Windows-specific
+      # by nature (bugchecks, WHEA, minidumps; WinForms), not because they are allowed to drift.
+      - name: No platform-bound calls outside the layer
+        shell: bash
+        run: |
+          pat='nvidia-smi |Get-CimInstance|WScript\.Shell|System\.Windows\.Forms|-win-x64|windows_amd64|darwin_arm64|bin-macos|pc-windows-msvc|apple-darwin'
+          fail=0
+          for f in $(git ls-files '*.ps1'); do
+            case "$f" in platform.ps1|tray.ps1|diagnose.ps1) continue ;; esac
+            hits=$(grep -nE "$pat" "$f" | grep -vE '^[0-9]+: *#' | grep -vE '^[0-9]+: *//' || true)
+            if [ -n "$hits" ]; then
+              echo "$hits" | while IFS= read -r h; do
+                echo "::error file=$f::platform-bound call outside platform.ps1 -> $h"
+              done
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Move it into platform.ps1 and call it from there."
+            exit 1
+          fi
+          echo "platform layer intact"
 
   docs:
     name: Docs and links

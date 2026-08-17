@@ -26,6 +26,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root       = $PSScriptRoot
+# Platform differences live in platform.ps1 and nowhere else - see the header there.
+. (Join-Path $PSScriptRoot 'platform.ps1')
 $startPs    = Join-Path $root 'start.ps1'
 $swapCfg    = Join-Path $root 'llamaswap\config.yaml'
 $llamaCpp   = Join-Path $root 'llama.cpp'
@@ -161,23 +163,7 @@ function Find-AppBrowser {
     $null
 }
 
-function Install-Shortcuts {
-    $ws = New-Object -ComObject WScript.Shell
-    $target = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $argline = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    $made = @()
-    foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
-                       (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
-        $path = Join-Path $dir 'LocalLLM.lnk'
-        $lnk = $ws.CreateShortcut($path)
-        $lnk.TargetPath = $target; $lnk.Arguments = $argline
-        $lnk.WorkingDirectory = $root; $lnk.Description = 'LocalLLM control panel'
-        $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,15"
-        $lnk.Save()
-        $made += $path
-    }
-    $made
-}
+function Install-Shortcuts { New-DesktopLauncher $PSCommandPath $root }
 
 if ($Install) {
     Install-Shortcuts | ForEach-Object { Write-Host "shortcut -> $_" }
@@ -370,11 +356,12 @@ function Get-OrphanModels {
 }
 
 function Get-Dashboard {
-    $gpu = @{ name = 'no NVIDIA GPU'; total = 0; used = 0; free = 0; temp = 0; util = 0 }
-    try {
-        $q = (nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu --format=csv,noheader,nounits) -split ','
-        $gpu = @{ name = $q[0].Trim(); total = [int]$q[1]; used = [int]$q[2]; free = [int]$q[3]; temp = [int]$q[4]; util = [int]$q[5] }
-    } catch { }
+    $gpu = @{ name = 'no GPU detected'; total = 0; used = 0; free = 0; temp = 0; util = 0 }
+    $acc = Get-AcceleratorInfo
+    if ($acc.Present) {
+        $gpu = @{ name = $acc.Name; total = $acc.TotalMib; used = $acc.UsedMib; free = $acc.FreeMib
+                  temp = $acc.TempC; util = $acc.UtilPct }
+    }
     $loaded = $null
     try { $loaded = ((Invoke-RestMethod "http://127.0.0.1:$swapPort/running" -TimeoutSec 2).running |
                      Where-Object { $_.state -ne 'stopped' } | Select-Object -First 1).model } catch { }
@@ -382,7 +369,7 @@ function Get-Dashboard {
     # Cached for Get-Sensors, which is polled every second and must not add a second HTTP probe.
     $script:lastLoaded = $loaded
     $cfg = Get-Settings
-    $os = Get-CimInstance Win32_OperatingSystem
+    $mem = Get-SystemMemoryUsage
     @{
         # 'selected' marks what Start/Stop act on. opencode is a CLI invoked per task, not a
         # service with a lifecycle, so it is reported but never started or stopped - selectable
@@ -400,8 +387,8 @@ function Get-Dashboard {
         gpu     = $gpu
         loaded  = $loaded
         # Win32_OperatingSystem reports kilobytes, so KB -> GB is /1MB.
-        ramUsed = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
-        ramTot  = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+        ramUsed = $mem.UsedGb
+        ramTot  = $mem.TotalGb
         build   = $script:build
     }
 }
@@ -416,45 +403,9 @@ function Get-Dashboard {
 # costs roughly a tenth of a second per second. If that ever crowds out the other endpoints, the
 # fix is to sample on a timer into a variable rather than to poll faster.
 function Get-Sensors {
-    $out = [Collections.ArrayList]@()
-    # nvidia-smi prints [N/A] for anything the card or driver doesn't report - a fan curve on a
-    # passively cooled card, power draw on some laptop parts. Those stay null rather than becoming
-    # zero, which would be averaged in and read as a real measurement.
-    $n = @{}
-    try {
-        $f = 'clocks.current.graphics,clocks.current.memory,temperature.gpu,fan.speed,' +
-             'utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,' +
-             'pcie.link.gen.current,pcie.link.width.current'
-        $q = (nvidia-smi "--query-gpu=$f" --format=csv,noheader,nounits) -split ','
-        for ($i = 0; $i -lt $q.Count; $i++) {
-            $s = $q[$i].Trim()
-            $n[$i] = if ($s -match '^-?[\d.]+$') { [double]$s } else { $null }
-        }
-    } catch { }
-    if ($n.Count) {
-        $free = if ($null -ne $n[7] -and $null -ne $n[6]) { $n[7] - $n[6] } else { $null }
-        foreach ($row in @(
-            @('GPU Core Clock', $n[0], 'MHz'), @('GPU Memory Clock', $n[1], 'MHz'),
-            @('GPU Temperature', $n[2], 'C'),  @('GPU Fan Speed', $n[3], '%'),
-            @('GPU Load', $n[4], '%'),         @('Memory Controller Load', $n[5], '%'),
-            @('GPU Memory Used', $n[6], 'MB'), @('GPU Memory Free', $free, 'MB'),
-            @('Board Power Draw', $n[8], 'W'), @('Power Limit', $n[9], 'W'),
-            @('PCIe Link Gen', $n[10], ''),    @('PCIe Link Width', $n[11], 'x'))) {
-            [void]$out.Add(@{ name = $row[0]; value = $row[1]; unit = $row[2] })
-        }
-    }
-    try {
-        # NOT Win32_Processor. Measured on this box: Win32_Processor's LoadPercentage costs
-        # 1,031-1,047 ms every call, which was the entire cost of this endpoint - nvidia-smi,
-        # twelve sensors and all, is 55 ms. The Monitoring tab polls once a second, so the
-        # listener spent essentially all of its time inside WMI and every other request in the
-        # panel queued behind it. The perf-counter class answers the same question in 275 ms.
-        $cpu = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
-        [void]$out.Add(@{ name = 'CPU Load'; value = [math]::Round($cpu, 0); unit = '%' })
-        $os = Get-CimInstance Win32_OperatingSystem
-        [void]$out.Add(@{ name = 'System RAM Used'
-                          value = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1KB, 0); unit = 'MB' })
-    } catch { }
+    # The GPU/CPU/RAM rows come from the platform layer; what stays here is the part that is
+    # about this stack rather than this machine.
+    $out = [Collections.ArrayList]@(Get-SensorReadings)
     # The inference process itself, which is the number that explains the rest of the table.
     $srv = @(Get-Process -Name llama-server -ErrorAction SilentlyContinue)
     [void]$out.Add(@{ name = 'llama-server Processes'; value = $srv.Count; unit = '' })

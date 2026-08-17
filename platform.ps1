@@ -83,14 +83,23 @@ function Get-ComponentAsset($component, $ver, $hasAccelerator) {
                 $variant = if ($hasAccelerator) { 'cuda' } else { 'cpu' }
                 $pat = if ($hasAccelerator) { '^llama-.*-bin-win-cuda-.*-x64\.zip$' } else { '^llama-.*-bin-win-cpu-x64\.zip$' }
                 return @{ Pattern = $pat
+                          # Fallback only - the real asset carries the CUDA version
+                          # (bin-win-cuda-12.4-x64), which this cannot know, so the API lookup
+                          # above is what normally resolves it. Pre-existing shape, preserved.
                           Url     = "https://github.com/ggml-org/llama.cpp/releases/download/$($ver.llamaCpp)/llama-$($ver.llamaCpp)-bin-win-$variant-x64.zip"
                           Extra   = $(if ($hasAccelerator) { '^cudart-.*-x64\.zip$' } else { $null }) }
             }
-            'llamaSwap' { return @{ Pattern = 'windows_amd64\.zip$'; Url = $null; Extra = $null } }
+            'llamaSwap' { $num = $ver.llamaSwap -replace '^v', ''
+                          return @{ Pattern = 'windows_amd64\.zip$'
+                                    Url     = "https://github.com/mostlygeek/llama-swap/releases/download/$($ver.llamaSwap)/llama-swap_${num}_windows_amd64.zip"
+                                    Extra   = $null } }
             'node'      { return @{ Pattern = $null
                                     Url     = "https://nodejs.org/dist/$($ver.node)/node-$($ver.node)-win-x64.zip"
                                     Extra   = $null } }
             'llmfit'    { return @{ Pattern = 'x86_64-pc-windows-msvc\.zip$'; Url = $null; Extra = $null } }
+            'uv'        { return @{ Pattern = $null
+                                    Url     = "https://github.com/astral-sh/uv/releases/download/$($ver.uv)/uv-x86_64-pc-windows-msvc.zip"
+                                    Extra   = $null } }
         }
     }
     if ($Plat.IsMac) {
@@ -100,11 +109,17 @@ function Get-ComponentAsset($component, $ver, $hasAccelerator) {
             'llamaCpp'  { return @{ Pattern = '^llama-.*-bin-macos-arm64\.tar\.gz$'
                                     Url     = "https://github.com/ggml-org/llama.cpp/releases/download/$($ver.llamaCpp)/llama-$($ver.llamaCpp)-bin-macos-arm64.tar.gz"
                                     Extra   = $null } }
-            'llamaSwap' { return @{ Pattern = 'darwin_arm64\.tar\.gz$'; Url = $null; Extra = $null } }
+            'llamaSwap' { $num = $ver.llamaSwap -replace '^v', ''
+                          return @{ Pattern = 'darwin_arm64\.tar\.gz$'
+                                    Url     = "https://github.com/mostlygeek/llama-swap/releases/download/$($ver.llamaSwap)/llama-swap_${num}_darwin_arm64.tar.gz"
+                                    Extra   = $null } }
             'node'      { return @{ Pattern = $null
                                     Url     = "https://nodejs.org/dist/$($ver.node)/node-$($ver.node)-darwin-arm64.tar.gz"
                                     Extra   = $null } }
             'llmfit'    { return @{ Pattern = 'aarch64-apple-darwin\.tar\.gz$'; Url = $null; Extra = $null } }
+            'uv'        { return @{ Pattern = $null
+                                    Url     = "https://github.com/astral-sh/uv/releases/download/$($ver.uv)/uv-aarch64-apple-darwin.tar.gz"
+                                    Extra   = $null } }
         }
     }
     throw "No '$component' asset defined for $($Plat.Id)."
@@ -124,17 +139,19 @@ function Get-ExeSuffix { if ($Plat.IsWindows) { return '.exe' } return '' }
 # Returns @{ Present; Name; TotalMib; UsedMib; FreeMib }. FreeMib is what -Action autotune steps
 # down against, and its meaning is genuinely different per platform - see Get-MemoryBudget.
 function Get-AcceleratorInfo {
-    $info = @{ Present = $false; Name = ''; TotalMib = 0; UsedMib = 0; FreeMib = 0 }
+    $info = @{ Present = $false; Name = ''; TotalMib = 0; UsedMib = 0; FreeMib = 0; TempC = 0; UtilPct = 0 }
     if ($Plat.IsWindows) {
         if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { return $info }
-        $q = (nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv,noheader,nounits 2>$null)
+        $q = (nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu --format=csv,noheader,nounits 2>$null)
         if (-not $q) { return $info }
         $f = ($q -split "`n")[0] -split ','
-        $info.Present = $true
+        $info.Present  = $true
         $info.Name     = $f[0].Trim()
         $info.TotalMib = [int]$f[1].Trim()
         $info.UsedMib  = [int]$f[2].Trim()
         $info.FreeMib  = [int]$f[3].Trim()
+        $info.TempC    = [int]$f[4].Trim()
+        $info.UtilPct  = [int]$f[5].Trim()
         return $info
     }
     if ($Plat.IsMac) {
@@ -330,4 +347,147 @@ function Test-AutostartEnabled {
     }
     $listed = & launchctl list 2>$null | Select-String -SimpleMatch 'com.localllm.stack'
     return [bool]$listed
+}
+
+# --- sensor table ----------------------------------------------------------------------------
+# Backs the panel's Monitoring tab, which polls once a second while that tab is in front - so this
+# must stay cheap. Rows whose value is $null render as "not reported" rather than 0, which would be
+# averaged in and read as a real measurement; that distinction is why the fan speed on a passively
+# cooled card does not drag the average toward a number nobody measured.
+function Get-SensorReadings {
+    $out = [Collections.ArrayList]@()
+    if ($Plat.IsWindows) {
+        $n = @{}
+        try {
+            $f = 'clocks.current.graphics,clocks.current.memory,temperature.gpu,fan.speed,' +
+                 'utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,' +
+                 'pcie.link.gen.current,pcie.link.width.current'
+            $q = (nvidia-smi "--query-gpu=$f" --format=csv,noheader,nounits) -split ','
+            for ($i = 0; $i -lt $q.Count; $i++) {
+                $v = $q[$i].Trim()
+                $n[$i] = if ($v -match '^-?[\d.]+$') { [double]$v } else { $null }
+            }
+        } catch { }
+        if ($n.Count) {
+            $free = if ($null -ne $n[7] -and $null -ne $n[6]) { $n[7] - $n[6] } else { $null }
+            foreach ($row in @(
+                @('GPU Core Clock', $n[0], 'MHz'), @('GPU Memory Clock', $n[1], 'MHz'),
+                @('GPU Temperature', $n[2], 'C'),  @('GPU Fan Speed', $n[3], '%'),
+                @('GPU Load', $n[4], '%'),         @('Memory Controller Load', $n[5], '%'),
+                @('GPU Memory Used', $n[6], 'MB'), @('GPU Memory Free', $free, 'MB'),
+                @('Board Power Draw', $n[8], 'W'), @('Power Limit', $n[9], 'W'),
+                @('PCIe Link Gen', $n[10], ''),    @('PCIe Link Width', $n[11], 'x'))) {
+                [void]$out.Add(@{ name = $row[0]; value = $row[1]; unit = $row[2] })
+            }
+        }
+        try {
+            # NOT Win32_Processor. Measured on this box: its LoadPercentage costs 1,031-1,047 ms
+            # every call - the entire cost of this endpoint, against 55 ms for nvidia-smi and all
+            # twelve sensors. At one poll per second the listener spent essentially all its time
+            # inside WMI and every other request queued behind it. This class answers in 275 ms.
+            $cpu = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+            [void]$out.Add(@{ name = 'CPU Load'; value = [math]::Round($cpu, 0); unit = '%' })
+            $os = Get-CimInstance Win32_OperatingSystem
+            [void]$out.Add(@{ name = 'System RAM Used'
+                              value = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1KB, 0); unit = 'MB' })
+        } catch { }
+        return $out
+    }
+    # macOS. UNVERIFIED until Phase 2. Deliberately fewer rows than Windows: per-sensor GPU
+    # telemetry on Apple Silicon comes from `powermetrics`, which requires sudo, and a monitoring
+    # tab that prompts for a password every second is not a trade worth making. The table already
+    # renders missing sensors as "not reported", so a shorter list degrades honestly.
+    $acc = Get-AcceleratorInfo
+    if ($acc.Present) {
+        [void]$out.Add(@{ name = 'GPU'; value = $null; unit = ''; note = $acc.Name })
+        [void]$out.Add(@{ name = 'Metal Working Set'; value = $acc.TotalMib; unit = 'MB' })
+        [void]$out.Add(@{ name = 'Memory In Use'; value = $acc.UsedMib; unit = 'MB' })
+        [void]$out.Add(@{ name = 'Memory Free'; value = $acc.FreeMib; unit = 'MB' })
+    }
+    try {
+        # 1-minute load average as a percentage of core count - the closest cheap analogue to the
+        # Windows counter, and it needs no elevation.
+        $cores = [int](& sysctl -n hw.ncpu)
+        $la = (& sysctl -n vm.loadavg) -replace '[{}]', ''
+        $one = [double](($la.Trim() -split '\s+')[0])
+        [void]$out.Add(@{ name = 'CPU Load'; value = [math]::Round(($one / [Math]::Max(1, $cores)) * 100, 0); unit = '%' })
+    } catch { }
+    try {
+        $totalMib = [int](([int64](& sysctl -n hw.memsize)) / 1MB)
+        [void]$out.Add(@{ name = 'System RAM Used'; value = ($totalMib - (Get-AcceleratorInfo).FreeMib); unit = 'MB' })
+    } catch { }
+    return $out
+}
+
+# Physical RAM used and total, in GB, for the dashboard's one-line memory readout.
+function Get-SystemMemoryUsage {
+    if ($Plat.IsWindows) {
+        $os = Get-CimInstance Win32_OperatingSystem
+        return @{ UsedGb  = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
+                  TotalGb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1) }
+    }
+    $total = Get-SystemMemoryGb
+    $freeMib = 0
+    try {
+        $pageSize = [int](& sysctl -n hw.pagesize)
+        $freePages = 0
+        foreach ($line in (& vm_stat)) {
+            if ($line -match '^Pages (free|inactive|speculative):\s+(\d+)') { $freePages += [int64]$Matches[2] }
+        }
+        $freeMib = [int](($freePages * $pageSize) / 1MB)
+    } catch { }
+    return @{ UsedGb = [math]::Round($total - ($freeMib / 1024), 1); TotalGb = $total }
+}
+
+# Desktop / start-menu entry for the control panel. Returns the paths it wrote. The panel exists
+# so that nothing here requires opening a terminal, which is why this is a real action rather
+# than a printed command to copy.
+function New-DesktopLauncher($scriptPath, $workingDir) {
+    $made = @()
+    if ($Plat.IsWindows) {
+        $ws = New-Object -ComObject WScript.Shell
+        $target = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $argline = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+        foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
+                           (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
+            $path = Join-Path $dir 'LocalLLM.lnk'
+            $lnk = $ws.CreateShortcut($path)
+            $lnk.TargetPath = $target; $lnk.Arguments = $argline
+            $lnk.WorkingDirectory = $workingDir; $lnk.Description = 'LocalLLM control panel'
+            $lnk.IconLocation = Join-Path $env:SystemRoot 'System32\shell32.dll,15'
+            $lnk.Save()
+            $made += $path
+        }
+        return $made
+    }
+    # macOS has no .lnk. A .command file is the double-clickable equivalent and ~/Applications is
+    # the per-user location that needs no admin. UNVERIFIED until Phase 3.
+    $pwshExe = Join-Path $workingDir '.pwsh/pwsh'
+    if (-not (Test-Path $pwshExe)) { $pwshExe = 'pwsh' }
+    foreach ($dir in @((Join-Path $HOME 'Applications'), (Join-Path $HOME 'Desktop'))) {
+        if (-not (Test-Path $dir)) { continue }
+        $path = Join-Path $dir 'LocalLLM.command'
+        Set-Content -Path $path -Encoding utf8 -Value @"
+#!/bin/bash
+cd "$workingDir" || exit 1
+exec "$pwshExe" -NoProfile -File "$scriptPath" -Launch
+"@
+        & chmod +x $path
+        $made += $path
+    }
+    return $made
+}
+
+# The local filename to stage a component download under - the extension has to match what the
+# platform actually serves, because Expand-Download dispatches on it.
+function Get-ArchiveName($component, $ver) {
+    $ext = if ($Plat.IsWindows) { '.zip' } else { '.tar.gz' }
+    switch ($component) {
+        'llamaSwap' { return "llama-swap-$($ver.llamaSwap)$ext" }
+        # Deliberately the archive's own name, not $Plat.Id: it keeps the staged filename
+        # byte-identical to what earlier versions cached, so an existing download is still reused.
+        'node'      { return ((Get-NodeDirName $ver) + $ext) }
+        'uv'        { return "uv-$($ver.uv)$ext" }
+    }
+    return "$component$ext"
 }
