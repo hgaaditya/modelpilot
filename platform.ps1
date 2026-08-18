@@ -491,3 +491,48 @@ function Get-ArchiveName($component, $ver) {
     }
     return "$component$ext"
 }
+
+# --- tool layout ------------------------------------------------------------------------------
+# Same tools, different shapes on disk. Every one of these was a hardcoded Windows path before
+# the port, and each is a place a fresh install would have failed on macOS with a "file not
+# found" naming a path that looks perfectly reasonable.
+function Get-VenvPython($venvDir) {
+    if ($Plat.IsWindows) { return (Join-Path $venvDir 'Scripts\python.exe') }
+    return (Join-Path $venvDir 'bin/python')
+}
+function Get-NodeExe($nodeDir) {
+    if ($Plat.IsWindows) { return (Join-Path $nodeDir 'node.exe') }
+    return (Join-Path $nodeDir 'bin/node')
+}
+function Get-NpmCmd($nodeDir) {
+    if ($Plat.IsWindows) { return (Join-Path $nodeDir 'npm.cmd') }
+    return (Join-Path $nodeDir 'bin/npm')
+}
+# Bare tool name plus the platform suffix, so callers say what they mean and never ".exe".
+function Get-ToolName($name) { return ($name + (Get-ExeSuffix)) }
+
+# curl does the multi-GB weight downloads: it resumes, and it reports progress. Absolute path
+# for the same reason as tar - PATH order decides which binary answers, and being explicit is
+# how this project already handles that class of bug.
+function Get-CurlExe {
+    if ($Plat.IsWindows) {
+        $c = Join-Path $env:SystemRoot 'System32\curl.exe'
+        if (Test-Path $c) { return $c }
+        $c = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+        if ($c) { return $c }
+        throw "curl.exe not found - it ships with Windows 10+; install it or download the file manually."
+    }
+    if (Test-Path '/usr/bin/curl') { return '/usr/bin/curl' }
+    $c = (Get-Command curl -ErrorAction SilentlyContinue).Source
+    if ($c) { return $c }
+    throw "curl not found on PATH."
+}
+
+# The engine path inside a config.yaml cmd block. On Windows that literal ends in .exe; on
+# macOS it has no extension at all, so a pattern anchored to .exe would silently find nothing
+# and Test-SwapConfig's engine check - the one that catches a model pointed at an uninstalled
+# fork - would pass every entry by default. Match the quoted path and let the caller judge.
+function Get-EnginePathPattern {
+    if ($Plat.IsWindows) { return '"([^"]+\.exe)"' }
+    return '"([^"]+llama-server[^"]*)"'
+}

@@ -133,21 +133,24 @@ $VER = @{
     llmfit    = 'v1.1.9'
     # uv (astral-sh/uv) - replaces winget for getting Python, and pip for installing into it.
     uv        = '0.12.3'
+    # macOS only: localllm.command greps this value out of this table and fetches a
+    # self-contained pwsh into .pwsh/. Windows uses its built-in PowerShell 5.1 and ignores it.
+    pwsh      = '7.6.5'
 }
 
 $root         = $PSScriptRoot
-$llamaCpp     = Join-Path $root 'llama.cpp'
-$llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side with the stock build
-$modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
-$uvDir        = Join-Path $root 'uv'          # provides Python; nothing is installed system-wide
-$llmfitDir    = Join-Path $root 'llmfit'
-$llmfitExe    = Join-Path $llmfitDir 'llmfit.exe'
-$llamaSwapDir = Join-Path $root 'llamaswap'
 
 # Everything that differs between Windows and macOS lives in platform.ps1 and nowhere else - see
 # the header there for why that rule is enforced in CI rather than trusted.
 . (Join-Path $PSScriptRoot 'platform.ps1')
 Assert-SupportedPlatform
+$llamaCpp     = Join-Path $root 'llama.cpp'
+$llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side with the stock build
+$modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
+$uvDir        = Join-Path $root 'uv'          # provides Python; nothing is installed system-wide
+$llmfitDir    = Join-Path $root 'llmfit'
+$llmfitExe    = Join-Path $llmfitDir (Get-ToolName 'llmfit')
+$llamaSwapDir = Join-Path $root 'llamaswap'
 $tarExe       = Get-TarExe
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
@@ -201,11 +204,7 @@ function Initialize-SwapConfig {
 # a stalled job for ten minutes. The sidecar survives a failure on purpose, so a resumed download
 # still knows what it is aiming at.
 function Get-BigFile($url, $out, [long]$total = 0) {
-    $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-    if (-not (Test-Path $curl)) {
-        $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
-        if (-not $curl) { throw "curl.exe not found - it ships with Windows 10+; install it or download $url manually into $modelsDir." }
-    }
+    $curl = Get-CurlExe   # resolves and throws with a usable message if absent
     $part = "$out.part"
     @{ total = $total; url = $url; started = (Get-Date).ToString('o') } |
         ConvertTo-Json -Compress | Set-Content -Path "$part.json" -Encoding utf8
@@ -344,11 +343,11 @@ function Stop-Stack($component = 'all') {
 function Invoke-Deploy($ver) {
     $webui    = Join-Path $root "open-webui-$($ver.openWebUI)"
     $venv     = Join-Path $webui '.venv'
-    $venvPy   = Join-Path $venv 'Scripts\python.exe'
+    $venvPy   = Get-VenvPython $venv
     $nodeRoot = Join-Path $webui '.node-runtime'
     $nodeDir  = Join-Path $nodeRoot (Get-NodeDirName $ver)
-    $nodeExe  = Join-Path $nodeDir 'node.exe'
-    $npmCmd   = Join-Path $nodeDir 'npm.cmd'
+    $nodeExe  = Get-NodeExe $nodeDir
+    $npmCmd   = Get-NpmCmd $nodeDir
 
     New-Item -ItemType Directory -Force -Path $dl | Out-Null
 
@@ -363,7 +362,7 @@ function Invoke-Deploy($ver) {
     }
 
     # --- 1. llama.cpp binaries ---
-    if (-not (Test-Path (Join-Path $llamaCpp 'llama-server.exe'))) {
+    if (-not (Test-Path (Join-Path $llamaCpp (Get-ToolName 'llama-server')))) {
         New-Item -ItemType Directory -Force -Path $llamaCpp | Out-Null
         $hasGpu = (Get-AcceleratorInfo).Present
         Write-Host "Fetching llama.cpp $($ver.llamaCpp) ($(if ($hasGpu) { 'CUDA' } else { 'CPU' }))..."
@@ -400,7 +399,7 @@ function Invoke-Deploy($ver) {
     New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null
 
     # --- 2. llama-swap binary ---
-    if (-not (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe'))) {
+    if (-not (Test-Path (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')))) {
         New-Item -ItemType Directory -Force -Path $llamaSwapDir | Out-Null
         Write-Host "Fetching llama-swap $($ver.llamaSwap)..."
         $swapAsset = Get-ComponentAsset 'llamaSwap' $ver $false
@@ -536,7 +535,7 @@ function Invoke-Deploy($ver) {
 # dependencies. Fetched the same way as every other component here - pinned version, GitHub
 # release, matched by asset name - so it is one more download rather than a new kind of dependency.
 function Get-Uv {
-    $exe = Join-Path $uvDir 'uv.exe'
+    $exe = Join-Path $uvDir (Get-ToolName 'uv')
     if (Test-Path $exe) { return $exe }
     New-Item -ItemType Directory -Force -Path $uvDir, $dl | Out-Null
     $zip = Join-Path $dl "uv-$($VER.uv).zip"
@@ -562,7 +561,7 @@ function Get-SwapMacros($text) {
     # the name character class excludes, so the file's prose doesn't parse as a macro.
     foreach ($m in [regex]::Matches($block.Groups[1].Value,
                    '(?ms)^\s{2}([A-Za-z0-9_.-]+):\s*>\s*\r?$(.*?)(?=^\s{2}[A-Za-z0-9_.-]+:|\z)')) {
-        $exe = [regex]::Match($m.Groups[2].Value, '"([^"]+\.exe)"')
+        $exe = [regex]::Match($m.Groups[2].Value, (Get-EnginePathPattern))
         if ($exe.Success) { $map[$m.Groups[1].Value] = $exe.Groups[1].Value }
     }
     $map
@@ -603,7 +602,7 @@ function Test-SwapConfig {
                 $missingEngine++
             } else { $exe = $macros[$name] }
         } else {
-            $lit = [regex]::Match($chunk, '"([^"]+\.exe)"')
+            $lit = [regex]::Match($chunk, (Get-EnginePathPattern))
             if ($lit.Success) { $exe = $lit.Groups[1].Value }
         }
         if ($exe -and -not (Test-Path $exe)) {
@@ -717,7 +716,7 @@ function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
         # within 5s, logging "reloading configuration" / "configuration reloaded".
         # A model already running keeps the flags it was spawned with until it unloads - a reload
         # rewrites the routing table, it does not restart a live llama-server.
-        $swapProc = Start-Process -FilePath (Join-Path $llamaSwapDir 'llama-swap.exe') `
+        $swapProc = Start-Process -FilePath (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')) `
             -ArgumentList '--config', $swapConfig, '--listen', ":$swapPort", '-watch-config' `
             -WorkingDirectory $llamaSwapDir -NoNewWindow -PassThru `
             -RedirectStandardOutput $swapLogs[1] -RedirectStandardError $swapLogs[0]
@@ -737,7 +736,7 @@ function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
         $webuiFirstBoot = $freshTree -or -not (Test-Path (Join-Path $webui 'backend\data\webui.db'))
         if ($webuiFirstBoot) { Write-Host "  (first boot: migrating the database and fetching embedding weights - this one takes a few minutes)" }
         Write-Host "Starting open-webui on :$webuiPort ..."
-        $webuiProc = Start-Process -FilePath (Join-Path $webui '.venv\Scripts\python.exe') `
+        $webuiProc = Start-Process -FilePath (Get-VenvPython (Join-Path $webui '.venv')) `
             -ArgumentList '-m', 'uvicorn', 'open_webui.main:app', '--host', '0.0.0.0', '--port', "$webuiPort", '--forwarded-allow-ips', "'*'", '--ws', 'auto' `
             -WorkingDirectory (Join-Path $webui 'backend') -NoNewWindow -PassThru `
             -RedirectStandardOutput $webuiLogs[1] -RedirectStandardError $webuiLogs[0]
@@ -938,8 +937,8 @@ function Get-GgufInfoAt {
 # llama.cpp's own fitter: loads the model's metadata, looks at free VRAM, and prints the CLI
 # args that fit. Beats hand-measuring, and it accounts for the KV type it's told about.
 function Get-FittedContext($ggufPath, $kvType = 'q4_0') {
-    $exe = Join-Path $llamaCpp 'llama-fit-params.exe'
-    $prismExe = Join-Path $llamaPrism 'llama-fit-params.exe'
+    $exe = Join-Path $llamaCpp (Get-ToolName 'llama-fit-params')
+    $prismExe = Join-Path $llamaPrism (Get-ToolName 'llama-fit-params')
     # A low-bit model only loads on the fork, so fit it with the fork's own binary.
     if ((Test-Path $prismExe) -and -not (Test-Path $exe)) { $exe = $prismExe }
     if (-not (Test-Path $exe)) { return $null }
@@ -1058,9 +1057,9 @@ function Invoke-Autotune {
     $sizeGb = (Get-Item $Gguf).Length / 1GB
 
     # A low-bit model only loads on the fork, so probe with whichever binary can open it.
-    $exe = Join-Path $llamaCpp 'llama-server.exe'
-    if ($info.Arch -in 'qwen35' -or (Test-Path (Join-Path $llamaPrism 'llama-server.exe')) -and $info.FileType -ge 41) {
-        $prism = Join-Path $llamaPrism 'llama-server.exe'
+    $exe = Join-Path $llamaCpp (Get-ToolName 'llama-server')
+    if ($info.Arch -in 'qwen35' -or (Test-Path (Join-Path $llamaPrism (Get-ToolName 'llama-server'))) -and $info.FileType -ge 41) {
+        $prism = Join-Path $llamaPrism (Get-ToolName 'llama-server')
         if (Test-Path $prism) { $exe = $prism }
     }
 
@@ -1209,7 +1208,7 @@ if ($Action -eq 'install-llmfit') {
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     # The archive nests everything under a versioned directory, so find the exe rather than
     # assuming it sits at the root.
-    $found = Get-ChildItem $tmp -Recurse -Filter 'llmfit.exe' | Select-Object -First 1
+    $found = Get-ChildItem $tmp -Recurse -Filter (Get-ToolName 'llmfit') | Select-Object -First 1
     if (-not $found) { throw "llmfit.exe not found inside $($asset.name)." }
     Copy-Item $found.FullName $llmfitExe -Force
     Get-ChildItem $tmp -Recurse -Include 'LICENSE', 'README.md' | ForEach-Object { Copy-Item $_.FullName $llmfitDir -Force }
@@ -1315,7 +1314,7 @@ if ($Action -eq 'install-prism') {
     # Deliberately a separate action rather than part of deploy: it's ~620 MB of downloads that
     # only matters if you actually run a low-bit model, and it must never replace the stock
     # build - every other model in config.yaml depends on that one.
-    $exe = Join-Path $llamaPrism 'llama-server.exe'
+    $exe = Join-Path $llamaPrism (Get-ToolName 'llama-server')
     if ((Test-Path $exe) -and -not $Force) {
         Write-Host "$exe already present (use -Force to reinstall)."
         return
@@ -1374,7 +1373,7 @@ if ($Action -eq 'bench') {
     if (-not (Test-ComponentRunning 'swap')) { throw "llama-swap isn't running - start the stack first." }
     # Reuse the venv the deploy already built rather than depending on a machine-wide Python.
     $webui = Find-WebuiDir
-    $py = if ($webui) { Join-Path $webui '.venv\Scripts\python.exe' } else { $null }
+    $py = if ($webui) { Get-VenvPython (Join-Path $webui '.venv') } else { $null }
     if (-not ($py -and (Test-Path $py))) {
         $py = (Get-Command python -ErrorAction SilentlyContinue).Source
         if (-not $py) { throw "No Python found - deploy the stack first, or put python on PATH." }
@@ -1664,7 +1663,7 @@ switch ($Action) {
         # prism key at all even when the fork is installed, because only -Action install-prism
         # records that. Reading either one alone put the table and the prose line four rows below
         # into disagreement - in opposite directions.
-        $prismOnDisk = Test-Path (Join-Path $llamaPrism 'llama-server.exe')
+        $prismOnDisk = Test-Path (Join-Path $llamaPrism (Get-ToolName 'llama-server'))
         $pi = if (-not $prismOnDisk) { '(not installed)' }
               elseif ($installed -and $installed.ContainsKey('prism')) { $installed['prism'] }
               else { 'installed (unstamped)' }
@@ -1672,9 +1671,9 @@ switch ($Action) {
         $wd = Find-WebuiDir
         Write-Host ""
         Write-Host "open-webui dir: $(if ($wd) { $wd } else { '(none)' })"
-        Write-Host "llama-server:   $(if (Test-Path (Join-Path $llamaCpp 'llama-server.exe')) { 'installed' } else { 'missing' })"
-        Write-Host "prism fork:     $(if (Test-Path (Join-Path $llamaPrism 'llama-server.exe')) { "installed ($llamaPrism)" } else { "not installed (-Action install-prism)" })"
-        Write-Host "llama-swap:     $(if (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe')) { 'installed' } else { 'missing' })"
+        Write-Host "llama-server:   $(if (Test-Path (Join-Path $llamaCpp (Get-ToolName 'llama-server'))) { 'installed' } else { 'missing' })"
+        Write-Host "prism fork:     $(if (Test-Path (Join-Path $llamaPrism (Get-ToolName 'llama-server'))) { "installed ($llamaPrism)" } else { "not installed (-Action install-prism)" })"
+        Write-Host "llama-swap:     $(if (Test-Path (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap'))) { 'installed' } else { 'missing' })"
         Write-Host "running:        $((@(Get-Process -Name llama-swap, llama-server -ErrorAction SilentlyContinue)).Count) llama process(es)"
         Write-Host "autostart:      $(if (Test-Path (Get-StartupShortcut)) { if (Test-StartupEnabled) { 'on' } else { 'set, but switched off in Task Manager > Startup apps' } } else { 'off (-Action autostart)' })"
         if (-not $Latest) { Write-Host "`n(add -Latest to also show newest upstream releases)" }
@@ -1719,7 +1718,7 @@ switch ($Action) {
 
         if ((-not $installed) -or $installed.llamaSwap -ne $target.llamaSwap) {
             Write-Host "Removing old llama-swap binary (config.yaml kept)..."
-            Remove-Item (Join-Path $llamaSwapDir 'llama-swap.exe') -Force -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')) -Force -ErrorAction SilentlyContinue
         }
 
         $webuiChanged = (-not $installed) -or $installed.openWebUI -ne $target.openWebUI
@@ -1772,7 +1771,7 @@ switch ($Action) {
         $targets = @()
         if (Test-Path $llamaCpp)     { $targets += if ($IncludeModels) { $llamaCpp } else { "$llamaCpp (except models\)" } }
         if (Test-Path $llamaPrism)   { $targets += $llamaPrism }
-        if (Test-Path (Join-Path $llamaSwapDir 'llama-swap.exe')) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
+        if (Test-Path (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap'))) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
         Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
@@ -1819,7 +1818,7 @@ switch ($Action) {
             else { Get-ChildItem $llamaCpp -Force | Where-Object { $_.Name -ne 'models' } | Remove-Item -Recurse -Force }
         }
         Remove-Item $llamaPrism -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $llamaSwapDir 'llama-swap.exe') -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')) -Force -ErrorAction SilentlyContinue
         Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like 'open-webui-*' -or $_.Name -like '_old-open-webui-*' } |
             Remove-Item -Recurse -Force

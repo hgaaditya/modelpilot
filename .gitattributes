@@ -11,6 +11,8 @@
 # Everything cross-platform stays LF.
 *.py    text eol=lf
 *.sh    text eol=lf
+# macOS entry point. A CRLF .command fails in bash with a $'' error that names nothing.
+*.command text eol=lf
 *.yaml  text eol=lf
 *.yml   text eol=lf
 *.json  text eol=lf
