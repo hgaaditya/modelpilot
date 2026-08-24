@@ -967,7 +967,22 @@ function Set-ModelTuning($id, $ctx, $kv, $nCpuMoe) {
     $m = [regex]::Match($text, $pattern)
     if (-not $m.Success) { return $false }
 
-    $flags = "`r`n      -c $ctx -ctk $kv -ctv $kv"
+    # Everything between -m and ttl: is this group, and it used to be replaced wholesale - which
+    # threw away every flag that is not a tuning flag. --mmproj was the one that caught it: tuning
+    # a vision model silently removed its projector and it came back text-only, with the panel's
+    # Tune button as the trigger. -ngl, --chat-template, --rope-scaling and anything else
+    # hand-written had the same fate. So: strip only the four flags this function owns, keep the
+    # rest verbatim, and re-append the new values.
+    $kept = $m.Groups[2].Value
+    foreach ($f in '-c', '-ctk', '-ctv', '--n-cpu-moe') {
+        $kept = [regex]::Replace($kept, "(?m)\s*" + [regex]::Escape($f) + "\s+\S+", '')
+    }
+    # Whatever survived, minus the blank lines the removals left behind.
+    $kept = (($kept -split "`r?`n" | Where-Object { $_.Trim() }) -join "`r`n")
+
+    $flags = ""
+    if ($kept) { $flags += "`r`n" + $kept }
+    $flags += "`r`n      -c $ctx -ctk $kv -ctv $kv"
     if ($null -ne $nCpuMoe) { $flags += "`r`n      --n-cpu-moe $nCpuMoe" }
     $flags += "`r`n"
 
