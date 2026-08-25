@@ -189,8 +189,8 @@ function Initialize-SwapConfig {
     if (Test-Path $swapConfig) { return }
     if (-not (Test-Path $swapConfigTpl)) { throw "Neither $swapConfig nor $swapConfigTpl exists - the repo is incomplete." }
     New-Item -ItemType Directory -Force -Path $llamaSwapDir | Out-Null
-    $text = (Get-Content $swapConfigTpl -Raw).Replace('{{LOCALLLM_ROOT}}', $root)
-    Set-Content -Path $swapConfig -Value $text -Encoding utf8 -NoNewline
+    $text = (Read-TextFile $swapConfigTpl).Replace('{{LOCALLLM_ROOT}}', $root)
+    Write-TextFile $swapConfig $text
     Write-Host "Generated $swapConfig from config.example.yaml (paths rooted at $root)."
 }
 
@@ -577,7 +577,25 @@ function Get-SwapMacros($text) {
 # would take the other nine models down with it.
 function Test-SwapConfig {
     if (-not (Test-Path $swapConfig)) { Write-Warning "$swapConfig not found - llama-swap has no models to serve."; return }
-    $text = Get-Content $swapConfig -Raw
+    $text = Read-TextFile $swapConfig
+
+    # llama-swap refuses the whole file - "yaml: control characters are not allowed" - and exits
+    # before serving anything, so this is a hard failure rather than a per-model warning. It can
+    # happen without anyone editing a model: PowerShell 5.1's Get-Content guesses the encoding when
+    # a file has no BOM, so a UTF-8 em-dash in a comment comes back as CP1252, gets rewritten as
+    # UTF-8, and a few add-model/set-tuning passes later it is U+009D. The symptom is a stack that
+    # dies on spawn with nothing on screen mentioning encoding - exactly what this preflight exists
+    # to turn into a sentence. Read-TextFile/Write-TextFile stop it recurring; this catches a file
+    # already damaged, or hand-edited somewhere else.
+    $ctl = @([regex]::Matches($text, '[\p{Cc}\p{Cf}]') | Where-Object { $_.Value -notmatch '[
+	]' })
+    if ($ctl.Count) {
+        $line = ($text.Substring(0, $ctl[0].Index) -split "`n").Count
+        Write-Warning ("config.yaml has {0} control character(s) - llama-swap will refuse the whole file. First is U+{1:X4} on line {2}." -f
+                       $ctl.Count, [int][char]$ctl[0].Value, $line)
+        Write-Host "     Usually a mangled dash or quote in a comment. Replace that line with plain ASCII."
+    }
+
     $macros = Get-SwapMacros $text
     # Split on the model-id lines ("qwen3-14b":) so each chunk holds one model's cmd.
     $parts = [regex]::Split($text, '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
@@ -962,7 +980,7 @@ function Get-FittedContext($ggufPath, $kvType = 'q4_0') {
 # per-model options elsewhere in the file survive.
 function Set-ModelTuning($id, $ctx, $kv, $nCpuMoe) {
     if (-not (Test-Path $swapConfig)) { throw "$swapConfig not found." }
-    $text = Get-Content $swapConfig -Raw
+    $text = Read-TextFile $swapConfig
     $pattern = "(?ms)(^\s{2,}""$([regex]::Escape($id))""\s*:\s*$.*?-m\s+""[^""]+""\s*$)(.*?)(?=^\s*ttl:|^\s{2}""|\z)"
     $m = [regex]::Match($text, $pattern)
     if (-not $m.Success) { return $false }
@@ -988,13 +1006,13 @@ function Set-ModelTuning($id, $ctx, $kv, $nCpuMoe) {
 
     Copy-Item $swapConfig "$swapConfig.bak" -Force
     $updated = $text.Remove($m.Groups[2].Index, $m.Groups[2].Length).Insert($m.Groups[2].Index, $flags)
-    Set-Content -Path $swapConfig -Value $updated -Encoding utf8 -NoNewline
+    Write-TextFile $swapConfig $updated
     $true
 }
 
 function Add-ModelToConfig($id, $ggufPath, $context) {
     Initialize-SwapConfig   # add-model can be the first thing a fresh clone runs
-    $text = Get-Content $swapConfig -Raw
+    $text = Read-TextFile $swapConfig
     if ($text -match "(?m)^\s{2,}""$([regex]::Escape($id))""\s*:") {
         Write-Warning "config.yaml already has a model called '$id' - leaving it alone."
         return $false
@@ -1012,7 +1030,7 @@ function Add-ModelToConfig($id, $ggufPath, $context) {
     ttl: 600
 '@
     $block = $block.Replace('@ID@', $id).Replace('@PATH@', $ggufPath).Replace('@CTX@', "$context")
-    Set-Content -Path $swapConfig -Value ($text + $block + "`r`n") -Encoding utf8 -NoNewline
+    Write-TextFile $swapConfig ($text + $block + "`r`n")
     $true
 }
 
@@ -1412,7 +1430,7 @@ if ($Action -eq 'autotune') {
     if ($Model) {
         $gguf = if (Test-Path $Model) { (Resolve-Path $Model).Path } else { Join-Path $modelsDir $Model }
     } elseif ($Id) {
-        $text = Get-Content $swapConfig -Raw
+        $text = Read-TextFile $swapConfig
         $parts = [regex]::Split($text, '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
         for ($i = 1; $i -lt $parts.Count; $i += 2) {
             if ($parts[$i] -eq $Id) {
@@ -1640,7 +1658,7 @@ switch ($Action) {
         $moe = if ($NCpuMoe -ge 0) { $NCpuMoe } else { $null }
         if ($NCpuMoe -lt 0) {
             # Preserve whatever the entry already had rather than dropping the flag.
-            $cur = [regex]::Match((Get-Content $swapConfig -Raw),
+            $cur = [regex]::Match((Read-TextFile $swapConfig),
                    "(?ms)^\s{2,}""$([regex]::Escape($Id))""\s*:.*?(?=^\s{2}""|\z)")
             if ($cur.Success -and $cur.Value -match '--n-cpu-moe\s+(\d+)') { $moe = [int]$Matches[1] }
         }

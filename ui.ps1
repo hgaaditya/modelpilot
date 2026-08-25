@@ -1195,7 +1195,10 @@ function adv(on){document.body.classList.toggle('showadv',on);try{localStorage.s
 // Without this the panel's answer to "did my click do anything" was a disabled button and, minutes
 // later, a log tail under Activity - which is not an answer.
 const JOBS_SAY={
- deploy:['Installing the stack','Downloads the engine, the router and the chat UI - about 1.5 GB. Several minutes on a first run.'],
+ // The Start button runs -Action deploy, but on an installed machine that downloads nothing -
+ // every step is skipped and it just launches. Saying "Downloads the engine..." there was a
+ // plain lie, and it made a two-second start look like it was doing something enormous.
+ deploy:['Starting','Launches the router and the chat UI. A first run also downloads them - about 1.5 GB, several minutes.'],
  restart:['Restarting','A few seconds. The chat UI takes longer than the router.'],
  stop:['Stopping',''],
  download:['Downloading a model','Multi-GB. Safe to interrupt - it resumes where it stopped.'],

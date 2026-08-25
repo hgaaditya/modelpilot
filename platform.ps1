@@ -536,3 +536,27 @@ function Get-EnginePathPattern {
     if ($Plat.IsWindows) { return '"([^"]+\.exe)"' }
     return '"([^"]+llama-server[^"]*)"'
 }
+
+# --- text files --------------------------------------------------------------------------------
+# config.yaml is read and rewritten by add-model, set-tuning and autotune, and PowerShell's own
+# defaults corrupt it a little more on every pass:
+#
+#   * Get-Content -Raw on Windows PowerShell 5.1 guesses the encoding, and with no BOM it assumes
+#     the system codepage - so a UTF-8 em-dash comes back as three CP1252 characters.
+#   * Set-Content -Encoding utf8 then writes those back as UTF-8, with a BOM on 5.1 and without one
+#     on pwsh 7 - so the same code produces different files per platform, which matters now that
+#     macOS runs it too.
+#
+# Round-trip that a few times and the header comment's em-dash becomes U+009D, a C1 control
+# character, and llama-swap refuses the whole file: "yaml: control characters are not allowed".
+# The stack then dies on spawn, Start-Stack rolls back, and nothing on screen mentions encoding.
+# Observed here after exactly that sequence.
+#
+# So: always read and write UTF-8 explicitly, and write it without a BOM, which both PowerShell
+# editions and Go's YAML parser accept.
+function Read-TextFile($path) {
+    return [IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding $false))
+}
+function Write-TextFile($path, $text) {
+    [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))
+}
