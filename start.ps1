@@ -551,7 +551,7 @@ function Get-ResetTargets($component, [switch]$IncludeModels) {
             if (Test-Path $d) { Add-Target $d 'private Python' }
         }
     }
-    if ($all -or $component -eq 'logs')      { if (Test-Path $logDir) { Add-Target $logDir 'logs' } }
+    if ($all -or $component -eq 'logs')      { if (Test-Path $logDir) { Add-Target $logDir 'job logs deleted, live service logs emptied in place' } }
     if ($all -or $component -eq 'downloads') { if (Test-Path $dl) { Add-Target $dl 'download cache' } }
     if ($all -or $component -eq 'metadata') {
         if (Test-Path $stampFile) { Add-Target $stampFile 'version stamp' }
@@ -2075,16 +2075,16 @@ switch ($Action) {
             # bare object, and the panel iterates the result. Same trap as /api/jobs.
             if ($Json) { ConvertTo-Json -InputObject @($found) -Depth 4 -Compress; break }
             if (-not $found) { Write-Host "Nothing installed for component '$Component'."; break }
-            Write-Host "`nA reset of '$Component' would delete:"
-            $found | ForEach-Object { Write-Host ("  {0,-58} {1}" -f $_.Path, (Format-Size $_.Bytes)) }
+            Write-Host "`nA reset of '$Component' would remove:"
+            $found | ForEach-Object { Write-Host ("  {0,-58} {1,8}  {2}" -f $_.Path, (Format-Size $_.Bytes), $_.Label) }
             Write-Host ("`n  total: {0}" -f (Format-Size (($found | Measure-Object Bytes -Sum).Sum)))
             break
         }
 
         if (-not $targets) { Write-Host "Nothing installed for component '$Component' - nothing to remove."; break }
 
-        Write-Host "`nThis will permanently delete:"
-        $targets | ForEach-Object { Write-Host "  $_" }
+        Write-Host "`nThis will permanently remove:"
+        $found | ForEach-Object { Write-Host ("  {0,-58} {1,8}  {2}" -f $_.Path, (Format-Size $_.Bytes), $_.Label) }
 
         if (($Component -eq 'llama-cpp' -or $Component -eq 'all') -and -not $IncludeModels) {
             Write-Host "`nModel weights in $modelsDir are KEPT (pass -IncludeModels to delete them too)."
