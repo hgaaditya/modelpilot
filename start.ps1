@@ -1,4 +1,4 @@
-# Local LLM stack: bootstrap, launch, upgrade, uninstall.
+# Local LLM stack: bootstrap, launch, upgrade, uninstall, reset.
 #
 #   .\start.ps1                      # deploy (first run) + launch. Idempotent.
 #   .\start.ps1 -Action stop         # stop llama-swap, any llama-server, and the open-webui backend
@@ -11,6 +11,11 @@
 #   .\start.ps1 -Action tray         # (re)start just the tray status indicator
 #   .\start.ps1 -Action install-prism      # PrismML llama.cpp fork (low-bit kernels), alongside the stock build
 #   .\start.ps1 -Action uninstall    # stop + remove everything (keeps .gguf weights unless -IncludeModels)
+#   .\start.ps1 -Action reset -Component llama-cpp     # remove just llama.cpp (keeps models by default)
+#   .\start.ps1 -Action reset -Component llama-prism   # remove just the PrismML fork
+#   .\start.ps1 -Action reset -Component webui         # remove open-webui directories
+#   .\start.ps1 -Action reset -Component uv            # remove uv, Python, and uv cache
+#   .\start.ps1 -Action reset -Component logs          # clear the logs directory
 #
 # Launching verifies both services answer /health before reporting success, warns up front about
 # any model in config.yaml whose .gguf is missing, and raises a tray indicator (see tray.ps1,
@@ -28,7 +33,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -38,10 +43,11 @@ param(
     # deploy/restart: don't launch the tray status indicator.
     [switch]$NoTray,
 
-    # stop/restart: act on one half of the stack only. 'swap' also takes down the llama-server
+    # stop/restart/reset: act on one half of the stack only. 'swap' also takes down the llama-server
     # processes it spawned. This is for a wedged router, not for config edits - llama-swap runs
     # with -watch-config and picks those up within a couple of seconds without a restart.
-    [ValidateSet('all', 'swap', 'webui')]
+    # reset: supports 'all', 'swap', 'webui', 'llama-cpp', 'llama-prism', 'llmfit', 'uv', 'logs', 'downloads', 'metadata'.
+    [ValidateSet('all', 'swap', 'webui', 'llama-cpp', 'llama-prism', 'llmfit', 'uv', 'logs', 'downloads', 'metadata')]
     [string]$Component = 'all',
 
     # upgrade/status: resolve the newest upstream release of each component instead of using $VER.
@@ -83,6 +89,9 @@ param(
 
     # uninstall: also delete the multi-GB .gguf weights (kept by default - they're slow to re-fetch).
     [switch]$IncludeModels,
+
+    # reset: keep the multi-GB .gguf weights when resetting llama.cpp (kept by default).
+    [switch]$KeepModels,
 
     # suggest: narrow llmfit's recommendations. 'any' drops the filter - an empty string cannot,
     # because `-Capability ''` through `powershell -File` is a parameter with no value and fails
@@ -332,6 +341,158 @@ function Stop-Stack($component = 'all') {
     $what = if ($component -eq 'all') { 'stack' } else { $component }
     if ($stopped) { Write-Host "Stopped $stopped $what process(es)."; Start-Sleep -Seconds 1 }
     else { Write-Host "Nothing was running for '$what'." }
+}
+
+# ==========================================================================
+#  Component-level uninstall/reset functions
+# ==========================================================================
+# Each function removes a specific component and returns a list of what was deleted.
+# Designed to be called individually or composed by the main uninstall action.
+
+function Remove-LlamaCpp {
+    param([switch]$KeepModels)
+
+    $removed = @()
+    if (Test-Path $llamaCpp) {
+        if ($KeepModels) {
+            Get-ChildItem $llamaCpp -Force | Where-Object { $_.Name -ne 'models' } | ForEach-Object {
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                $removed += $_.FullName
+            }
+            if ($removed) { $removed = @("$llamaCpp (except models\)") }
+        } else {
+            Remove-Item $llamaCpp -Recurse -Force -ErrorAction SilentlyContinue
+            $removed += $llamaCpp
+        }
+    }
+    return $removed
+}
+
+function Remove-LlamaPrism {
+    $removed = @()
+    if (Test-Path $llamaPrism) {
+        Remove-Item $llamaPrism -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $llamaPrism
+    }
+    return $removed
+}
+
+function Remove-LlamaSwap {
+    $removed = @()
+    $swapExe = Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')
+    if (Test-Path $swapExe) {
+        Remove-Item $swapExe -Force -ErrorAction SilentlyContinue
+        $removed += "$llamaSwapDir\llama-swap.exe (config.yaml kept)"
+    }
+    return $removed
+}
+
+function Remove-OpenWebUI {
+    param([switch]$IncludeOldVersions)
+
+    $removed = @()
+    $pattern = if ($IncludeOldVersions) { 'open-webui-*', '_old-open-webui-*' } else { 'open-webui-*' }
+
+    foreach ($p in $pattern) {
+        Get-ChildItem $root -Directory -Filter $p -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            $removed += $_.FullName
+        }
+    }
+    return $removed
+}
+
+function Remove-Llmfit {
+    $removed = @()
+    if (Test-Path $llmfitDir) {
+        Remove-Item $llmfitDir -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $llmfitDir
+    }
+    return $removed
+}
+
+function Remove-UV {
+    $removed = @()
+    if (Test-Path $uvDir) {
+        Remove-Item $uvDir -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $uvDir
+    }
+
+    $pythonDir = Join-Path $root '.python'
+    if (Test-Path $pythonDir) {
+        Remove-Item $pythonDir -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $pythonDir
+    }
+
+    $uvCache = Join-Path $root '.uv-cache'
+    if (Test-Path $uvCache) {
+        Remove-Item $uvCache -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $uvCache
+    }
+
+    return $removed
+}
+
+function Remove-Logs {
+    $removed = @()
+    if (Test-Path $logDir) {
+        Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $logDir
+    }
+    return $removed
+}
+
+function Remove-Downloads {
+    $removed = @()
+    if (Test-Path $dl) {
+        Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $dl
+    }
+    return $removed
+}
+
+function Remove-Metadata {
+    $removed = @()
+
+    if (Test-Path $stampFile) {
+        Remove-Item $stampFile -Force -ErrorAction SilentlyContinue
+        $removed += $stampFile
+    }
+
+    $compat = Join-Path $root '.agent-compat.json'
+    if (Test-Path $compat) {
+        Remove-Item $compat -Force -ErrorAction SilentlyContinue
+        $removed += $compat
+    }
+
+    $shortcut = Get-StartupShortcut
+    if (Test-Path $shortcut) {
+        Remove-Item $shortcut -Force -ErrorAction SilentlyContinue
+        $removed += $shortcut
+    }
+
+    return $removed
+}
+
+function Remove-AllComponents {
+    param([switch]$KeepModels)
+
+    # Stop everything first
+    Stop-Stack
+    Get-TrayProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+    $allRemoved = @()
+    $allRemoved += Remove-LlamaCpp -KeepModels:$KeepModels
+    $allRemoved += Remove-LlamaPrism
+    $allRemoved += Remove-LlamaSwap
+    $allRemoved += Remove-OpenWebUI -IncludeOldVersions
+    $allRemoved += Remove-Llmfit
+    $allRemoved += Remove-UV
+    $allRemoved += Remove-Logs
+    $allRemoved += Remove-Downloads
+    $allRemoved += Remove-Metadata
+
+    return $allRemoved
 }
 
 # ==========================================================================
@@ -1800,6 +1961,91 @@ switch ($Action) {
         Start-Stack $webui 'all' $webuiChanged
     }
 
+    'reset' {
+        if ($Component -eq 'all') {
+            # Map 'all' reset to uninstall since they are semantically identical
+            $Action = 'uninstall'
+            # Fall through to the uninstall block - standard powershell switch behavior handles the case match,
+            # but we're inside 'reset' so we need to manually invoke the logic if we don't duplicate it.
+            # Easiest way in 5.1 is to just call Remove-AllComponents and print our own summary.
+        }
+
+        # First, display what is going to be deleted (Dry Run phase)
+        $targets = @()
+        if ($Component -eq 'llama-cpp' -or $Component -eq 'all') {
+            if (Test-Path $llamaCpp) { $targets += if ($IncludeModels) { $llamaCpp } else { "$llamaCpp (except models\)" } }
+        }
+        if ($Component -eq 'llama-prism' -or $Component -eq 'all') {
+            if (Test-Path $llamaPrism) { $targets += $llamaPrism }
+        }
+        if ($Component -eq 'swap' -or $Component -eq 'all') {
+            if (Test-Path (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap'))) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
+        }
+        if ($Component -eq 'webui' -or $Component -eq 'all') {
+            Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
+            Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
+        }
+        if ($Component -eq 'llmfit' -or $Component -eq 'all') {
+            if (Test-Path $llmfitDir) { $targets += $llmfitDir }
+        }
+        if ($Component -eq 'uv' -or $Component -eq 'all') {
+            if (Test-Path $uvDir) { $targets += $uvDir }
+            foreach ($d in @((Join-Path $root '.python'), (Join-Path $root '.uv-cache'))) {
+                if (Test-Path $d) { $targets += $d }
+            }
+        }
+        if ($Component -eq 'logs' -or $Component -eq 'all') {
+            if (Test-Path $logDir) { $targets += $logDir }
+        }
+        if ($Component -eq 'downloads' -or $Component -eq 'all') {
+            if (Test-Path $dl) { $targets += $dl }
+        }
+        if ($Component -eq 'metadata' -or $Component -eq 'all') {
+            if (Test-Path $stampFile) { $targets += $stampFile }
+            if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
+            $compat = Join-Path $root '.agent-compat.json'
+            if (Test-Path $compat) { $targets += $compat }
+        }
+
+        if (-not $targets) { Write-Host "Nothing installed for component '$Component' - nothing to remove."; break }
+
+        Write-Host "`nThis will permanently delete:"
+        $targets | ForEach-Object { Write-Host "  $_" }
+
+        if (($Component -eq 'llama-cpp' -or $Component -eq 'all') -and -not $IncludeModels) {
+            Write-Host "`nModel weights in $modelsDir are KEPT (pass -IncludeModels to delete them too)."
+        }
+
+        if (-not $Force) {
+            $answer = Read-Host "`nType 'yes' to proceed"
+            if ($answer -ne 'yes') { Write-Host "Aborted."; break }
+        }
+
+        # Execution phase
+        if ($Component -eq 'all') {
+            $removed = Remove-AllComponents -KeepModels:(-not $IncludeModels)
+        } else {
+            # Stop relevant services before removing
+            if ($Component -in @('all', 'swap', 'llama-cpp', 'llama-prism')) { Stop-Stack 'swap' }
+            if ($Component -in @('all', 'webui', 'uv')) { Stop-Stack 'webui' }
+
+            $removed = @()
+            switch ($Component) {
+                'llama-cpp'   { $removed = Remove-LlamaCpp -KeepModels:(-not $IncludeModels) }
+                'llama-prism' { $removed = Remove-LlamaPrism }
+                'swap'        { $removed = Remove-LlamaSwap }
+                'webui'       { $removed = Remove-OpenWebUI -IncludeOldVersions }
+                'llmfit'      { $removed = Remove-Llmfit }
+                'uv'          { $removed = Remove-UV }
+                'logs'        { $removed = Remove-Logs }
+                'downloads'   { $removed = Remove-Downloads }
+                'metadata'    { $removed = Remove-Metadata }
+            }
+        }
+
+        Write-Host "`nReset completed for component: $Component"
+    }
+
     'uninstall' {
         $targets = @()
         if (Test-Path $llamaCpp)     { $targets += if ($IncludeModels) { $llamaCpp } else { "$llamaCpp (except models\)" } }
@@ -1842,33 +2088,7 @@ switch ($Action) {
             if ($answer -ne 'yes') { Write-Host "Aborted."; break }
         }
 
-        Stop-Stack
-        # Otherwise a tray dot lingers in the notification area pointing at a stack that's gone.
-        Get-TrayProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-
-        if (Test-Path $llamaCpp) {
-            if ($IncludeModels) { Remove-Item $llamaCpp -Recurse -Force }
-            else { Get-ChildItem $llamaCpp -Force | Where-Object { $_.Name -ne 'models' } | Remove-Item -Recurse -Force }
-        }
-        Remove-Item $llamaPrism -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')) -Force -ErrorAction SilentlyContinue
-        Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'open-webui-*' -or $_.Name -like '_old-open-webui-*' } |
-            Remove-Item -Recurse -Force
-        # Left behind, this runs a deleted start.ps1 at every logon.
-        Remove-Item (Get-StartupShortcut) -Force -ErrorAction SilentlyContinue
-        Remove-Item $llmfitDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $root '.agent-compat.json') -Force -ErrorAction SilentlyContinue
-        Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item $stampFile -Force -ErrorAction SilentlyContinue
-        Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
-        # These three are printed in the "will permanently delete" list above and were never
-        # actually deleted - a fresh uninstall left uv.exe and its siblings sitting there, 47 MB
-        # of a tool the user was told had been removed. An uninstaller that overstates what it
-        # removed is worse than one that removes less and says so.
-        Remove-Item $uvDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $root '.python') -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $root '.uv-cache') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-AllComponents -KeepModels:(-not $IncludeModels) | Out-Null
 
         Write-Host "`nUninstalled. Re-run '.\start.ps1' to rebuild from scratch."
     }
