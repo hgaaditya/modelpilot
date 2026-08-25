@@ -842,6 +842,26 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
    <span id="autoss" style="color:var(--dim);font-size:11px"></span></div>
   <div class="hint">Brings llama-swap, the chat UI and the tray indicator back on their own after a restart or a crash. The panel itself stays on demand.</div>
  </fieldset>
+ <fieldset><legend>Remove parts of the install</legend>
+  <div class="hint" style="margin-bottom:8px">Each of these can be reinstalled by pressing Start again. Model weights are never deleted unless you tick the box.</div>
+  <div class="row" style="gap:8px;flex-wrap:wrap">
+   <select id="rstc">
+    <option value="llama-cpp">Engine (llama.cpp)</option>
+    <option value="llama-prism">PrismML fork</option>
+    <option value="swap">Model router binary</option>
+    <option value="webui">Chat UI, with its chats and settings</option>
+    <option value="llmfit">Model picker (llmfit)</option>
+    <option value="uv">Private Python</option>
+    <option value="downloads">Download cache</option>
+    <option value="logs">Logs</option>
+    <option value="metadata">Version stamp, agent verdicts, logon shortcut</option>
+    <option value="all">Everything (full uninstall)</option>
+   </select>
+   <button class="gh" onclick="rstShow()">Show what this removes</button>
+   <span id="rstmsg" style="color:var(--dim);font-size:11px"></span>
+  </div>
+  <div id="rstout" style="margin-top:10px"></div>
+ </fieldset>
 </div>
 </main>
 <div id="act"><div id="acth"><span id="actt">Working</span><button onclick="actHide()" title="hide">&times;</button></div><div id="actb"></div></div>
@@ -1163,6 +1183,64 @@ async function inspect(){
  }catch(e){document.getElementById('insp').innerHTML='<div class="hint miss">'+e+'</div>'}
  delete PEND['inspect'];activity([]);
 }
+// Destructive, so it is deliberately two steps: this only ever asks the server what would go, and
+// the delete needs a separate confirmation naming the size. Nothing here deletes on first click.
+let RSTPOLL=0;
+async function rstShow(){
+ const comp=document.getElementById('rstc').value;
+ const inc=comp==='llama-cpp'||comp==='all' ? !!document.getElementById('rstim')?.checked : false;
+ document.getElementById('rstmsg').textContent='working out what that removes...';
+ document.getElementById('rstout').innerHTML='';
+ clearTimeout(RSTPOLL);
+ await post('/api/reset',{component:comp,includeModels:inc,run:1});
+ const poll=async()=>{
+  let d; try{d=await (await post('/api/reset',{component:comp,includeModels:inc})).json()}catch(e){return}
+  if(d.running){RSTPOLL=setTimeout(poll,700);return}
+  rstRender(comp,inc,d.targets||[]);
+ };
+ RSTPOLL=setTimeout(poll,700);
+}
+function rstRender(comp,inc,t){
+ document.getElementById('rstmsg').textContent='';
+ const out=document.getElementById('rstout');
+ if(!t.length){out.innerHTML='<div class="hint">Nothing of that is installed.</div>';return}
+ const tot=t.reduce((a,x)=>a+(x.Bytes||0),0);
+ let h='<table style="width:100%;font-size:12px"><tbody>';
+ for(const x of t) h+='<tr><td style="padding:2px 8px 2px 0">'+esc(x.Label||'')+'</td>'
+   +'<td style="color:var(--dim);word-break:break-all">'+esc(x.Path)+'</td>'
+   +'<td style="text-align:right;white-space:nowrap">'+fmtB(x.Bytes||0)+'</td></tr>';
+ h+='</tbody></table>';
+ h+='<div class="row" style="margin-top:8px;gap:8px">';
+ if(comp==='llama-cpp'||comp==='all')
+   h+='<label style="font-size:12px"><input type="checkbox" id="rstim" '+(inc?'checked':'')+' onchange="rstShow()"> also delete model weights</label>';
+ h+='<button class="act" id="rstgo" style="background:#b3261e">Delete '+fmtB(tot)+'</button></div>';
+ out.innerHTML=h;
+ // Wired here rather than as an inline onclick: the whole page is a PowerShell here-string,
+ // so a quote inside an attribute is one escaping layer away from a dead button.
+ const go=document.getElementById('rstgo');
+ if(go) go.onclick=()=>rstGo(comp,inc,tot);
+}
+function fmtB(b){
+ if(b>=1073741824)return (b/1073741824).toFixed(1)+' GB';
+ if(b>=1048576)return Math.round(b/1048576)+' MB';
+ if(b>=1024)return Math.round(b/1024)+' KB';
+ return b+' B';
+}
+async function rstGo(comp,inc,tot){
+ const what=comp==='all'?'the whole install':'"'+comp+'"';
+ // ask() escapes its text into HTML, so newlines would collapse - one flowing paragraph instead.
+ // The button carries the size rather than saying OK: this repo's rule for destructive confirms.
+ let warn='This deletes '+what+', '+fmtB(tot)+'. ';
+ if(comp==='webui'||comp==='all') warn+='That includes your chat history and open-webui settings, which are not backed up anywhere. ';
+ warn+=inc?'Model weights WILL be deleted - multi-GB and slow to fetch again. ':'Model weights are kept. ';
+ warn+='Press Start afterwards to reinstall.';
+ if(!await ask(warn,{danger:true,ok:'Delete '+fmtB(tot)})) return;
+ spin('reset-'+comp,600000);
+ await post('/api/reset',{component:comp,includeModels:inc,confirm:true});
+ document.getElementById('rstout').innerHTML='';
+ document.getElementById('rstmsg').textContent='';
+ setTimeout(tick,1200);
+}
 async function auto(set){
  const box=document.getElementById('autost'), note=document.getElementById('autoss');
  if(set!==undefined) note.textContent='working...';
@@ -1198,6 +1276,7 @@ const JOBS_SAY={
  // The Start button runs -Action deploy, but on an installed machine that downloads nothing -
  // every step is skipped and it just launches. Saying "Downloads the engine..." there was a
  // plain lie, and it made a two-second start look like it was doing something enormous.
+ reset:['Removing part of the install','Deleting files. Press Start afterwards to reinstall whatever you removed.'],
  deploy:['Starting','Launches the router and the chat UI. A first run also downloads them - about 1.5 GB, several minutes.'],
  restart:['Restarting','A few seconds. The chat UI takes longer than the router.'],
  stop:['Stopping',''],
@@ -1666,6 +1745,43 @@ try {
                     }
                     $script:verInfo = $null      # versions will have moved
                     $body = '{"ok":true}'
+                }
+                '^/api/reset$' {
+                    # Two shapes on purpose. Without 'confirm' this is a dry run: it answers what
+                    # would be deleted and how big, so the page can show the user the real list
+                    # before they agree to anything. Destructive work never happens on the same
+                    # call that renders the warning.
+                    $p = Read-Body $req
+                    $comp = "$($p.component)"
+                    if ($comp -notin 'all','swap','webui','llama-cpp','llama-prism','llmfit','uv','logs','downloads','metadata') {
+                        $res.StatusCode = 400
+                        $body = '{"error":"unknown component"}'
+                    } elseif ($p.confirm) {
+                        $a2 = @('-Action','reset','-Component',$comp,'-Force')
+                        if ($p.includeModels) { $a2 += '-IncludeModels' }
+                        Start-Job2 "reset-$comp" $a2 | Out-Null
+                        $body = '{"ok":true,"started":true}'
+                    } else {
+                        # Sizing walks directories, so it runs as a job rather than inside the
+                        # request - open-webui alone is 3 GB of small files and this listener is
+                        # single-threaded.
+        $key = "$comp|$([bool]$p.includeModels)"
+                        if ($p.run) {
+                            $a2 = @('-Action','reset','-Component',$comp,'-DryRun','-Json')
+                            if ($p.includeModels) { $a2 += '-IncludeModels' }
+                            Start-Async 'resetdry' $key $a2
+                            $body = '{"running":true}'
+                        } else {
+                            $st = Get-Async 'resetdry' $key
+                            if (-not $st -or $st.running) { $body = '{"running":true}' }
+                            else {
+                                # -Json prints one array; anything else on stdout is noise.
+                                $line = $st.out | Where-Object { $_.TrimStart().StartsWith('[') -or $_.TrimStart().StartsWith('{') } | Select-Object -First 1
+                                if ($line) { $body = "{""running"":false,""targets"":$line}" }
+                                else { $body = '{"running":false,"targets":[]}' }
+                            }
+                        }
+                    }
                 }
                 '^/api/shortcuts$' {
                     # Fast enough to run inline - it writes two .lnk files and nothing else.

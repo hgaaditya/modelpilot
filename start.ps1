@@ -115,6 +115,10 @@ param(
     # autostart: take the logon shortcut away instead of putting it there.
     [switch]$Remove,
 
+    # reset: list what would be deleted and stop. -Json makes that machine-readable, which is how
+    # the control panel shows the user what they are about to lose before they agree to it.
+    [switch]$DryRun,
+
     # uninstall: skip the confirmation prompt.
     [switch]$Force
 )
@@ -433,11 +437,31 @@ function Remove-UV {
     return $removed
 }
 
+# Deleting logs\ outright takes services down with it. Both llama-swap and open-webui are started
+# with their stdout redirected into this directory, so the files are open handles: measured here,
+# removing the directory while the stack ran deleted open-webui's log and killed the process, while
+# llama-swap's log survived because its handle blocked the delete. Half cleared, one service dead,
+# and the reset reported success.
+#
+# So: truncate the service logs in place - which is safe on Windows, the writer's handle stays
+# valid and simply continues at offset zero - and delete only the panel's job logs, which nothing
+# holds open. Reclaims the space without touching what is running.
 function Remove-Logs {
     $removed = @()
-    if (Test-Path $logDir) {
-        Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
-        $removed += $logDir
+    if (-not (Test-Path $logDir)) { return $removed }
+
+    $jobs = Join-Path $logDir 'jobs'
+    if (Test-Path $jobs) {
+        $n = @(Get-ChildItem $jobs -File -Force -ErrorAction SilentlyContinue).Count
+        Get-ChildItem $jobs -File -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        if ($n) { $removed += "$jobs ($n job log(s))" }
+    }
+    foreach ($f in Get-ChildItem $logDir -File -Filter '*.log' -Force -ErrorAction SilentlyContinue) {
+        try {
+            $was = $f.Length
+            [IO.File]::WriteAllText($f.FullName, '')
+            if ($was) { $removed += "$($f.FullName) (emptied, $(Format-Size $was))" }
+        } catch { }
     }
     return $removed
 }
@@ -472,6 +496,70 @@ function Remove-Metadata {
     }
 
     return $removed
+}
+
+# What a reset or uninstall would delete, without deleting it. One list, used by three callers:
+# the reset dry run, the uninstall confirmation, and the panel - which has to show the user what
+# they are about to lose before they agree to it. It was written twice before this (once in each
+# action) and the two copies had already diverged: uninstall listed the startup shortcut and
+# .agent-compat.json, reset's 'all' listed them only under 'metadata'.
+#
+# Returns objects, not strings, so a caller can render size as well as path.
+function Get-ResetTargets($component, [switch]$IncludeModels) {
+    $t = @()
+    function Add-Target($path, $label) {
+        $bytes = 0
+        if (Test-Path $path) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($item.PSIsContainer) {
+                $bytes = (Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+                          Measure-Object Length -Sum).Sum
+            } else { $bytes = $item.Length }
+        }
+        $script:__t += [pscustomobject]@{ Path = $path; Label = $label; Bytes = [long]$bytes }
+    }
+    $script:__t = @()
+
+    $all = ($component -eq 'all')
+    if ($all -or $component -eq 'llama-cpp') {
+        if (Test-Path $llamaCpp) {
+            if ($IncludeModels) { Add-Target $llamaCpp 'llama.cpp (including model weights)' }
+            else {
+                # Size the engine without the weights, which are the part being kept.
+                $b = (Get-ChildItem $llamaCpp -Force -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -ne 'models' } |
+                      Get-ChildItem -Recurse -File -Force -ErrorAction SilentlyContinue |
+                      Measure-Object Length -Sum).Sum
+                $script:__t += [pscustomobject]@{ Path = "$llamaCpp (except models\)"
+                                                  Label = 'llama.cpp engine, weights kept'; Bytes = [long]$b }
+            }
+        }
+    }
+    if ($all -or $component -eq 'llama-prism') { if (Test-Path $llamaPrism) { Add-Target $llamaPrism 'PrismML fork' } }
+    if ($all -or $component -eq 'swap') {
+        $exe = Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')
+        if (Test-Path $exe) { Add-Target $exe 'llama-swap binary, config.yaml kept' }
+    }
+    if ($all -or $component -eq 'webui') {
+        Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { Add-Target $_.FullName 'open-webui (chats and settings)' }
+        Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { Add-Target $_.FullName 'parked old open-webui' }
+    }
+    if ($all -or $component -eq 'llmfit') { if (Test-Path $llmfitDir) { Add-Target $llmfitDir 'llmfit model picker' } }
+    if ($all -or $component -eq 'uv') {
+        if (Test-Path $uvDir) { Add-Target $uvDir 'uv' }
+        foreach ($d in @((Join-Path $root '.python'), (Join-Path $root '.uv-cache'))) {
+            if (Test-Path $d) { Add-Target $d 'private Python' }
+        }
+    }
+    if ($all -or $component -eq 'logs')      { if (Test-Path $logDir) { Add-Target $logDir 'logs' } }
+    if ($all -or $component -eq 'downloads') { if (Test-Path $dl) { Add-Target $dl 'download cache' } }
+    if ($all -or $component -eq 'metadata') {
+        if (Test-Path $stampFile) { Add-Target $stampFile 'version stamp' }
+        $compat = Join-Path $root '.agent-compat.json'
+        if (Test-Path $compat) { Add-Target $compat 'agent compatibility verdicts' }
+        if (Test-Path (Get-StartupShortcut)) { Add-Target (Get-StartupShortcut) 'start-at-logon shortcut' }
+    }
+    return $script:__t
 }
 
 function Remove-AllComponents {
@@ -1014,7 +1102,16 @@ function Get-HfVariants($repo) {
     }
 }
 
-function Format-Size($bytes) { '{0:N1} GB' -f ($bytes / 1GB) }
+# Adaptive rather than GB-only: model weights are naturally GB, but the reset list also carries a
+# 23 MB picker and a 400-byte json, and "0.0 GB" tells the user nothing about what they are about
+# to delete.
+function Format-Size($bytes) {
+    if ($null -eq $bytes) { return '0 B' }
+    if ($bytes -ge 1GB) { return '{0:N1} GB' -f ($bytes / 1GB) }
+    if ($bytes -ge 1MB) { return '{0:N0} MB' -f ($bytes / 1MB) }
+    if ($bytes -ge 1KB) { return '{0:N0} KB' -f ($bytes / 1KB) }
+    return "$bytes B"
+}
 
 # GGUF keeps all its metadata at the head of the file, so a range request reads a model's
 # architecture and shape without pulling the weights. That is the difference between knowing a
@@ -1970,41 +2067,18 @@ switch ($Action) {
             # Easiest way in 5.1 is to just call Remove-AllComponents and print our own summary.
         }
 
-        # First, display what is going to be deleted (Dry Run phase)
-        $targets = @()
-        if ($Component -eq 'llama-cpp' -or $Component -eq 'all') {
-            if (Test-Path $llamaCpp) { $targets += if ($IncludeModels) { $llamaCpp } else { "$llamaCpp (except models\)" } }
-        }
-        if ($Component -eq 'llama-prism' -or $Component -eq 'all') {
-            if (Test-Path $llamaPrism) { $targets += $llamaPrism }
-        }
-        if ($Component -eq 'swap' -or $Component -eq 'all') {
-            if (Test-Path (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap'))) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
-        }
-        if ($Component -eq 'webui' -or $Component -eq 'all') {
-            Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
-            Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
-        }
-        if ($Component -eq 'llmfit' -or $Component -eq 'all') {
-            if (Test-Path $llmfitDir) { $targets += $llmfitDir }
-        }
-        if ($Component -eq 'uv' -or $Component -eq 'all') {
-            if (Test-Path $uvDir) { $targets += $uvDir }
-            foreach ($d in @((Join-Path $root '.python'), (Join-Path $root '.uv-cache'))) {
-                if (Test-Path $d) { $targets += $d }
-            }
-        }
-        if ($Component -eq 'logs' -or $Component -eq 'all') {
-            if (Test-Path $logDir) { $targets += $logDir }
-        }
-        if ($Component -eq 'downloads' -or $Component -eq 'all') {
-            if (Test-Path $dl) { $targets += $dl }
-        }
-        if ($Component -eq 'metadata' -or $Component -eq 'all') {
-            if (Test-Path $stampFile) { $targets += $stampFile }
-            if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
-            $compat = Join-Path $root '.agent-compat.json'
-            if (Test-Path $compat) { $targets += $compat }
+        $found = @(Get-ResetTargets $Component -IncludeModels:$IncludeModels)
+        $targets = @($found | ForEach-Object { $_.Path })
+
+        if ($DryRun) {
+            # -InputObject @(...) because ConvertTo-Json collapses a one-element array into a
+            # bare object, and the panel iterates the result. Same trap as /api/jobs.
+            if ($Json) { ConvertTo-Json -InputObject @($found) -Depth 4 -Compress; break }
+            if (-not $found) { Write-Host "Nothing installed for component '$Component'."; break }
+            Write-Host "`nA reset of '$Component' would delete:"
+            $found | ForEach-Object { Write-Host ("  {0,-58} {1}" -f $_.Path, (Format-Size $_.Bytes)) }
+            Write-Host ("`n  total: {0}" -f (Format-Size (($found | Measure-Object Bytes -Sum).Sum)))
+            break
         }
 
         if (-not $targets) { Write-Host "Nothing installed for component '$Component' - nothing to remove."; break }
