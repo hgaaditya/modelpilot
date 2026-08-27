@@ -57,3 +57,6 @@ __pycache__/
 # which models have been shown to actually work with Claude Code - depends on this machine's
 # llama.cpp build and the models installed, so it doesn't travel
 /.agent-compat.json
+
+# ComfyUI: multi-GB weights and a venv, provisioned by -Action install-comfy.
+comfyui/
