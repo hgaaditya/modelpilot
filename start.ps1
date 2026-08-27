@@ -299,7 +299,18 @@ function Resolve-Latest($ver) {
 
 # open-webui's backend: only the python.exe running out of our own venv, never a user's other
 # interpreter. Both Stop-Stack and Test-ComponentRunning key off this.
-function Get-WebuiProcess { Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $root }
+# Scoped to the open-webui tree, not the whole install root. It used to match any python.exe
+# under $root, which was fine until ComfyUI arrived with its own venv in comfyui\.venv - also
+# under $root. The result: '-Action stop -Component webui' and the webui half of a restart killed
+# ComfyUI as collateral, silently taking image generation down with the chat UI. A full stop still
+# gets both, which is what it is for.
+function Get-WebuiProcess {
+    $dir = Find-WebuiDir
+    if (-not $dir) { return @() }
+    Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $dir
+}
+
+function Get-ComfyProcess { Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $comfyDir }
 
 function Get-TrayProcess { Get-ProcessByCommandLine 'tray\.ps1' }
 
