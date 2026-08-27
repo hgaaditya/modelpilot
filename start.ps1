@@ -33,7 +33,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -149,6 +149,10 @@ $VER = @{
     # macOS only: localllm.command greps this value out of this table and fetches a
     # self-contained pwsh into .pwsh/. Windows uses its built-in PowerShell 5.1 and ignores it.
     pwsh      = '7.6.5'
+    # ComfyUI: the image and video backend. Separate from deploy for the same reason as prism -
+    # it is several GB that only matters if you generate images, and the stack serves text
+    # without it.
+    comfy     = 'v0.34.1'
 }
 
 $root         = $PSScriptRoot
@@ -164,6 +168,7 @@ $uvDir        = Join-Path $root 'uv'          # provides Python; nothing is inst
 $llmfitDir    = Join-Path $root 'llmfit'
 $llmfitExe    = Join-Path $llmfitDir (Get-ToolName 'llmfit')
 $llamaSwapDir = Join-Path $root 'llamaswap'
+$comfyDir     = Join-Path $root 'comfyui'
 $tarExe       = Get-TarExe
 $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
@@ -777,6 +782,24 @@ function Invoke-Deploy($ver) {
         $content += "WEBUI_SECRET_KEY='$([Convert]::ToBase64String($secretBytes))'`n"
 
         Set-Content -Path $envFile -Value $content
+    }
+
+    # Image generation, pointed at ComfyUI. These are PersistentConfig keys: open-webui reads them
+    # from the environment on a boot where the database has no value yet, then owns them from the
+    # database afterwards. So setting them here configures a fresh install without anyone visiting
+    # Admin > Settings > Images, and never overrides a choice made in the UI later.
+    #
+    # Appended rather than rewritten, and only when absent, because .env also holds
+    # WEBUI_SECRET_KEY - regenerating that would log every user out.
+    $envText = Read-TextFile $envFile
+    $add = @()
+    if ($envText -notmatch '(?m)^ENABLE_IMAGE_GENERATION=') { $add += "ENABLE_IMAGE_GENERATION=true" }
+    if ($envText -notmatch '(?m)^IMAGE_GENERATION_ENGINE=') { $add += "IMAGE_GENERATION_ENGINE=comfyui" }
+    if ($envText -notmatch '(?m)^COMFYUI_BASE_URL=')        { $add += "COMFYUI_BASE_URL=http://127.0.0.1:8188" }
+    if ($add.Count) {
+        Write-Host "Pointing open-webui's image generation at ComfyUI ..."
+        if (-not $envText.EndsWith("`n")) { $envText += "`n" }
+        Write-TextFile $envFile ($envText + ($add -join "`n") + "`n")
     }
 }
 
@@ -1598,6 +1621,113 @@ if ($Action -eq 'suggest') {
     }
     Write-Host ""
     Write-Host "Speeds are llmfit's estimate from memory bandwidth, not a measurement - '-Action bench' measures."
+    return
+}
+
+if ($Action -eq 'comfy') {
+    $comfyPy = Get-VenvPython (Join-Path $comfyDir '.venv')
+    if (-not (Test-Path $comfyPy)) { throw "ComfyUI is not installed - run '.\start.ps1 -Action install-comfy' first." }
+    if (@(Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $comfyDir).Count) {
+        Write-Host "ComfyUI is already running on http://127.0.0.1:8188"
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $log = Join-Path $logDir 'comfyui.log'
+    $args = @((Join-Path $comfyDir 'main.py')) + (Get-ComfyArgs)
+    Write-Host "Starting ComfyUI on :8188 ..."
+    $p = Start-Process -FilePath $comfyPy -ArgumentList $args -WorkingDirectory $comfyDir `
+             -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    # Its own health wait, for the same reason the rest of the stack has one: a backend that died
+    # on startup is otherwise invisible until open-webui reports a failed generation minutes later.
+    $ok = $false
+    foreach ($i in 1..60) {
+        if ($p.HasExited) { break }
+        try { $null = Invoke-WebRequest 'http://127.0.0.1:8188/system_stats' -UseBasicParsing -TimeoutSec 3; $ok = $true; break } catch { }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $ok) {
+        Write-Warning "ComfyUI did not answer on :8188. Last lines of $log.err:"
+        if (Test-Path "$log.err") { Get-Content "$log.err" -Tail 15 | Write-Host }
+        throw "ComfyUI failed to start."
+    }
+    Write-Host "ComfyUI ready:  http://127.0.0.1:8188"
+    Write-Host "open-webui will use it for the image button once ENABLE_IMAGE_GENERATION is set (deploy does this)."
+    return
+}
+
+if ($Action -eq 'install-comfy') {
+    # ComfyUI is the image (and later video) backend. Deliberately a separate action, like prism:
+    # it is several GB of PyTorch that only matters if you generate images, and the stack serves
+    # text perfectly well without it.
+    #
+    # Installed into the tree with the uv that is already here, so there is no system-wide Python,
+    # no conda, and -Action reset can remove it. Same reasoning that replaced winget-installed
+    # Python with a vendored uv.
+    $comfyPy = Get-VenvPython (Join-Path $comfyDir '.venv')
+    if ((Test-Path $comfyPy) -and -not $Force) {
+        Write-Host "ComfyUI already installed at $comfyDir (use -Force to reinstall)."
+        return
+    }
+    $uvExe = Join-Path $uvDir (Get-ToolName 'uv')
+    if (-not (Test-Path $uvExe)) { throw "uv is missing - run '.\start.ps1' once to provision it, then retry." }
+
+    if (-not (Test-Path (Join-Path $comfyDir 'main.py'))) {
+        New-Item -ItemType Directory -Force -Path $dl | Out-Null
+        $tar = Join-Path $dl "comfyui-$($VER.comfy).tar.gz"
+        Write-Host "Fetching ComfyUI $($VER.comfy)..."
+        Get-File "https://github.com/Comfy-Org/ComfyUI/archive/refs/tags/$($VER.comfy).tar.gz" $tar
+        Write-Host "Extracting..."
+        Expand-Download $tar $root
+        $extracted = Get-ChildItem $root -Directory -Filter "ComfyUI-*" | Select-Object -First 1
+        if (-not $extracted) { throw "Extracted the archive but found no ComfyUI-* directory in $root." }
+        if (Test-Path $comfyDir) { Remove-Item $comfyDir -Recurse -Force }
+        Move-Item $extracted.FullName $comfyDir
+    }
+
+    # Same environment the open-webui venv uses, so the interpreter lands inside this install and
+    # -Action reset can take it away again, rather than depending on whatever Python the machine
+    # happens to have. Without this uv picked the user's system CPython.
+    $env:UV_PYTHON_INSTALL_DIR = Join-Path $root '.python'
+    $env:UV_CACHE_DIR = Join-Path $root '.uv-cache'
+
+    Write-Host "Creating the ComfyUI environment (Python 3.12)..."
+    # No `2>&1 | Write-Host` on a native exe: PowerShell 5.1 wraps each stderr line in an
+    # ErrorRecord, and with $ErrorActionPreference = 'Stop' uv's ordinary "Using CPython 3.12.10"
+    # progress line terminates the script. Let uv write to the console itself and judge it by its
+    # exit code, which is what the rest of this file already does.
+    & $uvExe python install 3.12 --no-bin
+    & $uvExe venv (Join-Path $comfyDir '.venv') --python 3.12
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $comfyPy)) { throw "uv could not create the venv at $comfyDir\.venv." }
+
+    # PyTorch first and explicitly. The default PyPI wheel on Windows is CPU-only, which for image
+    # generation is minutes per picture rather than seconds, and it is a 3 GB mistake to discover
+    # late. macOS needs no index at all - the plain wheel carries MPS.
+    $idx = Get-TorchIndex
+    Write-Host "Installing PyTorch$(if ($idx) { ' (CUDA)' } else { ' (Metal)' }) - this is the big one, several GB..."
+    $torchArgs = @('pip', 'install', '--python', $comfyPy, 'torch', 'torchvision', 'torchaudio')
+    if ($idx) { $torchArgs += @('--index-url', $idx) }
+    & $uvExe @torchArgs
+    if ($LASTEXITCODE -ne 0) { throw "PyTorch install failed (exit $LASTEXITCODE)." }
+
+    Write-Host "Installing ComfyUI's own requirements..."
+    & $uvExe pip install --python $comfyPy -r (Join-Path $comfyDir 'requirements.txt')
+    if ($LASTEXITCODE -ne 0) { throw "ComfyUI requirements failed (exit $LASTEXITCODE)." }
+
+    # Prove the accelerator is actually reachable rather than trusting the install log. A CPU-only
+    # torch installs perfectly happily and only reveals itself when a generation takes ten minutes.
+    $probe = & $comfyPy -c "import torch;print('torch',torch.__version__);print('cuda',torch.cuda.is_available());print('mps',getattr(torch.backends,'mps',None) and torch.backends.mps.is_available())" 2>&1
+    Write-Host ""
+    $probe | Write-Host
+    if ("$probe" -notmatch 'cuda True' -and "$probe" -notmatch 'mps True') {
+        Write-Warning "torch cannot see an accelerator - generation would run on the CPU. Check the driver, then reinstall with -Force."
+    }
+
+    $stamp = Read-Stamp; if (-not $stamp) { $stamp = @{} }
+    $stamp['comfy'] = $VER.comfy
+    Write-Stamp $stamp
+    Write-Host "`nInstalled to $comfyDir"
+    Write-Host "Next: '.\start.ps1 -Action comfy' to run it, then point open-webui at http://127.0.0.1:8188"
+    Write-Host "Models go in $comfyDir\models\ - checkpoints\, unet\, clip\, vae\ by type."
     return
 }
 

@@ -560,3 +560,24 @@ function Read-TextFile($path) {
 function Write-TextFile($path, $text) {
     [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))
 }
+
+# --- ComfyUI ------------------------------------------------------------------------------------
+# PyTorch is the one dependency that genuinely differs per platform, and getting it wrong is a
+# multi-GB mistake: the default PyPI wheel on Windows is CPU-only, which for image generation means
+# minutes per picture instead of seconds. On Apple Silicon the opposite holds - the plain wheel
+# already carries MPS, and there is no accelerator index to point at.
+function Get-TorchIndex {
+    if ($Plat.IsWindows) { return 'https://download.pytorch.org/whl/cu128' }
+    return $null
+}
+
+# ComfyUI keeps a model in VRAM after a run so the next generation is instant. That is the right
+# default on a card with room to spare, and exactly wrong here: this box shares one 12 GB card
+# between the chat model and the image model, and the whole design is that only one is resident at
+# a time. --disable-smart-memory makes ComfyUI release the weights when it finishes, so llama-swap
+# can have the card back.
+function Get-ComfyArgs {
+    $a = @('--port', '8188', '--listen', '127.0.0.1', '--disable-smart-memory')
+    if ($Plat.IsMac) { $a += '--force-fp16' }
+    return $a
+}
