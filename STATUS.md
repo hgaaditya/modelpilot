@@ -52,7 +52,7 @@
 - `start.ps1 -Action check-ui`, PowerShell parser checks for `ui.ps1`, `start.ps1`, `platform.ps1` and `tray.ps1`, and local Inno Setup compilation passed.
 - A live download of the llama-swap v244 Windows zip matched GitHub's API-published digest; controlled downloader fixtures proved valid hashes pass and mismatches discard both `.part` and sidecar files.
 
-- Both workflow YAML files parsed locally. The hosted `release artifacts` workflow passed for `release/v0.1.13` run [#39040488629](https://github.com/hgaaditya/modelpilot/actions/runs/39040488629): it built and uploaded `model-pilot-0.1.13`, and the downloaded `Model-Pilot-Setup.exe` (2,213,370 bytes) matched its SHA-256 manifest: `19260e31568d7a7b8c247f09aa1c16ede7d90ca97b65ca977f3c77e3089178f7`. The tag-only publish job was skipped as intended.
+- Both workflow YAML files parsed locally. The hosted `release artifacts` workflow passed for `release/v0.1.13` run [#39040488629](https://github.com/hgaaditya/modelpilot/actions/runs/39040488629): it built and uploaded `model-pilot-0.1.13`, and the downloaded `Model-Pilot-Setup.exe` (2,213,370 bytes) matched its SHA-256 manifest: `19260e31568d7a7b8c247f09aa1c16ede7d90ca97b65ca977f3c77e3089178f7`. The tag-only publish job was skipped as intended. Pull request [#1](https://github.com/hgaaditya/modelpilot/pull/1) then passed all six hosted `check` jobs: docs, benchmark consent, platform boundary, Windows/macOS PowerShell parse and lint, and Windows installer compilation.
 - `bench/test_consent.py` passed using the installed Python environment. Its deliberate Python grading task was skipped; the test restored the prior consent-file state.
 
 ## Remaining release risks
