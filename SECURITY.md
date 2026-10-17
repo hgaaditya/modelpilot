@@ -2,9 +2,9 @@
 
 ## What this software assumes
 
-LocalLLM is a single-user desktop tool. It assumes **you trust everything running as your user
-account on your own machine**. Within that assumption it is reasonably careful; outside it, it
-offers no protection at all. If that assumption doesn't hold for you, this is the wrong tool.
+Model Pilot is a single-user Windows desktop tool. It assumes **you trust everything running as
+your user account on your own machine**. Within that assumption it is reasonably careful; outside
+it, it offers no protection at all. If that assumption doesn't hold for you, this is the wrong tool.
 
 Three things are worth understanding before you run it.
 
@@ -27,7 +27,7 @@ are in place:
 
 `/api/ping` is deliberately exempt: it returns a fixed literal, does no work, and is how a second
 launch discovers an existing panel before any token exists. It leaks only that the port is a
-LocalLLM panel, which a failed bind reveals anyway.
+Model Pilot panel, which a failed bind reveals anyway.
 
 ### The benchmark can run code the model writes
 
@@ -49,16 +49,63 @@ malformed one is parser input. Prefer publishers you recognise.
 
 ## What it does not do
 
-It does not phone home. Nothing is uploaded, no telemetry is collected, and no analytics exist. The
-only outbound requests are: model downloads you ask for, GitHub and nodejs.org release lookups when
-installing or when you press *Check for updates*, and Hugging Face metadata when you inspect a
-model. Conversations and files never leave the machine — that is the entire point of the project.
+Model Pilot does not include a telemetry or analytics service. That is not a claim that every
+upstream component or optional integration has no telemetry. With the default configuration,
+inference requests go to the local llama-swap endpoint and chat data stays on this PC. If you
+connect Open WebUI or another client to a remote provider, that provider receives the requests
+you send to it.
+
+Network requests happen when you choose an operation that needs them:
+
+- First-run setup downloads pinned components from GitHub releases/source archives and Node.js
+  from nodejs.org. It uses uv to install a private Python runtime and resolve Open WebUI's
+  Python dependencies from PyPI by default, and npm dependencies from its configured registry
+  (registry.npmjs.org by default).
+- The first Open WebUI boot may fetch its embedding model. Model discovery reads Hugging Face
+  metadata; model files are downloaded only when you request them, from the publisher or URL you
+  chose.
+- Checking latest versions contacts GitHub's release API and nodejs.org. Optional ComfyUI setup
+  downloads its source and Python packages; on Windows its CUDA-enabled PyTorch wheels come from
+  `download.pytorch.org`.
+
+The downloader checks GitHub's published SHA-256 digest for release assets when that digest is
+available in the release API. A mismatch is rejected and the staged file is discarded; if the API
+is unavailable or the publisher supplied no digest, installation continues with a warning.
+That digest is delivered by the same GitHub service as the asset, so it detects corruption or an
+asset mismatch but is not an independent publisher signature. It does not cover generated GitHub
+source archives, nodejs.org, Hugging Face model files, PyPI/npm package resolution, ComfyUI source,
+or every optional download.
+
+Version pins and transport are therefore not full supply-chain verification: Model Pilot does not
+verify an independent trusted checksum or signature for every upstream runtime/package download.
+A pinned version identifies the selected release URL, not necessarily the publisher or the bytes
+served from it. Treat upstream installers and dependencies as software you are choosing to trust.
+Python and npm dependency installation may also execute upstream build or install hooks as your
+user. Review package sources and their own security/licence notices before enabling optional
+components or distributing broadly.
+The current setup EXE is unsigned. Its SHA-256 checksum can detect a mismatch only when compared
+with a checksum obtained from a trusted release location; it does not identify the publisher.
+Windows may show an unknown-publisher warning.
+
+These requests send the normal connection metadata required by those upstream services. Model Pilot
+does not upload chat prompts or files as part of its default local inference route. Review any
+remote provider, custom node, or extension you choose before enabling it.
+
+### Optional extensions can execute code
+
+ComfyUI custom nodes are third-party code imported at startup. Installing one is equivalent to
+running that project's code as your Windows user; use only sources you trust. The default setup
+does not install custom nodes.
 
 ## Reporting a vulnerability
 
-Open an issue for anything already public or low risk. For something that would put users at risk
-if disclosed before a fix, use GitHub's **Report a vulnerability** button on the Security tab
-(private advisory) rather than a public issue.
+For a public or low-risk issue **after a public release exists**, use its public issue tracker. For
+an unresolved vulnerability, do **not** publish exploit details. Report it privately to
+[modelpilot.app@gmail.com](mailto:modelpilot.app@gmail.com), with **“Security”** in the subject.
+Do not send passwords, API keys, private chat history, or model weights. The repository is currently
+private and GitHub's private vulnerability-reporting endpoint returned 404, so email is the available
+private route. Before public distribution, test this address from an account outside the maintainer
+team and configure GitHub private vulnerability reporting if it becomes available.
 
 Please include the version (`.\start.ps1 -Action status`), what you did, and what happened. A
 proof of concept helps enormously — the CSRF issue above was fixed the day it was found because it

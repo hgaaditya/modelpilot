@@ -6,6 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A local LLM stack on Windows, made of three independently-vendored components glued together by one config file, plus `start.ps1` which bootstraps and launches the whole thing from a clean clone. This is not a monorepo of code you're expected to build from source — `llama.cpp` and `llama-swap` are pre-built binary drops (auto-downloaded by `start.ps1` if missing), and `open-webui` is a vendored upstream release (v0.11.0). Most work here is configuration, not development, unless the task is specifically inside `open-webui-0.11.0/`.
 
+The end-user product name is **Model Pilot**. The repository and per-user installation directory
+(`C:\LocalLLM`) and internal protocol/registry identifiers remain legacy names for in-place
+upgrades and compatibility. The launcher is now `ModelPilot.cmd`. Use Model Pilot in
+customer-facing surfaces; do not rename stable paths or identifiers as part of a display-name change.
+
 Lives at `C:\LocalLLM` deliberately — not under `Program Files (x86)`. That path requires admin ACLs to write, and its `(x86)` parentheses break glob-based JS build tooling (open-webui's `pyodide:fetch` / vite build silently mangle the path and fail). Don't move this back under Program Files.
 
 ```
@@ -45,7 +50,7 @@ models:
 
 ## Running the stack
 
-`start.ps1` at the repo root does all the work — idempotent, safe to re-run on a fresh clone or an already-set-up machine. (Double-clicking `LocalLLM.cmd` is the end-user route to the same thing through the control panel; see below.)
+`start.ps1` at the repo root does all the work — idempotent, safe to re-run on a fresh clone or an already-set-up machine. (The **Model Pilot** Start Menu/Desktop shortcut launches `ModelPilot.cmd`; see below.)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1
@@ -131,21 +136,22 @@ Re-running after the first successful setup just relaunches those last two proce
 
 ### Other actions
 
-Same script, `-Action`:
+Advanced maintenance actions are available through `start.ps1 -Action`:
+
+For normal lifecycle control, users should use Home or the tray. CLI `stop` and `restart` are deprecated for direct end-user use, but remain internal adapters for UI/tray callers and legacy automation; migrate those callers before removing the actions.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action stop
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action restart
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action autostart          # start at logon
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action autostart -Remove
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action tray
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action status -Latest
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action upgrade
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Model '<hf repo, hf url, or .gguf url>'
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action test-model -Id '<configured model id>'
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 ```
 
-- **stop** / **restart** — kills `llama-swap`, any spawned `llama-server`, and the open-webui backend. The backend is matched by `python.exe` whose `ExecutablePath` is under the repo root, so a machine's other interpreters are never touched. `-Component swap|webui` acts on one half only — `swap` also takes down the `llama-server` processes it spawned, since they're its children. `-Component swap` exists for a genuinely wedged router, not for config edits — those are picked up by `-watch-config` without a restart. A failed health check rolls back only what that call started.
+- **Internal lifecycle adapters (`stop`/`restart`)** — invoked by the panel and tray; direct end-user CLI use is deprecated. They stop `llama-swap`, spawned `llama-server` processes and the open-webui backend. `-Component swap|webui` acts on one half only; the UI/tray still depend on these actions, so do not remove them until those callers are migrated.
 - **tray** — (re)starts just the notification-area indicator, `tray.ps1`. It comes up automatically after a successful launch; `-NoTray` suppresses that. A coloured dot polls `/health` on both services every 5s — green for both up, yellow for one, red for neither — with the currently loaded model in the tooltip (from llama-swap's `/running`). Double-click opens the chat UI; right-click gives open/logs, **Restart** and **Stop** submenus offering whole-stack or either component alone, plus a **Models** submenu listing everything in `config.yaml` — the loaded one marked, any whose `.gguf` is missing greyed out with the absent path in the tooltip, and a click on any other sending a one-token completion to swap it in (fire-and-forget, since waiting on a multi-GB load would freeze the tray). The submenu is rebuilt when the menu opens rather than on the status timer, so models added by `add-model` while the tray is running show up without a restart. It raises a balloon when the stack drops on its own, which is the point: a backend that dies unattended is otherwise invisible until you next try to use it. Icons are drawn at runtime rather than shipped as `.ico` files, and a named mutex keeps it to one instance no matter how often `start.ps1` fires it off. Exiting the tray leaves the stack running; `uninstall` kills it.
 - **add-model** — fetch a model and register it, in one command. `-Model` takes whatever you have to hand: a Hugging Face repo id (`bartowski/Qwen_Qwen3-8B-GGUF`, optionally suffixed `:Q4_K_M`), a `huggingface.co` URL of either a repo or a single file (`/blob/` and `/resolve/` both work), or any other direct `.gguf` URL.
 
@@ -159,6 +165,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
   Downloads run through `curl.exe -L -C -` (ships with Windows 10+; `Invoke-WebRequest` has neither resume nor progress, which makes it useless for a multi-GB file), staging to `<name>.part` and renaming only on success, so an interrupted pull resumes on re-run and a partial file is never mistaken for a complete model.
 
   On success it appends an entry to `llamaswap\config.yaml` in the file's existing style, saving the previous version as `config.yaml.bak`. The id defaults to the file name lowercased (`-Id` overrides), context to 16384 (`-Context`). An id that already exists is left untouched rather than duplicated. `-NoConfig` downloads without touching the config. llama-swap picks the new entry up within a couple of seconds via `-watch-config`, so it is routable without a restart.
+- **test-model** — send one real short completion through llama-swap for a configured model. Checks the config entry, GGUF path and router health first; a cold load can take up to 15 minutes. A successful result proves that model returned text, not that the Open WebUI login/session works.
 - **install-prism** — installs [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) into `llama.cpp-prism\`, **alongside** the stock build, never over it. Deliberately not part of `deploy`: it's ~620 MB of downloads that only matters if you run a low-bit model, and every other model in `config.yaml` depends on the stock binary. Prebuilt Windows CUDA binaries come straight off the fork's releases (`-Latest` takes the newest, otherwise `$VER.prism`), so no CMake/CUDA-toolkit/MSVC install is needed. The Windows CUDA asset is named off the kernel build (`llama-prism-b1-…`) rather than the release tag, so the asset is matched by shape, not by tag string. Point a model at it with the `llama-server-prism` macro in `config.yaml`.
 
   Why it exists: ternary/low-bit GGUFs such as `prism-ml/Ternary-Bonsai-27B-gguf` store weights in ggml tensor types **42** (`Q2_0`, `Q2_g64`) or **142** (`PQ2_0`), and stock llama.cpp b10155 stops at type 41 — those models fail at load on the normal binary regardless of configuration. The repo's `dspark-*` files are a separate thing again: a speculative-decoding drafter with its own architecture (`dspark`), which stock llama.cpp rejects as an unknown architecture.
@@ -174,10 +181,10 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
   Three filters are applied for us and are the reason the output is usable:
   - `--runtime llamacpp` — llmfit also ranks vLLM/AWQ and MLX builds, which this stack cannot load.
-  - `--capability tool_use` (the `-Capability` default) — a model that can't call tools is useless for the coding-agent path, and it's the property people otherwise discover last.
+  - `--capability tool_use` — the CLI defaults to tool-calling models; the panel exposes this as an optional, default-off filter because general chat does not require tools.
   - `--no-dashboard` — **llmfit starts a background web server otherwise.** Never drop this flag.
 
-  Rows with no `gguf_sources` are then dropped, because there'd be nothing to download. What's left carries `gguf_sources[0].repo` and `best_quant`, which are exactly `add-model`'s `-Model` and `-Quant` — so the panel's **What should I run?** table has a working Download button per row, and `-Json` is the same data for it. Speeds are llmfit's memory-bandwidth estimate, not a measurement; `-Action bench` measures. Note that its context figure is the model's *trained* maximum, not what fits here — a downloaded model still needs `-c` set (32768+ for Claude Code), which is `set-tuning` or `autotune`.
+  Rows with no `gguf_sources` are dropped because they cannot be downloaded. The panel renders the remaining recommendations as **Models → Find models** cards with the fit rating, approximate download size, estimated speed, trained context and license when available. Speed is an estimate, not a benchmark; `-Action bench` measures. The trained context is not necessarily what fits here — use `set-tuning` or `autotune` for the actual context.
 - **Vision models (`--mmproj`)** — a multimodal GGUF needs its projector passed alongside the weights: add `--mmproj "<path>.gguf"` to the model's `cmd`. `add-model` does not fetch it (it picks one file per quant, and the projector is a separate `bf16` entry that would be ambiguous), so pull it by direct URL with `-NoConfig -Name <model>-mmproj.gguf` and add the flag by hand. Give it a name tied to the model — every repo calls its own `mmproj-model-bf16.gguf`, so a generic name collides the moment a second vision model arrives. Measured for `gemma4-12b-abliterated` on this box: the projector costs **~730 MiB** of VRAM on top of the weights (10204 MiB used against gemma4-v2's 9476 at the same `-c 131072`), and it is GPU-offloaded by default. Two things follow. Context is *not* the lever for reclaiming that — 98304 measured 10222 MiB against 131072's 10204, identical within noise, because only 8 of gemma4's 48 layers grow KV. And open-webui will not offer an image button until Vision is ticked for that model under Admin → Settings → Models, since `/v1/models` carries no capability information.
 - **install-comfy** / **comfy** — [ComfyUI](https://github.com/Comfy-Org/ComfyUI) as the image backend, installed into `comfyui\` with the `uv` that is already here, so there is no system-wide Python and `-Action reset` can remove it. Separate from `deploy` for the same reason as prism: several GB of PyTorch that only matters if you generate images. `-Action comfy` starts it on `:8188` with a health wait.
 
@@ -209,7 +216,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
   | duplicate model id | YAML keeps the last, so the earlier entry silently does nothing — including one you just edited |
 
   It **warns and never blocks**, including on the launch path. An entry whose weights or engine aren't installed yet is a legitimate state, and refusing to start over one bad entry would take the other nine models down with it. The panel shows the engine half of this as `engine missing` in the Models table.
-- **autostart** — write a `LocalLLM.lnk` into the user's Startup folder so the stack comes back at logon; `-Remove` takes it away. Deliberately a Startup shortcut rather than a scheduled task or a service: no admin, nothing to migrate on upgrade, and it appears in **Task Manager > Startup apps**, which is where people already go to turn a startup item off. It launches `start.ps1` (which brings the tray up with it), **not** the control panel — the panel is on demand, and what's missed after an unplanned reboot is a stack that answers on its ports. Re-running it while the stack is already up is safe: `Start-Stack`'s own double-launch guard refuses rather than spawning a second llama-swap.
+- **autostart** — write a `Model Pilot.lnk` into the user's Startup folder so the stack comes back at logon; older `LocalLLM.lnk` entries are migrated with their Task Manager enabled/disabled state. Deliberately a Startup shortcut rather than a scheduled task or a service: no admin, nothing to migrate on upgrade, and it appears in **Task Manager > Startup apps**, which is where people already go to turn a startup item off. It launches `start.ps1` (which brings the tray up with it), **not** the control panel — the panel is on demand, and what's missed after an unplanned reboot is a stack that answers on its ports. Re-running it while the stack is already up is safe: `Start-Stack`'s own double-launch guard refuses rather than spawning a second llama-swap.
 
   A `.lnk` that exists can still be switched off in Task Manager, which records that in `HKCU\...\Explorer\StartupApproved\StartupFolder` and leaves the file alone — so `Test-Path` on its own would report autostart as on for a machine where it will never run. `-Action status` reads both and says `set, but switched off in Task Manager > Startup apps` for that case. `uninstall` deletes the shortcut; left behind it runs a deleted `start.ps1` at every logon.
 
@@ -220,17 +227,14 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action uninstall
 
 Which versions are actually installed is tracked in `.stack-versions.json` (gitignored, written after each successful deploy/upgrade). Without it, `upgrade` treats every component as stale and re-provisions the lot. Bare `-Action deploy` deliberately *ignores* `$VER` when a stamp exists — bumping the pins requires `-Action upgrade`, so a routine relaunch can never surprise you with a re-download.
 
-## The control panel — `LocalLLM.cmd` / `ui.ps1`
+## The Model Pilot control panel — `ModelPilot.cmd` / `ui.ps1`
 
 The end-user entry point. `ui.ps1` serves a local web page on `127.0.0.1:9300` and opens it in a
 Chromium `--app` window, so it looks like a desktop app with no address bar. Everything it does
 shells out to `start.ps1` — the CLI stays the single source of truth and the panel is a face on it,
 never a second implementation. New behaviour belongs in `start.ps1` with the panel calling it.
 
-**`LocalLLM.cmd`** is the double-click shim, and the only file a new user has to touch: a `.ps1`
-opens in Notepad when double-clicked, so it can't be the entry point. It runs `ui.ps1 -Launch`,
-which clears mark-of-the-web from the `.ps1` files (they arrive blocked when extracted from a
-downloaded zip), spawns the panel **detached**, and then polls `/api/ping` for 15s. The detachment
+**`ModelPilot.cmd`** is the branded double-click launcher and the only file a new user has to touch if they open the install folder: a `.ps1` opens in Notepad when double-clicked, so it can't be the entry point. The shim runs `ui.ps1 -Launch`, which clears mark-of-the-web from the `.ps1` files (they arrive blocked when extracted from a downloaded zip), spawns the panel **detached**, and then polls `/api/ping` for 15s. The detachment
 matters — closing the panel window is a minimise, not a quit, so the server has to outlive its
 launcher. The polling matters just as much: without it a failure to start is completely invisible,
 which is the worst possible first-run outcome. `README.md` is the user-facing version of this.
@@ -257,12 +261,11 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
   It's how a second launch discovers a panel is already up, and that check runs before any token
   exists to send. Gating it broke single-instance detection outright — every launch believed
   nothing was running, then died failing to bind the port. It returns a fixed literal, so the only
-  thing it tells a cross-origin caller is that this port is a LocalLLM panel, which a failed bind
+  thing it tells a cross-origin caller is that this port is a Model Pilot panel, which a failed bind
   reveals anyway. Don't "fix" this by gating it again.
-- The **Dashboard banner** is a three-step first-run walkthrough (install → add a model → open the
-  chat), each step keyed on state and gone once done. Step 3 keys on *no model has ever been used*
-  (`loads`/`lastUsed`), not on *nothing loaded right now* — models unload on their idle timer all
-  day, and a banner that came back every time would be noise.
+- **The Home hero guides install → model → chat.** It distinguishes a first install, stopped services, no configured model, missing weights and first chat. Its state comes from `/api/status` and `/api/models`; loading copy remains visible until the first status response. The primary nav is Home, Models, Activity and Settings; troubleshooting, Tools and Monitoring live under **More**.
+- **Home's Test a real response** calls `start.ps1 -Action test-model` asynchronously. It validates the configured GGUF path, checks llama-swap health, then sends one short real completion and displays the model reply; a cold load can take up to 15 minutes and may switch the loaded model/use VRAM. It proves the inference path returns text, not that the user is authenticated in Open WebUI.
+- **Status avoids a known dead-endpoint timeout.** `Get-Dashboard` probes llama-swap health before requesting `/running`; if the router is down, no second request waits on its timeout. Do not reinstate the unconditional `/running` probe.
 - `-Install`, and the **Settings → Desktop integration** button that calls the same
   `Install-Shortcuts`, write a desktop and start-menu `.lnk`. The panel exists so that nothing
   requires opening a terminal; a Settings tab that tells you to run a PowerShell command defeats it.
@@ -383,6 +386,8 @@ which is the worst possible first-run outcome. `README.md` is the user-facing ve
   Size, **Conversation length** and State. Context is rendered as a band plus a word count
   (`very long ~98k words`) because a token budget means nothing to someone picking their first
   model, and words are the unit they think in. `Tune` is the button that sets it properly.
+
+- **Existing model folders are imported in place.** Models scans the selected folder recursively for GGUFs; it never copies or moves weights. Already registered paths are hidden. A filename that maps to an id already in `config.yaml` is shown as a conflict and cannot be added until renamed. New entries start at 16k context with q8_0 KV and can then be tuned.
 
 - **First run ends at a model, not at instructions.** Step 2 of the dashboard walkthrough used to
   read "open Models, paste a Hugging Face GGUF repo, press Inspect, download a variant it says fits

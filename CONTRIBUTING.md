@@ -26,11 +26,14 @@ doesn't quote spaces, or that `localhost` and `127.0.0.1` are not interchangeabl
 
 ## Before opening a pull request
 
-There is no CI yet, so please run these by hand:
+CI runs on each pull request and checks PowerShell parsing/lint, the benchmark consent gate,
+platform-layer boundaries, documentation links and installer compilation. It cannot exercise
+hardware or model completions, so run these against a deployed machine before release:
 
 ```powershell
 .\start.ps1 -Action check-config     # config parses and every model can actually start
 .\start.ps1 -Action status           # versions resolve
+.\start.ps1 -Action check-ui         # embedded panel JavaScript parses
 ```
 
 ```bash
@@ -39,16 +42,20 @@ python bench/test_consent.py         # the code-execution gate still refuses by 
 
 If you touched the panel, open it and click through every tab — most of its failures are visual or
 show up only in the browser console, and neither is caught by anything above.
+For the panel, also verify keyboard-only navigation, visible focus, dialog focus containment and
+return, and accessible names on forms. Check a narrow window for page-level horizontal overflow.
+Automated accessibility scans do not replace Windows Narrator or native Forced Colors checks; mark
+those checks unavailable rather than implying they passed.
+
+If changing download handling, verify that an advertised SHA-256 is checked before promotion and a mismatch deletes both the staged file and progress sidecar. Also keep the documentation clear that missing or same-host digests do not authenticate the publisher.
 
 ## Things that would genuinely help
 
 - **A concurrent listener for `ui.ps1`.** The single-threaded `HttpListener` loop is the panel's
   main ceiling: one slow probe delays everything queued behind it.
-- **macOS support.** The upstream stack already ports — llama-swap ships darwin builds, llama.cpp
-  ships macos-arm64, Open WebUI is Python. What doesn't port is this project's own automation:
-  WMI, `nvidia-smi`, WinForms in `tray.ps1`. The deeper problem is that Apple Silicon has unified
-  memory, so the VRAM-budget model behind `autotune` and `inspect` needs a hardware abstraction
-  rather than a translation.
+- **Keep the shipping product Windows-only.** The panel, tray and installer target Windows 10/11;
+  existing macOS backend code is not a supported installable product. Do not expand the release
+  matrix without a separate product decision.
 - **Tests.** `bench/test_consent.py` is currently the only one.
 
 ## Commit messages

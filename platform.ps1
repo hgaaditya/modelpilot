@@ -36,8 +36,22 @@ $Plat.Id = if ($Plat.IsWindows) { 'windows-x64' } elseif ($Plat.IsMac) { 'macos-
 
 function Assert-SupportedPlatform {
     if (-not ($Plat.IsWindows -or $Plat.IsMac)) {
-        throw "LocalLLM supports Windows and macOS (Apple Silicon). Detected: $($Plat.Name)."
+        throw "Model Pilot is supported as an installable desktop app on Windows 10/11 only. Detected unsupported platform: $($Plat.Name)."
     }
+}
+
+# ui.ps1 is platform-neutral, but its restart path has to identify the existing PowerShell server
+# by command line. CIM is Windows-only, so keep that process query behind the platform boundary.
+function Get-PanelServerProcesses($scriptPath, [int]$excludePid) {
+    if (-not $Plat.IsWindows) { return @() }
+    @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProcessId -ne $excludePid -and $_.Name -in @('powershell.exe', 'pwsh.exe') -and
+                $_.CommandLine -and
+                $_.CommandLine.IndexOf($scriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+            }
+    )
 }
 
 # --- archives ------------------------------------------------------------------------------
@@ -252,6 +266,23 @@ function Get-ProcessByCommandLine($pattern) {
 }
 
 # --- user locations --------------------------------------------------------------------------
+# Native directory chooser used by the panel. Keep OS-specific UI in this layer.
+function Select-Directory($title, $initialPath) {
+    if ($Plat.IsWindows) {
+        Add-Type -AssemblyName System.Windows.Forms
+        $dialog = New-Object Windows.Forms.FolderBrowserDialog
+        $dialog.Description = $title
+        $dialog.ShowNewFolderButton = $true
+        if ($initialPath -and (Test-Path $initialPath)) { $dialog.SelectedPath = $initialPath }
+        if ($dialog.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) { return $dialog.SelectedPath }
+        return $null
+    }
+    $script = 'POSIX path of (choose folder with prompt "' + ($title -replace '"', '\"') + '")'
+    $selected = & osascript -e $script 2>$null
+    if ($LASTEXITCODE -eq 0 -and $selected) { return "$selected" }
+    return $null
+}
+
 function Get-UserDataDir {
     if ($Plat.IsWindows) { return $env:APPDATA }
     return (Join-Path $HOME 'Library/Application Support')
@@ -277,10 +308,107 @@ function Get-BrowserPath {
 # Windows: a shortcut in the Startup folder. macOS: a LaunchAgent plist. Both are per-user, need no
 # admin, survive an upgrade untouched, and are visible where that platform's users already look to
 # switch a startup item off (Task Manager > Startup apps / System Settings > Login Items).
+function Move-LegacyAutostartShortcut {
+    if (-not $Plat.IsWindows) { return }
+    $startup = [Environment]::GetFolderPath('Startup')
+    $legacy = Join-Path $startup 'LocalLLM.lnk'
+    $current = Join-Path $startup 'Model Pilot.lnk'
+    if (-not (Test-Path -LiteralPath $legacy) -or (Test-Path -LiteralPath $current)) { return }
+
+    $moved = $false
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $link = $ws.CreateShortcut($legacy)
+        $expectedScript = Join-Path $PSScriptRoot 'start.ps1'
+        if (-not $link.Arguments -or
+            $link.Arguments.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return }
+
+        Move-Item -LiteralPath $legacy -Destination $current -ErrorAction Stop
+        $moved = $true
+        $newLink = $ws.CreateShortcut($current)
+        $newLink.Description = 'Start the Model Pilot stack at logon'
+        $newLink.Save()
+        $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+        $approval = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        if ($approval -and $approval.PSObject.Properties.Name -contains 'LocalLLM.lnk') {
+            $oldValue = $approval.'LocalLLM.lnk'
+            if ($approval.PSObject.Properties.Name -notcontains 'Model Pilot.lnk') {
+                Set-ItemProperty -Path $key -Name 'Model Pilot.lnk' -Value ([byte[]]$oldValue) -ErrorAction Stop
+            }
+            Remove-ItemProperty -Path $key -Name 'LocalLLM.lnk' -ErrorAction Stop
+        }
+    } catch {
+        if ($moved -and (Test-Path -LiteralPath $current) -and -not (Test-Path -LiteralPath $legacy)) {
+            Move-Item -LiteralPath $current -Destination $legacy -ErrorAction SilentlyContinue
+        }
+        Write-Verbose "Could not migrate the legacy startup shortcut: $($_.Exception.Message)"
+    }
+}
+
+function Move-LegacyDesktopShortcut($directory, $targetDirectory, $workingDir, $scriptPath) {
+    $legacy = Join-Path $directory 'LocalLLM.lnk'
+    $current = Join-Path $targetDirectory 'Model Pilot.lnk'
+    if (-not (Test-Path -LiteralPath $legacy)) { return }
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $old = $ws.CreateShortcut($legacy)
+        $legacyLauncher = Join-Path $workingDir 'LocalLLM.cmd'
+        $currentLauncher = Join-Path $workingDir 'ModelPilot.cmd'
+        $owned = ([string]::Equals($old.TargetPath, $legacyLauncher, [StringComparison]::OrdinalIgnoreCase)) -or
+            ([string]::Equals($old.TargetPath, $currentLauncher, [StringComparison]::OrdinalIgnoreCase)) -or
+            ($old.Arguments -and $old.WorkingDirectory -eq $workingDir -and
+             $old.Arguments.IndexOf($scriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+        if (-not $owned) { return }
+
+        if (Test-Path -LiteralPath $current) {
+            $new = $ws.CreateShortcut($current)
+            $newOwned = ([string]::Equals($new.TargetPath, $legacyLauncher, [StringComparison]::OrdinalIgnoreCase)) -or
+                ([string]::Equals($new.TargetPath, $currentLauncher, [StringComparison]::OrdinalIgnoreCase)) -or
+                ($new.Arguments -and $new.WorkingDirectory -eq $workingDir -and
+                 $new.Arguments.IndexOf($scriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+            if ($newOwned) {
+                Remove-Item -LiteralPath $legacy -Force
+                if ($directory -like '*\Start Menu\Programs\LocalLLM' -and
+                    -not (Get-ChildItem -LiteralPath $directory -Force -ErrorAction SilentlyContinue)) {
+                    Remove-Item -LiteralPath $directory -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return
+        }
+        if ([string]::Equals($old.TargetPath, $legacyLauncher, [StringComparison]::OrdinalIgnoreCase)) {
+            $old.TargetPath = $currentLauncher
+            $old.WorkingDirectory = $workingDir
+            $old.Description = 'Model Pilot'
+            $old.Save()
+        }
+        Move-Item -LiteralPath $legacy -Destination $current -ErrorAction Stop
+    } catch {
+        Write-Verbose "Could not migrate the legacy desktop shortcut at '$legacy': $($_.Exception.Message)"
+    }
+}
+
+function Migrate-LegacyDesktopShortcuts($workingDir, $scriptPath) {
+    if (-not $Plat.IsWindows) { return }
+    $programs = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    Move-LegacyDesktopShortcut $desktop $desktop $workingDir $scriptPath
+    Move-LegacyDesktopShortcut $programs $programs $workingDir $scriptPath
+    Move-LegacyDesktopShortcut (Join-Path $programs 'LocalLLM') (Join-Path $programs 'Model Pilot') $workingDir $scriptPath
+}
+
 function Get-AutostartPath {
-    if ($Plat.IsWindows) { return (Join-Path ([Environment]::GetFolderPath('Startup')) 'LocalLLM.lnk') }
+    if ($Plat.IsWindows) {
+        Move-LegacyAutostartShortcut
+        $startup = [Environment]::GetFolderPath('Startup')
+        $current = Join-Path $startup 'Model Pilot.lnk'
+        if (Test-Path -LiteralPath $current) { return $current }
+        $legacy = Join-Path $startup 'LocalLLM.lnk'
+        if (Test-Path -LiteralPath $legacy) { return $legacy }
+        return $current
+    }
     return (Join-Path $HOME 'Library/LaunchAgents/com.localllm.stack.plist')
 }
+
 
 function Enable-Autostart($scriptPath, $workingDir) {
     $target = Get-AutostartPath
@@ -290,7 +418,7 @@ function Enable-Autostart($scriptPath, $workingDir) {
         $s.TargetPath       = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $s.Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
         $s.WorkingDirectory = $workingDir
-        $s.Description      = 'Start the LocalLLM stack at logon'
+        $s.Description      = 'Start the Model Pilot stack at logon'
         $s.IconLocation     = Join-Path $env:SystemRoot 'System32\shell32.dll,15'
         $s.Save()
         return $target
@@ -337,10 +465,12 @@ function Disable-Autostart {
 # a Task Manager toggle in the registry and leaves the .lnk alone; macOS can have a plist that is
 # not loaded.
 function Test-AutostartEnabled {
-    if (-not (Test-Path (Get-AutostartPath))) { return $false }
+    $target = Get-AutostartPath
+    if (-not (Test-Path $target)) { return $false }
     if ($Plat.IsWindows) {
         $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
-        $v = (Get-ItemProperty $k -Name 'LocalLLM.lnk' -ErrorAction SilentlyContinue).'LocalLLM.lnk'
+        $name = [IO.Path]::GetFileName($target)
+        $v = (Get-ItemProperty $k -Name $name -ErrorAction SilentlyContinue).$name
         # ponytail: byte 0 odd = disabled is the documented shape of this value; read the rest of
         # the struct only if Microsoft gives it more meanings.
         return -not ($v -and ($v[0] % 2))
@@ -448,12 +578,13 @@ function New-DesktopLauncher($scriptPath, $workingDir) {
         $ws = New-Object -ComObject WScript.Shell
         $target = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $argline = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+        Migrate-LegacyDesktopShortcuts $workingDir $scriptPath
         foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
                            (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
-            $path = Join-Path $dir 'LocalLLM.lnk'
+            $path = Join-Path $dir 'Model Pilot.lnk'
             $lnk = $ws.CreateShortcut($path)
             $lnk.TargetPath = $target; $lnk.Arguments = $argline
-            $lnk.WorkingDirectory = $workingDir; $lnk.Description = 'LocalLLM control panel'
+            $lnk.WorkingDirectory = $workingDir; $lnk.Description = 'Model Pilot control panel'
             $lnk.IconLocation = Join-Path $env:SystemRoot 'System32\shell32.dll,15'
             $lnk.Save()
             $made += $path
@@ -466,7 +597,7 @@ function New-DesktopLauncher($scriptPath, $workingDir) {
     if (-not (Test-Path $pwshExe)) { $pwshExe = 'pwsh' }
     foreach ($dir in @((Join-Path $HOME 'Applications'), (Join-Path $HOME 'Desktop'))) {
         if (-not (Test-Path $dir)) { continue }
-        $path = Join-Path $dir 'LocalLLM.command'
+        $path = Join-Path $dir 'ModelPilot.command'
         Set-Content -Path $path -Encoding utf8 -Value @"
 #!/bin/bash
 cd "$workingDir" || exit 1
@@ -510,6 +641,29 @@ function Get-NpmCmd($nodeDir) {
 }
 # Bare tool name plus the platform suffix, so callers say what they mean and never ".exe".
 function Get-ToolName($name) { return ($name + (Get-ExeSuffix)) }
+function ConvertTo-ProcessArgument([string]$value) {
+    # Start-Process joins ArgumentList items into one command line. Quote each value using the
+    # Windows C-runtime rules so installed roots and user-selected paths containing spaces survive.
+    if ($null -eq $value) { $value = '' }
+    if (-not $Plat.IsWindows) { return $value }
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append([char]34)
+    $slashes = 0
+    foreach ($character in $value.ToCharArray()) {
+        if ($character -eq [char]92) { $slashes++; continue }
+        if ($character -eq [char]34) {
+            [void]$builder.Append([char]92, (2 * $slashes) + 1)
+            [void]$builder.Append([char]34)
+            $slashes = 0
+            continue
+        }
+        if ($slashes) { [void]$builder.Append([char]92, $slashes); $slashes = 0 }
+        [void]$builder.Append($character)
+    }
+    if ($slashes) { [void]$builder.Append([char]92, 2 * $slashes) }
+    [void]$builder.Append([char]34)
+    $builder.ToString()
+}
 
 # curl does the multi-GB weight downloads: it resumes, and it reports progress. Absolute path
 # for the same reason as tar - PATH order decides which binary answers, and being explicit is

@@ -1,8 +1,8 @@
-# LocalLLM control panel - a local web UI that opens as a chromeless desktop window.
+# Model Pilot desktop control panel - local UI served in a chromeless browser window.
 #
 #   .\ui.ps1                 # start the server and open the window
 #   .\ui.ps1 -NoWindow       # server only (then browse to http://127.0.0.1:9300)
-#   .\ui.ps1 -Launch         # spawn the server detached and wait for it (what LocalLLM.cmd runs)
+#   .\ui.ps1 -Launch         # spawn the server detached and wait for it (what ModelPilot.cmd runs)
 #   .\ui.ps1 -Install        # desktop + start-menu shortcut, and the start-with-Windows command
 #
 # Why a local web page rather than WinForms: the same density CPU-Z gets from Win32 controls is
@@ -21,13 +21,16 @@ param(
     [int]$Port = 9300,
     [switch]$NoWindow,
     [switch]$Install,
-    [switch]$Launch
+    [switch]$Launch,
+    [switch]$RestartPanel
 )
 
 $ErrorActionPreference = 'Stop'
 $root       = $PSScriptRoot
 # Platform differences live in platform.ps1 and nowhere else - see the header there.
-. (Join-Path $PSScriptRoot 'platform.ps1')
+. (Join-Path $root 'platform.ps1')
+Migrate-LegacyDesktopShortcuts $root (Join-Path $root 'ui.ps1')
+if ($Plat.IsWindows) { [void](Get-AutostartPath) }
 $startPs    = Join-Path $root 'start.ps1'
 $swapCfg    = Join-Path $root 'llamaswap\config.yaml'
 $llamaCpp   = Join-Path $root 'llama.cpp'
@@ -71,9 +74,9 @@ $script:build = (Get-Item -LiteralPath $PSCommandPath).LastWriteTimeUtc.Ticks.To
 # five of them open it still reports one, the check for "is a window already up" passes on the
 # wrong evidence, and each launch adds another. Five identical panels, which is what happened.
 #
-# EnumWindows is the only way to actually see them. The title match alone isn't enough either -
-# this repo lives in C:\LocalLLM, so an Explorer window on that folder is also titled "LocalLLM" -
-# hence the check that the owning process is a browser.
+# The browser title is Model Pilot. The legacy installation folder remains C:\LocalLLM, and
+# Explorer windows there are still titled LocalLLM, so the owning browser process is checked too.
+
 Add-Type -ErrorAction SilentlyContinue @'
 using System;
 using System.Collections.Generic;
@@ -115,7 +118,7 @@ public static class PanelWin {
 
 $BROWSER_PROCS = @('chrome', 'msedge', 'brave')
 
-function Get-PanelWindows { @([PanelWin]::Find('LocalLLM', $BROWSER_PROCS)) }
+function Get-PanelWindows { @([PanelWin]::Find('Model Pilot', $BROWSER_PROCS)) + @([PanelWin]::Find('LocalLLM', $BROWSER_PROCS)) }
 
 # Bring the panel back rather than opening another one. Returns false when there is nothing to
 # bring back, which is the only case where a new window should be launched.
@@ -172,18 +175,36 @@ if ($Install) {
     return
 }
 
-# Double-clicking LocalLLM.cmd lands here. The panel has to outlive its launcher - closing the
+# Double-clicking ModelPilot.cmd lands here. The panel has to outlive its launcher - closing the
 # browser window is a minimise, not a quit - so this spawns the server detached and then waits on
 # its health endpoint. Without the wait, a failure to start (a taken port, a broken PowerShell
 # policy) would be completely silent: no window, no message, nothing to act on.
 if ($Launch) {
     # Files extracted from a downloaded .zip carry mark-of-the-web. -ExecutionPolicy Bypass already
     # ignores it, but clearing it stops the "do you want to run" prompt in every other entry point.
-    Get-ChildItem $root -Filter *.ps1 | Unblock-File -ErrorAction SilentlyContinue
-    Start-Process powershell -WindowStyle Hidden `
-        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-                      '-File', $PSCommandPath, '-Port', $Port
-    Write-Host "Starting the LocalLLM panel..."
+    if ($RestartPanel) {
+        $otherPanelServers = @(Get-PanelServerProcesses $PSCommandPath $PID)
+        foreach ($server in $otherPanelServers) {
+            Stop-Process -Id $server.ProcessId -Force -ErrorAction Stop
+        }
+        if ($otherPanelServers) {
+            $deadline = (Get-Date).AddSeconds(5)
+            do {
+                $responding = $false
+                try {
+                    $responding = (Invoke-WebRequest "http://127.0.0.1:$Port/api/ping" -UseBasicParsing -TimeoutSec 1).StatusCode -eq 200
+                } catch { }
+                if (-not $responding) { break }
+                Start-Sleep -Milliseconds 250
+            } while ((Get-Date) -lt $deadline)
+            if ($responding) { throw 'The existing Model Pilot panel did not stop; close it and run the installer again.' }
+        }
+    }
+    $launchArgs = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+                    '-File', $PSCommandPath, '-Port', $Port)
+    $launchArgs = @($launchArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
+    Start-Process powershell -WindowStyle Hidden -ArgumentList $launchArgs
+    Write-Host "Starting the Model Pilot panel..."
     foreach ($i in 1..30) {
         Start-Sleep -Milliseconds 500
         try {
@@ -346,6 +367,11 @@ function Get-Downloads {
     }
 }
 
+function Get-ModelIdFromFileName($path) {
+    $id = [IO.Path]::GetFileNameWithoutExtension($path).ToLowerInvariant() -replace '[^a-z0-9_-]+', '-'
+    $id.Trim('-')
+}
+
 function Get-OrphanModels {
     $s = Get-Settings
     if (-not (Test-Path $s.modelsDir)) { return @() }
@@ -362,9 +388,15 @@ function Get-Dashboard {
         $gpu = @{ name = $acc.Name; total = $acc.TotalMib; used = $acc.UsedMib; free = $acc.FreeMib
                   temp = $acc.TempC; util = $acc.UtilPct }
     }
+    # Probe the router before asking for its loaded model. The listener's /running endpoint can
+    # wait until its timeout when llama-swap is down; that state is already known from /health.
+    $swapUp = Test-Endpoint "http://127.0.0.1:$swapPort/health"
+    $webuiUp = Test-Endpoint "http://127.0.0.1:$webuiPort/health"
     $loaded = $null
-    try { $loaded = ((Invoke-RestMethod "http://127.0.0.1:$swapPort/running" -TimeoutSec 2).running |
-                     Where-Object { $_.state -ne 'stopped' } | Select-Object -First 1).model } catch { }
+    if ($swapUp) {
+        try { $loaded = ((Invoke-RestMethod "http://127.0.0.1:$swapPort/running" -TimeoutSec 2).running |
+                         Where-Object { $_.state -ne 'stopped' } | Select-Object -First 1).model } catch { }
+    }
     Update-Usage $loaded
     # Cached for Get-Sensors, which is polled every second and must not add a second HTTP probe.
     $script:lastLoaded = $loaded
@@ -376,10 +408,10 @@ function Get-Dashboard {
         # would imply a button that cannot do anything.
         services = @(
             @{ key = 'swap'; name = 'llama-swap'; role = 'model router'; managed = $true; selected = [bool]$cfg.useSwap
-               up = (Test-Endpoint "http://127.0.0.1:$swapPort/health"); url = "http://127.0.0.1:$swapPort/ui"
+               up = $swapUp; url = "http://127.0.0.1:$swapPort/ui"
                installed = (Test-Path (Join-Path $root 'llamaswap\llama-swap.exe')) }
             @{ key = 'webui'; name = 'open-webui'; role = 'chat interface'; managed = $true; selected = [bool]$cfg.useWebui
-               up = (Test-Endpoint "http://127.0.0.1:$webuiPort/health"); url = "http://127.0.0.1:$webuiPort"
+               up = $webuiUp; url = "http://127.0.0.1:$webuiPort"
                installed = [bool](Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue) }
             @{ key = 'opencode'; name = 'opencode'; role = 'local coding agent (per-task CLI)'; managed = $false; selected = $false
                up = $false; url = ''; installed = [bool](Get-Command opencode -ErrorAction SilentlyContinue) }
@@ -477,12 +509,14 @@ function Get-Engine {
 # Downloads and autotune runs take minutes. They run detached with output to a log, and the UI
 # polls that log - so the HTTP thread never blocks and progress is visible while it happens.
 
+
 function Start-Job2($name, $argList, $script) {
     if (-not $script) { $script = $startPs }
     $id = "{0}-{1}" -f $name, (Get-Date -Format 'HHmmss')
     $log = Join-Path $jobDir "$id.log"
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) + $argList
-    $p = Start-Process powershell -WindowStyle Hidden -ArgumentList $a -PassThru `
+    $quotedArgs = @($a | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
+    $p = Start-Process powershell -WindowStyle Hidden -ArgumentList $quotedArgs -PassThru `
              -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     # Below-normal priority so the panel keeps its own thread. Moving the work out of the request
     # stopped it blocking structurally, but a CPU-bound job (llmfit scoring, a model load) still
@@ -520,7 +554,10 @@ function Get-Async($name, $key) {
     }
     $err = if (Test-Path "$log.err") { (Get-Content "$log.err" -Raw) } else { '' }
     @{ running = $false
-       out = $(if (Test-Path $log) { Get-Content $log } else { @() })
+       # Windows PowerShell decorates Get-Content strings with provider metadata. Serializing
+       # those objects produced JSON objects instead of strings, so UI response checks saw
+       # "[object Object]" and graded a successful completion as a failure.
+       out = $(if (Test-Path $log) { @(Get-Content $log | ForEach-Object { "$_" }) } else { @() })
        err = "$err" }
 }
 
@@ -595,33 +632,59 @@ function Get-Jobs {
 # ---------------------------------------------------------------- page
 
 $html = @'
-<!doctype html><html><head><meta charset="utf-8"><title>LocalLLM</title>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Model Pilot</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='6.5' y='6.5' width='19' height='19' rx='3.5' fill='none' stroke='%232360c4' stroke-width='2'/%3E%3Cg stroke='%232360c4' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 6.5V3M16 6.5V3M20 6.5V3M12 25.5V29M16 25.5V29M20 25.5V29'/%3E%3Cpath d='M6.5 12H3M6.5 16H3M6.5 20H3M25.5 12H29M25.5 16H29M25.5 20H29'/%3E%3C/g%3E%3Cpath d='M12 12.5h8a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-4.2L13 21v-2.5h-1a1.5 1.5 0 0 1-1.5-1.5v-3a1.5 1.5 0 0 1 1.5-1.5z' fill='%232360c4'/%3E%3C/svg%3E">
 <style>
-:root{--bg:#f3f4f6;--panel:#fff;--line:#d6dae1;--fg:#1b2027;--dim:#5f6875;--ok:#127a45;--warn:#8a6100;--bad:#c1362b;--acc:#2360c4;--soft:#eef1f5}
+:root{--bg:#f5f7fb;--panel:#fff;--line:#e2e7f0;--fg:#1d2939;--dim:#536176;--ok:#147a54;--warn:#a86608;--bad:#bb3b46;--acc:#405dc8;--soft:#eef2f8;--tint:#eef3ff;--shadow:0 5px 18px rgba(26,42,74,.06)}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:12.5px/1.4 "Segoe UI",system-ui,sans-serif;user-select:none}
-header{display:flex;align-items:center;gap:9px;padding:7px 11px;background:var(--panel);border-bottom:1px solid var(--line)}
-header b{font-size:13px;font-weight:600}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+@media(forced-colors:active){:focus-visible{outline-color:Highlight}.dot{border:1px solid CanvasText}.bar{border:1px solid CanvasText}.bar i{background:Highlight}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 "Segoe UI",system-ui,sans-serif;user-select:none}
+header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:12px 26px;background:rgba(255,255,255,.96);border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}
+header b{font-size:16px;font-weight:650;letter-spacing:-.02em}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%}.up{background:var(--ok)}.down{background:var(--bad)}.part{background:var(--warn)}
-nav{display:flex;background:var(--soft);padding:0 8px;border-bottom:1px solid var(--line)}
-nav button{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:6px 15px;font-size:12px;cursor:pointer}
-nav button.on{color:var(--acc);border-bottom-color:var(--acc);background:var(--panel);font-weight:600}
-main{padding:10px}
+nav{position:sticky;top:53px;z-index:19;display:flex;align-items:center;gap:5px;padding:8px 26px;background:rgba(255,255,255,.96);border-bottom:1px solid var(--line)}
+nav button,nav summary{background:transparent;border:0;border-radius:7px;color:var(--dim);padding:8px 13px;font-size:13px;font-weight:550;cursor:pointer;list-style:none}
+nav button:hover,nav summary:hover{background:var(--soft);color:var(--fg)}
+nav button.on,nav summary.on{color:var(--acc);background:var(--tint);font-weight:650}
+.nav-more{position:relative;margin-left:auto}
+.nav-more summary::-webkit-details-marker{display:none}
+ .nav-more summary:after{content:'';display:inline-block;width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);margin:0 0 3px 7px}
+.nav-menu{position:absolute;right:0;top:42px;min-width:190px;padding:6px;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
+.nav-menu button{display:block;width:100%;text-align:left}
+main{width:min(1360px,100%);margin:0 auto;padding:26px 34px 48px}
 .pane{display:none}.pane.on{display:block}
-fieldset{border:1px solid var(--line);border-radius:4px;margin:0 0 9px;padding:6px 9px 8px;background:var(--panel)}
-legend{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;padding:0 4px;font-weight:600}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:var(--dim);font-weight:600;padding:3px 7px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:3px 7px;border-bottom:1px solid #eceff3;white-space:nowrap}
-tr:last-child td{border-bottom:0}
-.kv{display:grid;grid-template-columns:118px 1fr;gap:1px 10px;font-size:12px}
+fieldset,.surface{border:1px solid var(--line);border-radius:13px;margin:0 0 16px;padding:18px 20px;background:var(--panel);box-shadow:var(--shadow)}
+legend{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.08em;padding:0 5px;font-weight:700}
+.section-head{display:flex;align-items:flex-end;justify-content:space-between;margin:0 0 20px}
+.section-head h1{font-size:27px;line-height:1.2;letter-spacing:-.035em;margin:3px 0 4px}
+.section-head p,.surface p{margin:4px 0 0;color:var(--dim)}
+.eyebrow{font-size:10px;font-weight:750;letter-spacing:.12em;color:var(--acc)}
+.surface h2{font-size:16px;line-height:1.3;letter-spacing:-.015em;margin:3px 0}
+.surface h3{font-size:14px;margin:0 0 8px}
+.surface-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}
+.home-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(270px,.85fr);gap:16px;align-items:start}
+.service-grid{display:grid;gap:10px}
+.service-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 16px;padding:14px;border:1px solid var(--line);border-radius:10px;background:#fff}
+.service-card h3{margin:0;font-size:14px}.service-card p{margin:3px 0 0;font-size:12px}
+.service-meta{display:flex;align-items:center;gap:8px}
+.service-card .service-choice{grid-column:1/-1;display:flex;align-items:center;gap:8px;margin-top:5px;color:var(--dim);font-size:12px}
+.service-card .service-choice input{width:auto}
+.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:20px;background:#f0f3f8;padding:4px 9px;font-size:11px;font-weight:650;color:var(--dim)}
+.status-pill.good{background:#eaf6f0;color:var(--ok)}.status-pill.bad{background:#fff0f0;color:var(--bad)}.status-pill.warn{background:#fff6e7;color:var(--warn)}
+.kv{display:grid;grid-template-columns:minmax(94px,.55fr) 1fr;gap:9px 12px;font-size:13px}
 .kv span{color:var(--dim)}
-button.act{background:var(--acc);color:#fff;border:0;border-radius:3px;padding:3px 10px;font-size:11.5px;cursor:pointer}
-button.gh{background:var(--soft);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:3px 10px;font-size:11.5px;cursor:pointer}
-button.gh:hover{background:#e3e8ef}
-button.dz{background:#fff;color:var(--bad);border:1px solid #e4b7b2;border-radius:3px;padding:3px 9px;font-size:11.5px;cursor:pointer}
-button:disabled{opacity:.4;cursor:default}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:700;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:10px;border-bottom:1px solid #edf0f5;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+.table-wrap{width:100%;overflow:auto}
+button.act{background:var(--acc);color:#fff;border:0;border-radius:7px;padding:8px 14px;font-size:13px;font-weight:650;cursor:pointer;box-shadow:0 2px 5px rgba(64,93,200,.16)}
+button.act:hover{background:#344faf}
+button.gh{background:#fff;color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer}
+button.gh:hover{background:var(--soft);border-color:#cad3e2}
+button.dz{background:#fff;color:var(--bad);border:1px solid #ecc8ca;border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
 /* A click that starts a background job has no other visible effect for up to three seconds -
    the next poll - so the button says so itself. The label stays readable; only a spinner is
    added, because a button whose text vanishes reads as broken rather than busy. */
@@ -631,11 +694,44 @@ button.busy::before{content:'';display:inline-block;width:9px;height:9px;margin-
  border:2px solid var(--dim);border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite}
 button.act.busy::before{border-color:#fff;border-top-color:transparent}
 button.busy:disabled{opacity:.85}
-input,select{background:#fff;border:1px solid var(--line);color:var(--fg);border-radius:3px;padding:3px 6px;font-size:12px;user-select:text}
+input,select{background:#fff;border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:8px 10px;font-size:13px;user-select:text}
 input{width:100%}
+input[type=checkbox]{accent-color:var(--acc)}
+.check-label{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px}
+.check-label input{width:auto}
 .adv{display:none}body.showadv .adv{display:table-cell}
-.bar{height:5px;background:#e2e6ec;border-radius:3px;overflow:hidden;margin-top:3px}
+.bar{height:6px;background:#e5eaf2;border-radius:8px;overflow:hidden;margin-top:5px}
 .bar i{display:block;height:100%;background:var(--acc)}
+.home-grid .hint{margin-top:10px}
+.hero{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:0 0 18px;padding:20px 22px;border:1px solid #d9e2ff;border-radius:13px;background:linear-gradient(120deg,#f2f5ff,#fff)}
+.hero h2{font-size:19px;letter-spacing:-.025em;margin:3px 0}
+.hero p{margin:4px 0 0;color:var(--dim);max-width:680px}
+.hero-actions{display:flex;gap:8px;max-width:58%;min-width:0;flex-shrink:1;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+.hero>div:first-child{flex:1;min-width:0}
+.hero-actions>div{max-width:100%;min-width:0}
+.hero-actions .subtle{overflow-wrap:anywhere}
+.model-tools{margin:0 0 16px}
+.picker{background:linear-gradient(135deg,#fff,#f9faff)}
+.model-pick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:16px}
+.model-pick{border:1px solid var(--line);border-radius:10px;padding:15px;background:#fff}
+.model-pick-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.model-pick h3{margin:0;font-size:14px;word-break:break-word}
+.model-pick .fit{font-size:11px;font-weight:700;color:var(--fg);background:var(--soft);border-radius:20px;padding:3px 8px;white-space:nowrap}
+.model-pick .fit.good{background:#eaf6f0;color:var(--ok)}.model-pick .fit.warn{background:#fff6e7;color:var(--warn)}
+.model-stats{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0;color:var(--dim)}
+.recommendation-reason{font-size:12px;line-height:1.5;color:var(--dim);min-height:36px;margin:9px 0 0}
+.model-stats span{background:var(--soft);padding:3px 7px;border-radius:5px;font-size:11px}
+.model-pick button{width:100%;margin-top:4px}
+.empty-state{padding:20px;text-align:center;border:1px dashed #cbd4e2;border-radius:9px;color:var(--dim)}
+.disclosure summary,.subtle-list summary{cursor:pointer;font-weight:650}
+.disclosure[open] summary{margin-bottom:12px}
+.subtle-list{margin-top:12px}
+.download-box{padding:12px;margin:12px 0;background:#f8faff;border:1px solid var(--line);border-radius:9px}
+.subtle,.note{color:var(--dim);font-size:12px}
+@media(max-width:760px){header{padding:8px 12px;gap:8px}header .gh,header .act{padding:6px 7px;font-size:12px}main{padding:18px 14px 32px}.home-grid{grid-template-columns:1fr}.section-head{align-items:flex-start}.hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%}nav{padding:7px 10px;overflow:visible}nav button,nav summary{padding:8px 9px}.service-card{grid-template-columns:1fr}.service-meta{grid-column:1}.service-card .service-choice{grid-column:1}}
+@media(max-width:760px){.hero-actions{max-width:none;min-width:0}}
+@media(max-width:760px){.import-table{display:block;width:100%}.import-table thead{display:none}.import-table tbody{display:block;width:100%}.import-table tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:12px 0;border-bottom:1px solid var(--line)}.import-table td{display:block;min-width:0;padding:0 2px}.import-table td:first-child{grid-column:1/-1}.import-table td:first-child .subtle{overflow-wrap:anywhere;word-break:break-word;white-space:normal}.import-table td:nth-child(2){grid-column:1}.import-table td:nth-child(3){grid-column:2;max-width:100%;text-align:right}.import-table .miss{display:block;max-width:100%;overflow-wrap:anywhere}}
+@media(max-width:760px){#modelTable{display:block;width:100%;min-width:0}#modelTable thead{display:none}#modelTable tbody{display:block;width:100%}#modelTable tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:11px 0;border-bottom:1px solid var(--line)}#modelTable td{display:block;min-width:0;padding:2px 0}#modelTable td.adv{display:none}#modelTable td:first-child{grid-column:1;overflow-wrap:anywhere}#modelTable td:nth-child(2){display:none}#modelTable td:nth-child(3){grid-column:1;color:var(--dim);font-size:12px}#modelTable td:nth-child(9){grid-column:2;grid-row:1;white-space:nowrap}#modelTable td:nth-child(10){grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px}#modelTable td:nth-child(10) button{font-size:11px;padding:6px 8px}}
 /* Anything slow gets a card in the corner saying what is happening, how long it usually takes,
    and its latest line of output. Every long action already routes through spin(), so the card is
    driven off the same busy() state the buttons use rather than a second bookkeeping system. */
@@ -705,32 +801,40 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
   fill="var(--acc)" stroke="none"/>
 </symbol></svg>
 <header><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><use href="#mark"/></svg>
-<b>LocalLLM</b><span id="d" class="dot down" title="stack status"></span><span id="sub" style="color:var(--dim);font-size:11px"></span>
+<b>Model Pilot</b><span id="d" class="dot down" title="stack status"></span><span id="sub" style="color:var(--dim);font-size:11px"></span>
 <span style="flex:1"></span>
-<button class="gh" id="hre" onclick="act('restart')">Restart</button>
-<button class="gh" id="hst" onclick="act('stop')">Stop</button>
-<button class="act" id="go" onclick="act('deploy')">Start</button></header>
-<nav>
-<button class="on" onclick="tab(0,this)">Dashboard</button>
-<button onclick="tab(2,this)">Models</button>
-<button onclick="tab(1,this)">Engine</button>
-<button onclick="tab(3,this)">Tools</button>
-<button onclick="tab(4,this)">Monitoring</button>
-<button onclick="tab(5,this)">Activity</button>
-<button onclick="tab(6,this)">Settings</button>
+ <button class="gh" id="hre" aria-label="Restart selected services" onclick="act('restart')" disabled>Restart</button>
+ <button class="gh" id="hst" aria-label="Stop selected services" onclick="act('stop')" disabled>Stop</button>
+ <button class="act" id="go" aria-label="Start selected services" onclick="act('deploy')" disabled>Start</button></header>
+<nav aria-label="Main navigation">
+ <button class="on" data-pane="0" aria-current="page" onclick="tab(0,this)">Home</button>
+ <button data-pane="2" onclick="tab(2,this)">Models</button>
+ <button data-pane="5" onclick="tab(5,this)">Activity</button>
+ <button data-pane="6" onclick="tab(6,this)">Settings</button>
+ <details class="nav-more" id="navMore"><summary id="moreNav" aria-label="More navigation">More</summary><div class="nav-menu">
+  <button onclick="tab(1,this)">Engine details</button>
+  <button onclick="tab(3,this)">Tools</button>
+  <button onclick="tab(4,this)">Monitoring</button>
+ </div></details>
 </nav>
 <main>
-<div id="guide"></div>
 
 <div class="pane on" id="p0">
- <fieldset><legend>Services</legend>
-  <table><thead><tr><th style="width:24px"></th><th>Service</th><th>Role</th><th>State</th><th></th></tr></thead><tbody id="svc"></tbody></table>
-  <div class="hint" style="margin:7px 0 0">Ticked services are your stack: Start, Stop and Restart act on those only, and the status light ignores the rest.</div>
- </fieldset>
- <fieldset><legend>Hardware</legend><div class="kv" id="hw"></div></fieldset>
+ <div class="section-head"><div><div class="eyebrow">YOUR LOCAL AI WORKSPACE</div><h1>Home</h1><p>Start your services, choose a model, then chat on your own machine.</p></div></div>
+ <div id="homeLoading" class="hint" role="status" aria-live="polite">Checking this PC and the local services. This can take a few seconds.</div>
+ <div id="guide"></div>
+ <div id="verifyResult" class="verify-result" role="status" aria-live="polite" style="display:none"></div>
+ <div class="home-grid">
+  <section class="surface"><div class="surface-head"><div><h2>Your services</h2><p>Choose which parts of the local AI stack should run.</p></div><div class="row">
+   <button class="gh" id="homeRestart" onclick="act('restart')">Restart</button><button class="gh" id="homeStop" onclick="act('stop')">Stop</button></div></div>
+   <div id="svc" class="service-grid"><div class="hint" style="grid-column:1/-1">Checking installed services...</div></div>
+  </section>
+  <section class="surface"><div class="surface-head"><div><h2>This PC</h2><p>Hardware available to your models.</p></div></div><div class="kv" id="hw"><span>Hardware</span><div>Reading memory and accelerator information...</div></div></section>
+ </div>
 </div>
 
 <div class="pane" id="p1">
+ <div class="section-head"><div><div class="eyebrow">SYSTEM STATUS</div><h1>Engine details</h1><p>Versions, services and API endpoints for troubleshooting and integrations.</p></div></div>
  <div class="row" style="margin-bottom:9px">
   <button class="gh" onclick="chk()">Check for updates</button>
   <button class="gh" onclick="inst('components')">Install / repair all</button>
@@ -751,40 +855,49 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 </div>
 
 <div class="pane" id="p2">
- <fieldset><legend>What should I run?</legend>
-  <div class="mode">Ranks known models against this machine's actual RAM, VRAM and memory bandwidth, and tells you which quant to take.</div>
+ <div class="section-head"><div><div class="eyebrow">MODEL LIBRARY</div><h1>Models</h1><p>Find one that fits, bring in a model you already have, and manage what's ready to use.</p></div></div>
+ <section class="surface picker">
+  <div class="eyebrow">RECOMMENDED</div><h2>Find a model for this PC</h2>
+  <p>Recommendations use your available memory and hardware. You can review the fit before downloading.</p>
   <div class="row">
-   <select id="sgcase" style="width:auto">
-    <option value="">any use case</option><option value="coding">coding</option>
-    <option value="reasoning">reasoning</option><option value="general">general</option><option value="chat">chat</option>
+   <select id="sgcase" aria-label="Recommendation use case" style="width:auto">
+    <option value="">Any use case</option><option value="coding">Coding</option>
+    <option value="reasoning">Reasoning</option><option value="general">General</option><option value="chat">Chat</option>
    </select>
-   <label style="font-size:11px;color:var(--dim)"><input type="checkbox" style="width:auto" id="sgtools"> must be able to call tools</label>
-   <button class="act" id="sgbtn" onclick="suggest()">Suggest models</button>
-   <span id="sgmsg" style="color:var(--dim);font-size:11px"></span>
+   <label class="check-label"><input type="checkbox" id="sgtools"> Needs tool calling</label>
+   <button class="act" id="sgbtn" onclick="suggest()">Find models</button>
+   <span id="sgmsg" class="subtle"></span>
   </div>
   <div id="sug"></div>
- </fieldset>
-
- <fieldset><legend>Add a model you already know</legend>
-  <div class="row">
-   <input id="repo" placeholder="Hugging Face repo, e.g. unsloth/gpt-oss-20b-GGUF  (or a direct .gguf URL)" style="flex:1;min-width:260px">
-   <button class="gh" onclick="inspect()">Inspect</button>
-  </div>
-  <div id="insp"></div>
- </fieldset>
- <fieldset id="dlbox" style="display:none"><legend>Downloading</legend><div id="dlrows"></div></fieldset>
- <fieldset><legend>Configured models</legend>
-  <div class="row" style="margin-bottom:6px"><label style="font-size:11px;color:var(--dim)">
-    <input type="checkbox" style="width:auto" id="advchk" onchange="adv(this.checked)"> Show the raw llama.cpp settings</label></div>
-  <table><thead><tr><th>Model</th><th>Size</th><th>Conversation length</th><th class="adv">Context</th><th class="adv">KV</th><th class="adv">MoE</th><th class="adv">Last used</th><th class="adv">Loads</th><th>State</th><th></th></tr></thead><tbody id="mt"></tbody></table>
-  <div class="hint" style="margin:7px 0 0">Conversation length is how much of a chat the model can hold before it starts forgetting the beginning. <b>Tune</b> measures this machine and sets it as high as your card allows. Tick the box above for the raw <code>-c</code>, KV type and usage counts.</div>
- </fieldset>
- <fieldset><legend>Weights on disk with no config entry</legend><table><tbody id="orph"></tbody></table></fieldset>
+ </section>
+ <div class="home-grid model-tools">
+  <section class="surface"><div class="eyebrow">ALREADY DOWNLOADED?</div><h2>Find models on your drive</h2>
+   <p>Choose a folder and scan for GGUF files. Adding one creates a model entry with 16k context and q8_0 KV defaults; the file stays where it is and is never copied or moved. Tune can measure settings for this PC later.</p>
+   <div class="row"><button class="gh" onclick="browseDir()">Choose model folder</button><button class="gh" id="scanModelsBtn" onclick="scanModels()">Scan folder</button></div>
+   <div class="subtle" id="modelDirLabel" style="margin-top:9px"></div>
+   <div id="modelFiles"></div>
+  </section>
+  <details class="surface disclosure"><summary>I know which model I want</summary>
+   <p>Inspect a Hugging Face repo or paste a direct GGUF URL.</p>
+   <div class="row"><input id="repo" aria-label="Hugging Face repository or model URL" placeholder="Hugging Face repo, model URL or .gguf URL" style="flex:1;min-width:240px">
+    <button class="gh" onclick="inspect()">Inspect</button></div>
+   <div id="insp"></div>
+  </details>
+ </div>
+ <section class="surface"><div class="surface-head"><div><h2>Your models</h2><p>Models configured for this install. Tune a model to measure settings for this PC.</p></div>
+  <label class="check-label"><input type="checkbox" id="advchk" onchange="adv(this.checked)"> Advanced settings</label></div>
+  <div id="dlbox" class="download-box" style="display:none"><h3>Downloads</h3><div id="dlrows"></div></div>
+  <div class="table-wrap"><table id="modelTable"><thead><tr><th>Model</th><th>File size</th><th>Conversation length</th><th class="adv">Context</th><th class="adv">KV</th><th class="adv">MoE</th><th class="adv">Last used</th><th class="adv">Loads</th><th>Status</th><th>Actions</th></tr></thead><tbody id="mt"></tbody></table></div>
+  <div id="emptyModels" class="empty-state" style="display:none">No models configured yet. Find a recommendation above or scan a folder for GGUF files.</div>
+  <div class="subtle" style="margin-top:10px">Context length describes how much conversation a model can hold. Tune measures a setting that fits this PC.</div>
+  <details class="subtle-list"><summary>Unconfigured model files</summary><div class="table-wrap"><table><tbody id="orph"></tbody></table></div></details>
+ </section>
 </div>
 
 <div class="pane" id="p3">
+ <div class="section-head"><div><div class="eyebrow">LOCAL WORKFLOWS</div><h1>Tools</h1><p>Run local tasks or delegate large-file reading to a model on this PC.</p></div></div>
  <fieldset><legend>Project</legend>
-  <div class="row"><input id="pdir" placeholder="C:\path\to\your\project" style="flex:1"></div>
+  <div class="row"><input id="pdir" aria-label="Project folder" placeholder="C:\path\to\your\project" style="flex:1"></div>
   <div class="hint" style="margin:7px 0 0">Used by the two Run buttons below.</div>
   <div id="agstat" style="color:var(--dim);font-size:11px;margin-top:5px"></div>
  </fieldset>
@@ -796,32 +909,34 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 
  <fieldset><legend>opencode, on a local model</legend>
   <div class="mode">A local agent does the whole task itself, start to finish. Nothing reaches Anthropic at any point.</div>
-  <div class="row"><input id="agtask" placeholder="what it should do, e.g. add a guard clause to divide()" style="flex:1">
+  <div class="row"><input id="agtask" aria-label="Local agent task" placeholder="what it should do, e.g. add a guard clause to divide()" style="flex:1">
    <button class="gh" onclick="runLocal('agent')">Run</button></div>
  </fieldset>
 
  <fieldset><legend>Delegate the reading</legend>
   <div class="mode">Claude Code stays on the cloud model and keeps its judgement; only the bulk reading happens here, so a huge file costs you almost no quota.</div>
-  <div class="row"><input id="dgfile" placeholder="file to read (optional)" style="flex:1.2">
-   <input id="dgtask" placeholder="what to extract" style="flex:1.4">
+  <div class="row"><input id="dgfile" aria-label="File to read, optional" placeholder="file to read (optional)" style="flex:1.2">
+   <input id="dgtask" aria-label="What to extract from the file" placeholder="what to extract" style="flex:1.4">
    <button class="gh" onclick="runLocal('delegate')">Run</button></div>
  </fieldset>
  <div class="hint">Results from the two Run buttons appear under Models &gt; Activity.</div>
 </div>
 
 <div class="pane" id="p4">
+ <div class="section-head"><div><div class="eyebrow">LIVE HARDWARE</div><h1>Monitoring</h1><p>Sensor history is sampled only while this view is open.</p></div></div>
  <fieldset><legend>Sensors</legend>
   <div class="row" style="margin-bottom:6px">
    <button class="gh" onclick="monReset()">Reset min/max</button>
    <span id="monmeta" style="color:var(--dim);font-size:11px"></span>
   </div>
-  <table class="sens"><thead><tr><th>Sensor</th><th>Current</th><th>Minimum</th><th>Maximum</th><th>Average</th></tr></thead>
-   <tbody id="sens"><tr><td colspan="5" style="color:var(--dim)">waiting for the first sample...</td></tr></tbody></table>
+  <div class="table-wrap"><table class="sens"><thead><tr><th>Sensor</th><th>Current</th><th>Minimum</th><th>Maximum</th><th>Average</th></tr></thead>
+   <tbody id="sens"><tr><td colspan="5" style="color:var(--dim)">waiting for the first sample...</td></tr></tbody></table></div>
   <div class="hint" style="margin:7px 0 0">Sampled once a second while this tab is open, and not at all while it isn't. Min/max/average cover the samples since this window opened or since the last reset - they are not a lifetime record.</div>
  </fieldset>
 </div>
 
 <div class="pane" id="p5">
+ <div class="section-head"><div><div class="eyebrow">BACKGROUND WORK</div><h1>Activity</h1><p>Follow downloads, setup, upgrades and model tuning.</p></div></div>
  <fieldset><legend>Running and recent jobs</legend>
   <div class="mode">Downloads, installs, autotune runs and stack restarts all run detached and write here. This is where their output goes.</div>
   <div id="jobs"></div>
@@ -829,23 +944,24 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 </div>
 
 <div class="pane" id="p6">
- <fieldset><legend>Storage</legend>
-  <div class="row"><input id="mdir" style="flex:1"><button class="gh" onclick="saveDir()">Save</button></div>
-  <div class="hint" style="margin-top:8px">Where new downloads are written. Existing entries in config.yaml keep their own paths.</div>
+ <div class="section-head"><div><div class="eyebrow">PREFERENCES</div><h1>Settings</h1><p>Manage storage, integrations and optional components.</p></div></div>
+ <fieldset><legend>Model storage</legend>
+  <div class="row"><input id="mdir" aria-label="Model download folder" style="flex:1" readonly><button class="gh" onclick="browseDir()">Choose folder</button></div>
+  <div class="hint" style="margin-top:8px">New downloads are saved here. To find and register existing files, go to Models &gt; Find models on your drive. Files stay in place.</div>
  </fieldset>
  <fieldset><legend>Ports</legend><div class="kv" id="st"></div></fieldset>
  <fieldset><legend>Desktop integration</legend>
   <div class="row"><button class="gh" onclick="mkLnk()">Create desktop &amp; start-menu shortcut</button>
    <span id="lnk" style="color:var(--dim);font-size:11px"></span></div>
-  <div class="hint" style="margin-top:8px">Otherwise the panel is opened by double-clicking <code>LocalLLM.cmd</code> in the install folder.</div>
+  <div class="hint" style="margin-top:8px">Open Model Pilot from the Start Menu or Desktop shortcut. You can also launch the app directly from its install folder.</div>
   <div class="row" style="margin-top:10px"><label><input type="checkbox" id="autost" onchange="setAuto(this.checked)"> Start the stack when I log in</label>
    <span id="autoss" style="color:var(--dim);font-size:11px"></span></div>
   <div class="hint">Brings llama-swap, the chat UI and the tray indicator back on their own after a restart or a crash. The panel itself stays on demand.</div>
  </fieldset>
  <fieldset><legend>Remove parts of the install</legend>
-  <div class="hint" style="margin-bottom:8px">Each of these can be reinstalled by pressing Start again. Model weights are never deleted unless you tick the box.</div>
+ <div class="hint" style="margin-bottom:8px">Each selected runtime can be reinstalled by pressing Start. The checkbox only deletes GGUF weights inside this installation; model folders you selected elsewhere are always kept. Everything also removes optional ComfyUI models, inputs, outputs and user settings.</div>
   <div class="row" style="gap:8px;flex-wrap:wrap">
-   <select id="rstc">
+   <select id="rstc" aria-label="Install component to remove">
     <option value="llama-cpp">Engine (llama.cpp)</option>
     <option value="llama-prism">PrismML fork</option>
     <option value="swap">Model router binary</option>
@@ -864,9 +980,9 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
  </fieldset>
 </div>
 </main>
-<div id="act"><div id="acth"><span id="actt">Working</span><button onclick="actHide()" title="hide">&times;</button></div><div id="actb"></div></div>
-<div id="ovl"><div id="dlg" role="dialog" aria-modal="true">
- <h4 id="dlgtitle">LocalLLM</h4>
+<div id="act" role="region" aria-label="Background task activity"><div id="acth"><span id="actt">Working</span><button onclick="actHide()" aria-label="Dismiss activity status">&times;</button></div><div id="actb"></div></div>
+<div id="ovl"><div id="dlg" role="dialog" aria-modal="true" aria-labelledby="dlgtitle">
+ <h4 id="dlgtitle">Model Pilot</h4>
  <div id="dlgbody"></div>
  <div id="dlgfoot"><button class="gh" id="dlgno">Cancel</button><button class="act" id="dlgyes">OK</button></div>
 </div></div>
@@ -874,15 +990,17 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 // ---- dialogs
 // One implementation behind msg/ask/askText, all promise-based so callers just await them.
 // Replaces alert/confirm/prompt, whose browser-drawn versions are titled "127.0.0.1:9300 says".
-let dlgResolve=null;
+let dlgResolve=null,dlgReturnFocus=null;
 function dlgClose(v){
  document.getElementById('ovl').classList.remove('on');
+ const previous=dlgReturnFocus;dlgReturnFocus=null;
+ if(previous&&previous.isConnected)previous.focus();
  const r=dlgResolve;dlgResolve=null;if(r)r(v);
 }
 function dlgOpen(o){
  return new Promise(res=>{
-  dlgResolve=res;
-  document.getElementById('dlgtitle').textContent=o.title||'LocalLLM';
+  dlgResolve=res;dlgReturnFocus=document.activeElement;
+  document.getElementById('dlgtitle').textContent=o.title||'Model Pilot';
   document.getElementById('dlgbody').innerHTML=o.html;
   const yes=document.getElementById('dlgyes'),no=document.getElementById('dlgno');
   yes.textContent=o.ok||'OK';
@@ -912,20 +1030,31 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 document.addEventListener('keydown',e=>{
  if(!dlgResolve)return;
- if(e.key==='Escape'){e.preventDefault();dlgClose(null)}
- if(e.key==='Enter'){e.preventDefault();const i=document.getElementById('dlgin');dlgClose(i?i.value:true)}
+ if(e.key==='Escape'){e.preventDefault();dlgClose(null);return}
+ const dlg=document.getElementById('dlg');
+ if(e.key==='Tab'){
+  const items=[...dlg.querySelectorAll('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')]
+   .filter(x=>x.getClientRects().length);
+  if(!items.length){e.preventDefault();dlg.focus();return}
+  const first=items[0],last=items[items.length-1];
+  if(!dlg.contains(document.activeElement)){e.preventDefault();first.focus()}
+  else if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
+  return;
+ }
+ if(e.key==='Enter'&&document.activeElement.tagName!=='BUTTON'){
+  e.preventDefault();const i=document.getElementById('dlgin');dlgClose(i?i.value:true)
+ }
 });
 
-let S={},E={},M={},VER={},JOBS=[],EP={},BUILD=null;
+let S={},E={},M={},VER={},JOBS=[],EP={},BUILD=null,pollBusy=false;
 // Every button here starts a detached job and returns immediately, so for up to one poll
 // interval a click had no visible effect whatsoever - which reads as the click not registering.
-// Busy state comes from two places: the server's job list, which is the truth and survives a
-// reload, and an optimistic local mark that covers the gap before the next poll sees the job.
-// A mark records when it was made as well as when to give up, because "has this job finished"
-// can only be answered against the click that started it - a log left over from the same action
-// ten minutes ago would otherwise clear a mark made a moment ago.
+// Busy state comes from the server's job list plus an optimistic mark for the round-trip gap.
+// The action response attaches the exact job id, so an older same-name log cannot clear this
+// click's mark. The deadline is only a backstop if the request never yields a job.
 let PEND={};
-function mark(k,ms){PEND[k]={t:Date.now(),d:Date.now()+(ms||10000)}}
+function mark(k,ms){PEND[k]={d:Date.now()+(ms||10000),id:null}}
 function busy(k){
  if(JOBS.some(j=>j.running&&j.name===k))return true;
  const p=PEND[k];
@@ -953,15 +1082,28 @@ function B(cls,key,onclick,label){
 const TOK='@@TOKEN@@';
 const _f=window.fetch;
 window.fetch=(u,o)=>{o=o||{};o.headers=Object.assign({},o.headers,{'X-LocalLLM-Token':TOK});return _f(u,o)};
-function tab(i,b){document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
- document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+function tab(i,b){
+ document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
+ document.querySelectorAll('nav button').forEach(x=>{x.classList.remove('on');x.removeAttribute('aria-current')});
+ const primary=document.querySelector(`nav button[data-pane="${i}"]`);
+ const more=document.getElementById('moreNav'),menu=document.getElementById('navMore');
+ more.removeAttribute('aria-current');
+ menu.open=false;
+ if(primary){
+  primary.classList.add('on');primary.setAttribute('aria-current','page');
+  more.textContent='More';more.setAttribute('aria-label','More navigation');more.classList.remove('on');
+ }else{
+  const label={1:'Engine details',3:'Tools',4:'Monitoring'}[i]||'More';
+  more.textContent='More · '+label;more.setAttribute('aria-label','More navigation, current section: '+label);
+  more.setAttribute('aria-current','page');more.classList.add('on');if(b)b.classList.add('on');
+ }
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
  monRun(i===4);
  if(i===3)agents();
- // Read the real state when the tab comes up rather than tracking it: the shortcut can be
- // removed in Explorer or switched off in Task Manager without this page hearing about it.
- if(i===6)auto()}
+ if(i===1)tick();
+ if(i===6)auto();
+}
 // ---- coding agents
 let AG={};
 function pdir(){return document.getElementById('pdir').value.trim()}
@@ -1015,7 +1157,7 @@ async function mon(){
  document.getElementById('sens').innerHTML=rows||'<tr><td colspan="5" style="color:var(--dim)">no sensors available (no NVIDIA GPU detected)</td></tr>';
  document.getElementById('monmeta').textContent=monN+' sample'+(monN===1?'':'s')+(d.loaded?'  -  model loaded: '+d.loaded:'  -  no model loaded');
 }
-async function post(u,o){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})})}
+async function post(u,o){return await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})})).json()}
 // Map the ticked services onto start.ps1's -Component, which takes all|swap|webui.
 function selected(){
  const s=(S.services||[]).filter(x=>x.managed&&x.selected).map(x=>x.key);
@@ -1028,8 +1170,18 @@ function jkey(a,comp){return (comp&&comp!=='all')?a+'-'+comp:a}
 async function act(a,c){
  const comp=(c!==undefined)?c:selected();
  if(comp===null){msg('No services are ticked, so Start, Stop and Restart have nothing to act on.\n\nTick llama-swap and/or open-webui on the Dashboard.');return}
- spin(jkey(a,comp),a==='deploy'?600000:60000);
- await post('/api/action',{action:a,component:comp});setTimeout(tick,1200);
+ const k=jkey(a,comp);
+ spin(k,a==='deploy'?600000:60000);
+ try{
+  const r=await post('/api/action',{action:a,component:comp});
+  if(r.error){delete PEND[k];msg('Could not '+a+' selected services: '+r.error);setTimeout(tick,300);return}
+  if(PEND[k]&&r.id)PEND[k].id=r.id;
+  setTimeout(tick,1200);
+ }catch(e){
+  delete PEND[k];
+  msg('Could not '+a+' selected services: '+e.message);
+  setTimeout(tick,300);
+ }
 }
 // The tick decides what Start/Stop act on; it does not itself start or stop anything. Unticking a
 // service that is up therefore leaves it running and simultaneously removes it from the health
@@ -1049,8 +1201,47 @@ async function toggleSvc(key,on){
 // only a backstop for a load that fails outright.
 async function load(id){spin('load:'+id,300000);await post('/api/load',{id});setTimeout(tick,700)}
 async function unloadAll(){spin('unload',8000);await post('/api/unload',{});setTimeout(tick,700)}
+async function browseDir(){
+ const r=await post('/api/browse-models',{});
+ if(r.path){document.getElementById('mdir').value=r.path;await saveDir()}
+}
+async function saveDir(){
+ const r=await post('/api/settings',{modelsDir:document.getElementById('mdir').value});
+ if(r.error){msg(r.error);return}
+ document.getElementById('mdir').value=r.modelsDir;tick()
+}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function scanModels(notice){
+ const box=document.getElementById('modelFiles'),btn=document.getElementById('scanModelsBtn');
+ if(btn){btn.disabled=true;btn.textContent='Scanning...'}
+ box.innerHTML='<div class="hint" role="status">Scanning the selected folder and its subfolders for GGUF files...</div>';
+ try{
+  const r=await fetch('/api/model-files'),d=await r.json();
+  if(d.error){box.innerHTML='<div class="hint miss">'+esc(d.error)+'</div>';return}
+  const files=d.files||[],addable=files.filter(f=>!f.conflict).length,warnings=d.scanWarnings||[];
+  const summary=notice?'<div class="hint">'+esc(notice)+'</div>':'';
+  const warning=warnings.length?`<div class="hint miss" role="alert"><b>Scan incomplete.</b> ${warnings.length} folder or file path${warnings.length===1?'':'s'} could not be read. Results may be incomplete. Check access permissions or choose another folder.${warnings.length?'<div class="subtle" style="margin-top:5px">'+warnings.slice(0,3).map(esc).join('<br>')+'</div>':''}</div>`:'';
+  const count=`<div class="subtle" style="margin:8px 0">${addable} file${addable===1?'':'s'} ready to add${files.length>addable?`; ${files.length-addable} filename conflict${files.length-addable===1?'':'s'} need attention`:''}. Existing registered files are hidden.</div>`;
+  const empty=warnings.length?'<div class="hint">No unregistered GGUF files were found in the folders this app could read.</div>':'<div class="hint">No unregistered GGUF model files found in this folder. Files already in your model list are hidden here.</div>';
+  const table=files.length?'<table class="import-table"><thead><tr><th>File and location</th><th>Size</th><th>Action</th></tr></thead><tbody>'+
+   files.map(f=>`<tr><td><b>${esc(f.name)}</b><div class="subtle" style="margin-top:3px;word-break:break-all">${esc(f.path)}</div></td><td>~${esc(f.sizeGb)} GB</td><td>${f.conflict?`<span class="miss">${esc(f.conflict)}</span>`:`<button class="act" onclick="registerModel(decodeURIComponent('${encodeURIComponent(f.path).replace(/'/g,'%27')}'),this)">Add to Models</button>`}</td></tr>`).join('')+
+   '</tbody></table>':empty;
+  box.innerHTML=summary+warning+count+table;
+ }catch(e){box.innerHTML='<div class="hint miss">Could not scan this folder: '+esc(e)+'</div>'}
+ finally{if(btn){btn.disabled=false;btn.textContent='Scan folder'}}
+}
+async function registerModel(path,btn){
+ if(btn&&btn.disabled)return;
+ if(btn){btn.disabled=true;btn.textContent='Adding...'}
+ try{
+  const r=await post('/api/register-model',{path});
+  if(r.error){msg(r.error);return}
+  await scanModels('Registered "'+r.id+'". The file stays in place; the new entry starts at 16k context with q8_0 KV cache.');
+  tick()
+ }catch(e){msg('Could not register this file: '+e)}
+ finally{if(btn){btn.disabled=false;btn.textContent='Add to Models'}}
+}
 async function tune(id){spin('autotune-'+id,900000);await post('/api/autotune',{id});setTimeout(tick,700)}
-async function saveDir(){await post('/api/settings',{modelsDir:document.getElementById('mdir').value});tick()}
 async function inst(what){
  const names={components:'install or repair all components',upgrade:'upgrade to the pinned versions',
   'upgrade-latest':'upgrade to the newest upstream releases','prism':'install the PrismML fork (~620 MB)'};
@@ -1132,41 +1323,65 @@ async function suggest(minfit){
   // The picker is a separate 5 MB binary. Telling someone to go and run a CLI action is exactly
   // the friction this panel exists to remove, so the error turns into the button that fixes it.
   if(d.needInstall){document.getElementById('sug').innerHTML=
-    '<div class="hint">The picker is a separate 5 MB download. '
-    +'<button class="act" onclick="installPicker()">Install it</button></div>';return}
-  if(d.error){document.getElementById('sug').innerHTML='<div class="hint miss">'+d.error+'</div>';return}
+    '<div class="hint">The model picker is a separate 5 MB download. '
+    +'<button class="act" onclick="installPicker()">Install model picker</button></div>';return}
+  if(d.error){document.getElementById('sug').innerHTML='<div class="hint miss">'+esc(d.error)+'</div>';return}
   const m=d.models||[];
   document.getElementById('sug').innerHTML=m.length?
-   '<table><thead><tr><th>Model</th><th>Quant</th><th>Fit</th><th>Size</th><th>est. tok/s</th><th>Context</th><th></th></tr></thead><tbody>'+
-   m.map(x=>`<tr><td>${x.name}${x.moe?' <span class="tag">MoE</span>':''}</td><td>${x.quant}</td>
-    <td>${x.fit==='Perfect'?'<span class="on2">'+x.fit+'</span>':x.fit}</td>
-    <td>${x.sizeGb} GB</td><td>${x.tps}</td><td>${x.ctx||'-'}</td>
-    <td><button class="gh" onclick="dl('${x.repo}','${x.quant}')">Download</button></td></tr>`).join('')+
-   '</tbody></table><div class="hint" style="margin:7px 0 0">Speeds are estimated from memory bandwidth, not measured - <b>Tune</b> on a downloaded model measures this machine properly. Context here is what the model was trained for, not what will fit; the downloaded entry gets its own setting.</div>'
-   :'<div class="hint"><b>Nothing matched.</b> That is the filters, not your hardware - '
+   '<div class="model-pick-grid">'+m.map(x=>{
+    const grade=String(x.fit||'Potential fit'),fitClass=/^(perfect|good)$/i.test(grade)?'good':/marginal|poor/i.test(grade)?'warn':'';
+    const reasons={perfect:'Strong hardware-fit estimate; actual speed still depends on context and other apps.',
+      good:'Good hardware-fit estimate. Review download size and estimated speed before choosing.',
+      marginal:'Tighter fit estimate; you may need to reduce context or accept slower generation.',
+      poor:'Weak fit estimate; expect trade-offs in headroom or speed.'};
+    const reason=reasons[grade.toLowerCase()]||'llmfit hardware-fit estimate; this is not a measured model run.';
+    const fit=esc(grade),repo=encodeURIComponent(x.repo).replace(/'/g,'%27'),quant=encodeURIComponent(x.quant).replace(/'/g,'%27');
+    const license=x.license?`<span>License: ${esc(x.license)}</span>`:'';
+    return `<article class="model-pick"><div class="model-pick-head"><div><h3>${esc(x.name)}</h3><div class="subtle">${esc(x.quant)} quant</div></div><span class="fit ${fitClass}">${fit} fit</span></div>
+     <p class="recommendation-reason">${reason}</p>
+     <div class="model-stats"><span>~${esc(x.sizeGb)} GB download</span><span>~${esc(x.tps)} tok/s estimate</span><span>Trained context up to ${esc(x.ctx||'unknown')} tokens</span>${x.moe?'<span>MoE architecture</span>':''}${license}</div>
+     <button class="act" onclick="dl(decodeURIComponent('${repo}'),decodeURIComponent('${quant}'))">Download ~${esc(x.sizeGb)} GB</button></article>`
+   }).join('')+'</div><div class="subtle" style="margin-top:12px">Speed is an estimate from memory bandwidth, not a benchmark. Context shown is the trained maximum; Tune measures what fits on this PC.</div>'
+   :'<div class="hint"><b>No recommendations for these filters.</b> This is not proof that no model can run on this PC - '
     +(use?'the <b>'+esc(use)+'</b> use case':'the current filters')
-    +' ruled everything out'+(minfit?' even at a looser fit':'')+'.<div class="row" style="margin-top:7px">'
+    +' ruled everything out'+(minfit?' even at a looser fit':'')+'. Try a broader filter or scan files already on your drive.<div class="row" style="margin-top:7px">'
     +(use?'<button class="gh" onclick="relaxUse()">Try any use case</button>':'')
     +'<button class="gh" onclick="relaxTools('+(tools?'false':'true')+')">'
     +(tools?'Drop the tool-calling requirement':'Require tool calling')+'</button>'
     +(minfit?'':'<button class="gh" onclick="suggest(&quot;marginal&quot;)">Include tighter fits</button>')
-    +'</div><div class="note" style="margin-top:6px">These filters do not simply narrow the list - each one changes how models are ranked, so turning one <i>on</i> can produce results where <i>off</i> produced none.</div></div>';
+    +'<button class="gh" onclick="focusModelScanner()">Scan local files</button>'
+    +'</div><div class="note" style="margin-top:6px">These filters change llmfit\'s ranking rather than simply narrowing a fixed list, so turning a filter on can produce results where off produced none. Estimates are not measured runs.</div></div>';
   document.getElementById('sgmsg').textContent='';
  }catch(e){document.getElementById('sug').innerHTML='<div class="hint miss">'+e+'</div>'}
  finally{b.classList.remove('busy');b.disabled=false;document.getElementById('sgmsg').textContent='';delete PEND['suggest'];activity([])}
 }
-// Straight from the dashboard into the picker, with the tab switched for them. The nav button
-// is found by its label rather than threaded through, because tab() wants the element it marks.
+// Keep the primary journey one click away from Home.
+function gotoModels(){const b=document.querySelector('nav button[data-pane="2"]');if(b)tab(2,b)}
+function focusModelScanner(){document.getElementById('modelDirLabel').scrollIntoView({behavior:'smooth',block:'center'});document.getElementById('scanModelsBtn').focus({preventScroll:true})}
+function openChat(){const port=(M.settings&&M.settings.webuiPort)||8080;window.open('http://127.0.0.1:'+port,'_blank')}
+async function verifyModel(id){
+ const box=document.getElementById('verifyResult');
+ box.style.display='block';box.innerHTML='<div class="hint" role="status">Sending a real completion. A cold model may take several minutes to load.</div>';
+ spin('verify-model',900000);
+ try{
+  const started=await post('/api/verify-model',{id});
+  if(started.error)throw new Error(started.error);
+  const d=await waitFor('/api/verify-model?id='+encodeURIComponent(id),900000);
+  const lines=(d.out||[]).map(x=>String(x)),output=lines.join('\n'),passed=output.includes('[MODEL_RESPONSE_CHECK_PASSED]');
+  const detail=[output,d.err||''].filter(Boolean).join('\n');
+  box.innerHTML=`<div class="hint ${passed?'':'miss'}"><b>${passed?'A real response was received.':'The response check failed.'}</b><pre>${esc(detail||d.error||'No output was recorded. See Activity for details.')}</pre></div>`;
+ }catch(e){box.innerHTML='<div class="hint miss">Response check failed: '+esc(e)+'</div>'}
+ finally{delete PEND['verify-model'];tick()}
+}
 function firstModel(){
- const b=[...document.querySelectorAll('nav button')].find(x=>x.textContent==='Models');
- if(b)tab(2,b);
+ gotoModels();
  document.getElementById('sgtools').checked=false;   // a first model is for chatting, not tools
  suggest();
 }
 async function installPicker(){
  spin('llmfit',300000);
  await post('/api/install-picker',{});
- document.getElementById('sug').innerHTML='<div class="hint">Installing the picker - it appears under Activity. Press <b>Suggest models</b> again in a moment.</div>';
+ document.getElementById('sug').innerHTML='<div class="hint">Installing the picker - it appears under Activity. Press <b>Find models</b> again in a moment.</div>';
  setTimeout(tick,900);
 }
 async function inspect(){
@@ -1194,7 +1409,7 @@ async function rstShow(){
  clearTimeout(RSTPOLL);
  await post('/api/reset',{component:comp,includeModels:inc,run:1});
  const poll=async()=>{
-  let d; try{d=await (await post('/api/reset',{component:comp,includeModels:inc})).json()}catch(e){return}
+  let d; try{d=await post('/api/reset',{component:comp,includeModels:inc})}catch(e){return}
   if(d.running){RSTPOLL=setTimeout(poll,700);return}
   rstRender(comp,inc,d.targets||[]);
  };
@@ -1212,7 +1427,7 @@ function rstRender(comp,inc,t){
  h+='</tbody></table>';
  h+='<div class="row" style="margin-top:8px;gap:8px">';
  if(comp==='llama-cpp'||comp==='all')
-   h+='<label style="font-size:12px"><input type="checkbox" id="rstim" '+(inc?'checked':'')+' onchange="rstShow()"> also delete model weights</label>';
+   h+='<label style="font-size:12px"><input type="checkbox" id="rstim" '+(inc?'checked':'')+' onchange="rstShow()"> also delete GGUF weights inside this install (external folders are kept)</label>';
  h+='<button class="act" id="rstgo" style="background:#b3261e">Delete '+fmtB(tot)+'</button></div>';
  out.innerHTML=h;
  // Wired here rather than as an inline onclick: the whole page is a PowerShell here-string,
@@ -1232,8 +1447,8 @@ async function rstGo(comp,inc,tot){
  // The button carries the size rather than saying OK: this repo's rule for destructive confirms.
  let warn='This deletes '+what+', '+fmtB(tot)+'. ';
  if(comp==='webui'||comp==='all') warn+='That includes your chat history and open-webui settings, which are not backed up anywhere. ';
- warn+=inc?'Model weights WILL be deleted - multi-GB and slow to fetch again. ':'Model weights are kept. ';
- warn+='Press Start afterwards to reinstall.';
+ if(comp==='all') warn+='If installed, ComfyUI and its local models, inputs, outputs and user settings are included in the deletion list. ';
+ warn+=inc?'GGUF weights inside this installation WILL be deleted - multi-GB and slow to fetch again. External model folders are always kept. ':'GGUF weights are kept. External model folders are always kept. ';
  if(!await ask(warn,{danger:true,ok:'Delete '+fmtB(tot)})) return;
  spin('reset-'+comp,600000);
  await post('/api/reset',{component:comp,includeModels:inc,confirm:true});
@@ -1277,19 +1492,21 @@ const JOBS_SAY={
  // every step is skipped and it just launches. Saying "Downloads the engine..." there was a
  // plain lie, and it made a two-second start look like it was doing something enormous.
  reset:['Removing part of the install','Deleting files. Press Start afterwards to reinstall whatever you removed.'],
- deploy:['Starting','Launches the router and the chat UI. A first run also downloads them - about 1.5 GB, several minutes.'],
+ deploy:['Starting','Launches the router and the chat UI. First-run setup downloads and builds the stack; the wait depends on your connection and PC.'],
  restart:['Restarting','A few seconds. The chat UI takes longer than the router.'],
  stop:['Stopping',''],
  download:['Downloading a model','Multi-GB. Safe to interrupt - it resumes where it stopped.'],
  llmfit:['Installing the model picker','About 5 MB.'],
  inspect:['Reading the model listing','Metadata only, no weights. Around 40 seconds.'],
  suggest:['Scoring models against this PC','Ranks the catalogue against your RAM, VRAM and memory bandwidth. Up to a minute.'],
+ 'verify-model':['Checking a real model response','Sends one short completion and records the model reply here. A cold load can take several minutes.'],
  unload:['Freeing VRAM',''],
  vercheck:['Checking for newer versions','Asks GitHub and nodejs.org.'],
  opencode:['The local agent is working','It edits files in your project directly.'],
  delegate:['The local model is reading your file','Long files are split into chunks and answered in turn.']
 };
 function jobSay(k){
+ if(k==='verify-model')return JOBS_SAY[k];
  const base=k.split(/[:\-]/)[0], who=k.slice(base.length+1);
  if(base==='load')  return ['Loading '+who,'Reading multi-GB weights into VRAM. Ten seconds to a minute.'];
  if(base==='edit')  return ['Saving settings for '+who,''];
@@ -1355,51 +1572,52 @@ function downloads(rows){
 }
 async function dl(repo,quant){spin('download',3600000);await post('/api/download',{model:repo,quant});document.getElementById('insp').innerHTML='<div class="hint">Download started - watch Activity below.</div>';setTimeout(tick,800)}
 async function tick(){
- try{S=await (await fetch('/api/status')).json()}catch(e){return}
+ if(pollBusy)return;
+ pollBusy=true;
+ try{
+  try{S=await (await fetch('/api/status')).json()}catch(e){return}
  // Stale page check, first thing: if the server is running different code than served this page,
  // nothing rendered below can be trusted to match it. Covers the ordinary restart too, since the
  // window survives the server it was opened from.
  if(!BUILD)BUILD=S.build; else if(S.build!==BUILD){location.reload();return}
+ document.getElementById('homeLoading').style.display='none';
  // Jobs before anything renders: every button's busy state is derived from this list.
  try{JOBS=await (await fetch('/api/jobs')).json()}catch(e){}
- // A finished job clears its optimistic mark. Without this the mark would hold the button
- // spinning for its whole ceiling - and the ceilings are generous, because they exist for the
- // job that never starts. Restarting llama-swap takes about two seconds; the button should
- // stop spinning then, not sixty seconds later.
+ try{M=await (await fetch('/api/models')).json()}catch(e){}
+ // Clear an optimistic mark only when the exact job started by this click has finished.
+ // File timestamps are not job start times: using their age could leave a completed restart
+ // spinning until the full timeout, or clear it based on an unrelated older job.
  JOBS.forEach(j=>{const p=PEND[j.name];
-  if(p&&!j.running&&(Date.now()-j.age*1000)>p.t)delete PEND[j.name]});
+  if(p&&p.id===j.id&&!j.running)delete PEND[j.name]});
  // A load has no job behind it, so its mark clears on the outcome instead - the model is loaded.
  if(S.loaded)delete PEND['load:'+S.loaded];
  // Health is judged only against ticked services - a deselected one being down is not a fault.
  const mine=S.services.filter(s=>s.managed&&s.selected);
  const up=mine.filter(s=>s.up).length, need=mine.length;
- // The header buttons are static markup rather than re-rendered, so they are synced by hand.
- const sel=selected();
- [['go','deploy'],['hre','restart'],['hst','stop']].forEach(([el,a])=>{
-  const e=document.getElementById(el),b=busy(jkey(a,sel));
-  e.classList.toggle('busy',b);e.disabled=b||(el==='go'&&need>0&&up===need);
+ // The header is visible before the first status response; hold lifecycle controls until the
+ // selected services are known, so an early click cannot be mistaken for "nothing selected".
+ const ready=Array.isArray(S.services);
+ const sel=ready?selected():null;
+ [['go','deploy'],['hre','restart'],['hst','stop'],['homeRestart','restart'],['homeStop','stop']].forEach(([el,a])=>{
+  const e=document.getElementById(el),b=ready&&busy(jkey(a,sel));
+  e.classList.toggle('busy',b);e.disabled=!ready||b||(el==='go'&&need>0&&up===need);
  });
  document.getElementById('d').className='dot '+(need===0?'down':up===need?'up':up?'part':'down');
  document.getElementById('sub').textContent=need===0?'nothing selected':up===need?'running':up?'partly running':'stopped';
- document.getElementById('svc').innerHTML=S.services.map(s=>`<tr>
-  <td>${s.managed?`<input type="checkbox" style="width:auto" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)">`:''}</td>
-  <td>${s.name}</td><td style="color:var(--dim)">${s.role}</td>
-  <td>${!s.installed?'<span class="tag">not installed</span>'
-    // An unmanaged entry is a CLI you invoke per task, not a service - calling it "stopped", in
-    // red, reads as a fault when nothing is wrong and there is no button that would fix it.
-    :!s.managed?'<span style="color:var(--dim)">available</span>'
-    // Running but not ticked has to say so. The tick is a selection for Start/Stop, not an
-    // on/off switch, so unticking leaves the service serving - and the header dot ignores it,
-    // because health is judged against ticked services only. Reported as plain "running" that
-    // is a service nothing on this page accounts for.
-    :s.up?(s.selected?'<span class="on2">running</span>'
-                     :'<span class="on2">running</span> <span style="color:var(--dim)">(not selected)</span>')
-    :s.selected?'<span class="miss">stopped</span>'
-    :'<span style="color:var(--dim)">stopped (not selected)</span>'}</td>
-  <td>${s.url&&s.up?`<a href="${s.url}" target="_blank"><button class="gh">Open</button></a>`:''}</td></tr>`).join('');
- document.getElementById('hw').innerHTML=`<span>GPU</span><div>${S.gpu.name}</div>
-  <span>VRAM</span><div>${fmt(S.gpu.used)} / ${fmt(S.gpu.total)}<div class="bar"><i style="width:${100*S.gpu.used/S.gpu.total}%"></i></div></div>
-  <span>GPU load</span><div>${S.gpu.util}% &nbsp; ${S.gpu.temp} &deg;C</div>
+ document.getElementById('svc').innerHTML=S.services.map(s=>{
+  const state=!s.installed?['Not installed','']:!s.managed?['Available','']:s.up?['Running','good']:s.selected?['Stopped','bad']:['Not selected',''];
+  return `<article class="service-card">
+   <div><h3>${esc(s.name)}</h3><p>${esc(s.role)}</p></div>
+   <div class="service-meta"><span class="status-pill ${state[1]}">${state[0]}</span>${s.url&&s.up?`<a href="${esc(s.url)}" target="_blank"><button class="gh">Open</button></a>`:''}</div>
+   ${s.managed?`<label class="service-choice"><input type="checkbox" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)"> Include in Start and Stop</label>`:''}
+  </article>`
+ }).join('');
+ const gpuTotal=Number(S.gpu.total)||0,gpuUsed=Number(S.gpu.used)||0;
+ const gpuName=gpuTotal?S.gpu.name:'No supported accelerator detected';
+ const gpuVram=gpuTotal?`${fmt(gpuUsed)} / ${fmt(gpuTotal)}<div class="bar"><i style="width:${Math.max(0,Math.min(100,100*gpuUsed/gpuTotal))}%"></i></div>`:'Not reported';
+ document.getElementById('hw').innerHTML=`<span>GPU</span><div>${esc(gpuName)}</div>
+  <span>VRAM</span><div>${gpuVram}</div>
+  <span>GPU load</span><div>${gpuTotal?`${S.gpu.util}% &nbsp; ${S.gpu.temp} &deg;C`:'Not reported'}</div>
   <span>System RAM</span><div>${S.ramUsed} / ${S.ramTot} GB<div class="bar"><i style="width:${100*S.ramUsed/S.ramTot}%"></i></div></div>
   <span>Loaded model</span><div>${S.loaded||'<span style="color:var(--dim)">idle</span>'}</div>`;
  // First-run walkthrough. Someone who just unzipped this has three things to do in order -
@@ -1407,23 +1625,22 @@ async function tick(){
  // that only reports state. Each step names the next action and disappears once it is done.
  const fresh=mine.some(s=>!s.installed), noModels=M.models&&M.models.length===0;
  const noWeights=M.models&&M.models.length>0&&M.models.every(m=>!m.present);
- let g='';
- if(need===0) g='<div class="hint">No services are ticked, so Start and Stop have nothing to act on. Tick llama-swap and/or open-webui below.</div>';
- else if(fresh) g='<div class="hint"><b>Step 1 of 3.</b> Nothing is installed yet. Press <b>Start</b> - it downloads the inference engine, the router and the chat UI (about 1.5 GB) and takes several minutes on a first run. Progress shows under <b>Engine</b>.</div>';
- else if(!up) g='<div class="hint">Nothing is running. Press <b>Start</b>.</div>';
- else if(up<need) g='<div class="hint">Only part of your stack is up. <b>Restart</b> brings the rest back.</div>';
- // Step 2 used to be four manual instructions ending in "download a variant it says fits your
- // card", which is the step a first-time user is least equipped to judge. It is now one button
- // that opens Models and runs the picker against this machine's own VRAM.
- else if(noModels) g='<div class="hint"><b>Step 2 of 3.</b> The stack is running but has no models yet. '
-  +'<button class="act" onclick="firstModel()">Find one that fits this PC</button></div>';
- else if(noWeights) g='<div class="hint">Models are configured but none of their weight files are on disk. Download one from <b>Models</b>, or delete the entries that point at weights you do not have.</div>';
- // Step 3 is keyed on "no model has ever been used", not on "nothing loaded right now" - models
- // unload on their idle timer all day, and a banner that returns every time would be noise.
- else if(M.models&&M.models.every(m=>!m.loads&&!m.lastUsed)) g='<div class="hint"><b>Step 3 of 3.</b> Ready. Open the chat UI with the <b>Open</b> button below and pick a model - your first message loads it, which takes a few seconds.</div>';
- document.getElementById('guide').innerHTML=g;
+ let hero={step:'LOCAL STATUS',title:'Your workspace',text:'Your local model services run on this PC.',button:'',action:''};
+ if(need===0) hero={step:'SETUP',title:'Choose what to run',text:'Select llama-swap and/or the chat interface below, then start your local workspace.',button:'',action:''};
+ else if(fresh) hero={step:'STEP 1 - SET UP',title:'Set up your local AI workspace',text:'Install the local engine, model router and chat interface. This downloads the runtime once; model files are added separately.',button:'Install and start',action:"act('deploy')"};
+ else if(!up) hero={step:'READY WHEN YOU ARE',title:'Your services are stopped',text:'Start the selected services to use your local models.',button:'Start services',action:"act('deploy')"};
+ else if(up<need) hero={step:'CHECKING SERVICES',title:'Part of your workspace is running',text:'Restart the selected services to bring the rest back online.',button:'Restart services',action:"act('restart')"};
+ else if(noModels) hero={step:'STEP 2 - CHOOSE A MODEL',title:'Your workspace is ready for a model',text:'Find a recommendation sized for this PC or register a GGUF file you already have.',button:'Find a model',action:'firstModel()'};
+ else if(noWeights) hero={step:'MODEL FILES NEEDED',title:'Your models need their weight files',text:'Choose a folder containing the GGUF files, or download a model from the library.',button:'Manage models',action:'gotoModels()'};
+ else if(M.models&&M.models.every(m=>!m.loads&&!m.lastUsed)) hero={step:'STEP 3 - FIRST CHAT',title:'Ready for your first chat',text:'Open the chat interface and choose one of your models. The first request loads it into memory.',button:'Open chat',action:'openChat()'};
+ else hero={step:'ALL SYSTEMS READY',title:'Your local AI is ready',text:'Open the chat interface to continue. Your conversations stay on this PC.',button:'Open chat',action:'openChat()'};
+ const testable=(M.models||[]).find(m=>m.id===S.loaded&&m.present&&m.engineOk)||(M.models||[]).find(m=>m.present&&m.engineOk);
+ const routerUp=S.services.some(s=>s.key==='swap'&&s.up);
+ const testBusy=busy('verify-model'),testId=testable?encodeURIComponent(testable.id).replace(/'/g,'%27'):'';
+ const testButton=testable&&routerUp?`<div><button class="gh" id="verifyModelBtn" onclick="verifyModel(decodeURIComponent('${testId}'))" ${testBusy?'disabled':''}>${testBusy?'Checking response...':'Test a real response'}</button><div class="subtle">Checks ${esc(testable.id)}; may switch the loaded model and use VRAM. It confirms that the model returns text, not that the answer is accurate or useful.</div></div>`:'';
+ document.getElementById('guide').innerHTML=`<section class="hero"><div><div class="eyebrow">${hero.step}</div><h2>${hero.title}</h2><p>${hero.text}</p></div><div class="hero-actions">${hero.button?`<button class="act" onclick="${hero.action}">${hero.button}</button>`:''}${testButton}</div></section>`;
 
- try{E=await (await fetch('/api/engine')).json()}catch(e){}
+ if(document.getElementById('p1').classList.contains('on'))try{E=await (await fetch('/api/engine')).json()}catch(e){}
  if(E.llamacpp){
   // One panel per component, with its own versions and its own actions - the version table that
   // used to sit at the bottom repeated the Build line already shown here.
@@ -1458,7 +1675,7 @@ async function tick(){
  }
  // Endpoints change only when a port or a model does, so they ride the same poll as the rest of
  // this tab rather than getting their own.
- try{EP=await (await fetch('/api/endpoints')).json()}catch(e){}
+ if(document.getElementById('p1').classList.contains('on'))try{EP=await (await fetch('/api/endpoints')).json()}catch(e){}
  if(EP.rows){
   document.getElementById('eps').innerHTML=EP.rows.map(r=>{
    const up=r.url.indexOf(':'+ (M.settings?M.settings.webuiPort:8080))>0 ? EP.webuiUp : EP.swapUp;
@@ -1469,10 +1686,13 @@ async function tick(){
    ? 'Model ids ready to use: '+EP.models.map(m=>'<code>'+esc(m)+'</code>').join(' ')
    : 'No model has both its weights and an engine yet, so there is nothing to request.';
  }
- try{M=await (await fetch('/api/models')).json()}catch(e){}
+ // M was loaded near the top of the poll so the home guide and storage controls can render early.
  downloads(M.downloads||[]);
  activity(M.downloads||[]);
  if(M.models){
+  const empty=M.models.length===0;
+  document.getElementById('modelTable').style.display=empty?'none':'';
+  document.getElementById('emptyModels').style.display=empty?'':'none';
   document.getElementById('mt').innerHTML=M.models.map(m=>{
    const on=S.loaded===m.id;
    // A model that has been asked for but hasn't finished loading is neither idle nor loaded,
@@ -1492,7 +1712,7 @@ async function tick(){
   document.getElementById('orph').innerHTML=M.orphans.length?M.orphans.map(o=>`<tr><td>${o.file}</td><td>${o.sizeGb} GB</td><td style="color:var(--dim)">downloaded, not in config.yaml</td></tr>`).join(''):'<tr><td style="color:var(--dim)">none</td></tr>';
  }
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
- if(!VER.rows){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
+ if(!VER.rows&&document.getElementById('p1').classList.contains('on')){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
  document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
  // The agents tab refreshes on the normal poll while it is in front. The session list does NOT:
  // it is server-cached for 30s, but the *request* still queues on a single-threaded listener,
@@ -1501,8 +1721,12 @@ async function tick(){
  // once every 30s is plenty.
  if(document.getElementById('p3').classList.contains('on'))agents()
  const md=document.getElementById('mdir');
- if(M.settings&&document.activeElement!==md){md.value=M.settings.modelsDir;
-  document.getElementById('st').innerHTML=`<span>llama-swap</span><div>127.0.0.1:${M.settings.swapPort}</div><span>Chat UI</span><div>127.0.0.1:${M.settings.webuiPort}</div><span>This panel</span><div>127.0.0.1:${location.port}</div>`;}
+ if(M.settings){
+  if(document.activeElement!==md)md.value=M.settings.modelsDir;
+  document.getElementById('modelDirLabel').textContent='Current folder: '+M.settings.modelsDir;
+  document.getElementById('st').innerHTML=`<span>llama-swap</span><div>127.0.0.1:${M.settings.swapPort}</div><span>Chat UI</span><div>127.0.0.1:${M.settings.webuiPort}</div><span>This panel</span><div>127.0.0.1:${location.port}</div>`;
+ }
+ }finally{pollBusy=false}
 }
 tick();setInterval(tick,3000);
 </script></body></html>
@@ -1523,7 +1747,7 @@ if ($alreadyUp) {
 $listener = New-Object Net.HttpListener
 $listener.Prefixes.Add("http://127.0.0.1:$Port/")
 try { $listener.Start() } catch { throw "Could not bind 127.0.0.1:$Port - is the panel already running? ($($_.Exception.Message))" }
-Write-Host "LocalLLM panel -> http://127.0.0.1:$Port  (Ctrl-C to stop)"
+Write-Host "Model Pilot panel -> http://127.0.0.1:$Port  (Ctrl-C to stop)"
 
 # Closing the window leaves this server running, which is the behaviour we want - it is a
 # minimise, not a quit. That only works if there is something to restore it from, so make sure
@@ -1531,8 +1755,9 @@ Write-Host "LocalLLM panel -> http://127.0.0.1:$Port  (Ctrl-C to stop)"
 # no-op rather than a second icon.
 $trayPs = Join-Path $root 'tray.ps1'
 if (Test-Path $trayPs) {
-    Start-Process powershell -WindowStyle Hidden `
-        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $trayPs
+    $trayArgs = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $trayPs)
+    $trayArgs = @($trayArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
+    Start-Process powershell -WindowStyle Hidden -ArgumentList $trayArgs
 }
 
 if (-not $NoWindow) { Open-PanelWindow }
@@ -1555,7 +1780,7 @@ try {
         # panel is already up, and that check runs before any token exists to send. Gating it meant
         # every launch believed nothing was running and then failed to bind the port. It returns a
         # fixed literal - no state, no action - so the only thing it leaks to a cross-origin caller
-        # is that this port is a LocalLLM panel, which failing to bind reveals anyway.
+        # is that this port is a Model Pilot panel, which failing to bind reveals anyway.
         if ($req.Url.AbsolutePath -like '/api/*' -and $req.Url.AbsolutePath -ne '/api/ping') {
             $origin = $req.Headers['Origin']
             $token  = $req.Headers['X-LocalLLM-Token']
@@ -1612,15 +1837,40 @@ try {
                 '^/api/jobs$'   { $body = ConvertTo-Json -InputObject @(Get-Jobs) -Depth 4 -Compress }
                 '^/api/action$' {
                     $p = Read-Body $req
+                    $jobId = $null
                     if ($p.action -in 'deploy', 'restart', 'stop') {
                         $a = @('-Action', $p.action, '-NoTray')
                         if ($p.component) { $a += @('-Component', $p.component) }
                         # The component is part of the job name so "restart swap" and "restart
                         # webui" are distinguishable - otherwise both buttons would spin for either.
                         $name = if ($p.component -and $p.component -ne 'all') { "$($p.action)-$($p.component)" } else { $p.action }
-                        Start-Job2 $name $a | Out-Null
+                        $jobId = Start-Job2 $name $a
                     }
-                    $body = '{"ok":true}'
+                    $body = @{ ok = $true; id = $jobId } | ConvertTo-Json -Compress
+                }
+                '^/api/verify-model$' {
+                    if ($req.HttpMethod -eq 'POST') {
+                        $p = Read-Body $req
+                        $id = [string]$p.id
+                        if ($id -notmatch '^[A-Za-z0-9_.-]+$') { throw 'Choose a configured model before running the response check.' }
+                        $old = $script:asyncJobs['verify-model']
+                        if ($old) {
+                            $oldResult = Get-Async 'verify-model' $old.key
+                            if ($oldResult.running -and $old.key -ne $id) {
+                                throw "A response check is already running for '$($old.key)'. Wait for it to finish first."
+                            }
+                        }
+                        $current = Get-Async 'verify-model' $id
+                        if (-not $current -or -not $current.running) {
+                            Start-Async 'verify-model' $id @('-Action', 'test-model', '-Id', $id)
+                        }
+                        $body = '{"running":true}'
+                    } elseif ($req.HttpMethod -eq 'GET') {
+                        $id = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['id']
+                        $result = Get-Async 'verify-model' $id
+                        $body = if ($result) { $result | ConvertTo-Json -Depth 4 -Compress }
+                                else { @{ error = 'No response check is running for this model.' } | ConvertTo-Json -Compress }
+                    } else { throw 'Use POST to start or GET to read a model response check.' }
                 }
                 '^/api/load$' {
                     $p = Read-Body $req
@@ -1660,7 +1910,9 @@ try {
                 }
                 '^/api/download$' {
                     $p = Read-Body $req
-                    $a = @('-Action', 'add-model', '-Model', $p.model)
+                    $s = Get-Settings
+                    $a = @('-Action', 'add-model', '-Model', $p.model,
+                           '-ModelDir', ('"{0}"' -f $s.modelsDir))
                     if ($p.quant) { $a += @('-Quant', $p.quant) }
                     Start-Job2 "download" $a | Out-Null
                     $body = '{"ok":true}'
@@ -1726,8 +1978,76 @@ try {
                         }
                     }
                 }
+                '^/api/browse-models$' {
+                    $s = Get-Settings
+                    $path = Select-Directory 'Choose the folder where model downloads should be saved' $s.modelsDir
+                    $body = @{ path = $path } | ConvertTo-Json -Compress
+                }
+                '^/api/model-files$' {
+                    $s = Get-Settings
+                    $existing = @(Get-ConfiguredModels)
+                    $known = @($existing | Where-Object { $_.path } | ForEach-Object {
+                        [IO.Path]::GetFullPath($_.path).ToLowerInvariant()
+                    })
+                    $knownIds = @{}
+                    foreach ($model in $existing) { $knownIds[$model.id.ToLowerInvariant()] = $true }
+                    $files = @()
+                    $scanErrors = @()
+                    if (Test-Path -LiteralPath $s.modelsDir -PathType Container) {
+                        $files = @(Get-ChildItem -LiteralPath $s.modelsDir -Filter '*.gguf' -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable +scanErrors |
+                            Where-Object { $_.Name -notmatch '-\d{5}-of-\d{5}\.gguf$' -or $_.Name -match '-00001-of-\d{5}\.gguf$' } |
+                            Where-Object { $known -notcontains $_.FullName.ToLowerInvariant() } |
+                            ForEach-Object {
+                                $id = Get-ModelIdFromFileName $_.FullName
+                                $conflict = if (-not $id) { 'Rename this file to create a model id.' }
+                                            elseif ($knownIds.ContainsKey($id)) { "Model id '$id' is already in use; rename this file." }
+                                            else { $null }
+                                @{ path = $_.FullName; name = $_.Name; id = $id; conflict = $conflict
+                                   sizeGb = [math]::Round($_.Length / 1GB, 1) }
+                            })
+                    } else {
+                        $scanErrors += "Selected folder is missing or unavailable: $($s.modelsDir)"
+                    }
+                    $scanWarnings = @($scanErrors | ForEach-Object {
+                        if ($_ -is [string]) { $_ }
+                        elseif ($_.TargetObject) { [string]$_.TargetObject }
+                        else { [string]$_.Exception.Message }
+                    } | Select-Object -Unique)
+                    $body = @{ files = $files; scanWarnings = $scanWarnings } | ConvertTo-Json -Depth 4 -Compress
+                }
+                '^/api/register-model$' {
+                    $p = Read-Body $req
+                    $path = [IO.Path]::GetFullPath([string]$p.path)
+                    $dir = [IO.Path]::GetFullPath((Get-Settings).modelsDir).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+                    if (-not $path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) {
+                        throw 'Choose a model from the selected storage folder.'
+                    }
+                    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or [IO.Path]::GetExtension($path) -ine '.gguf') {
+                        throw 'Choose an existing .gguf model file.'
+                    }
+                    $existing = @(Get-ConfiguredModels)
+                    if ($existing | Where-Object { $_.path -and [IO.Path]::GetFullPath($_.path) -ieq $path }) {
+                        throw 'This model file is already registered.'
+                    }
+                    $id = Get-ModelIdFromFileName $path
+                    if (-not $id) { throw 'Could not make a model id from this filename.' }
+                    if ($existing | Where-Object { $_.id -ieq $id }) { throw "Model id '$id' already exists; rename the file or edit config.yaml." }
+                    if (-not (Test-Path $swapCfg)) { throw 'llama-swap config.yaml is not installed yet. Press Start first.' }
+                    Copy-Item -LiteralPath $swapCfg -Destination "$swapCfg.bak" -Force
+                    $entry = "`r`n  `"$id`":`r`n    cmd: >`r`n      `${llama-server}`r`n      -m `"$path`"`r`n      -c 16384 -ctk q8_0 -ctv q8_0`r`n    ttl: 600`r`n"
+                    Add-Content -LiteralPath $swapCfg -Value $entry -Encoding UTF8
+                    $body = @{ ok = $true; id = $id } | ConvertTo-Json -Compress
+                }
                 '^/api/settings$' {
                     $p = Read-Body $req
+                    if ($p.PSObject.Properties.Name -contains 'modelsDir') {
+                        $dir = [string]$p.modelsDir
+                        if (-not $dir.Trim()) { throw 'Choose a folder for model storage.' }
+                        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+                            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                        }
+                        $p.modelsDir = (Resolve-Path -LiteralPath $dir).Path
+                    }
                     $body = (Set-Settings $p) | ConvertTo-Json -Compress
                 }
                 '^/api/versions$' {
@@ -1799,10 +2119,11 @@ try {
                     $p = Read-Body $req
                     if ($null -ne $p.set) {
                         $a2 = @('-Action', 'autostart') + $(if (-not $p.set) { @('-Remove') } else { @() })
-                        Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList (
-                            @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $a2)
+                        $autoStartArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $a2
+                        $autoStartArgs = @($autoStartArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
+                        Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList $autoStartArgs
                     }
-                    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'LocalLLM.lnk'
+                    $lnk = Get-AutostartPath
                     $body = @{ ok = $true; on = (Test-Path $lnk) } | ConvertTo-Json -Compress
                 }
                 '^/api/delete-model$' {

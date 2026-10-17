@@ -3,7 +3,7 @@
 * text=auto
 
 # Windows shells are the ones that actually care. cmd.exe in particular can mis-parse a .cmd file
-# with LF endings, and LocalLLM.cmd is the double-click entry point - it has to be right.
+# with LF endings, and ModelPilot.cmd is the double-click entry point - it has to be right.
 *.ps1  text eol=crlf
 *.cmd  text eol=crlf
 *.bat  text eol=crlf
@@ -11,7 +11,8 @@
 # Everything cross-platform stays LF.
 *.py    text eol=lf
 *.sh    text eol=lf
-# macOS entry point. A CRLF .command fails in bash with a $'' error that names nothing.
+# macOS entry point. A CRLF .command fails in bash with a $'
+' error that names nothing.
 *.command text eol=lf
 *.yaml  text eol=lf
 *.yml   text eol=lf

@@ -1,7 +1,7 @@
 #!/bin/bash
-# macOS double-click entry point - the counterpart to LocalLLM.cmd on Windows, and the only file a
-# new Mac user has to touch. Finder runs a .command in Terminal, which is why it is this and not a
-# .sh: double-clicking a .sh opens it in an editor, exactly like a .ps1 does on Windows.
+# macOS double-click entry point for Model Pilot. Finder runs a `.command` in Terminal, which is
+# why it is this and not a `.sh`: double-clicking a `.sh` opens it in an editor, exactly like a
+# `.ps1` does on Windows.
 #
 # It exists because the rest of this project is PowerShell and macOS ships none. Rather than tell
 # people to install PowerShell first - a system-wide change, for a tool that installs nothing
@@ -28,7 +28,7 @@ fi
 
 ARCH="$(uname -m)"
 if [ "$ARCH" != "arm64" ]; then
-  echo "LocalLLM targets Apple Silicon. This Mac reports '$ARCH'." >&2
+  echo "Model Pilot targets Apple Silicon. This Mac reports '$ARCH'." >&2
   echo "Intel Macs are not supported yet - see README.md." >&2
   exit 1
 fi

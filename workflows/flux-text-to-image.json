@@ -84,7 +84,7 @@
         "7",
         0
       ],
-      "filename_prefix": "localllm_test"
+      "filename_prefix": "model_pilot_test"
     }
   }
 }

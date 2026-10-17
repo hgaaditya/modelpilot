@@ -77,7 +77,7 @@ function Add-Line($s) {
 }
 function Add-Section($t) { Add-Line ""; Add-Line ("=" * 70); Add-Line "  $t"; Add-Line ("=" * 70) }
 
-Add-Line "LocalLLM stability report - $(Get-Date)"
+Add-Line "Model Pilot stability report - $(Get-Date)"
 Add-Line "host: $env:COMPUTERNAME"
 
 Add-Section "CRASH HISTORY"

@@ -1,4 +1,4 @@
-# Name and branding
+# Model Pilot name and branding
 
 The code is MIT — fork it, change it, sell it, embed it in something closed. That licence covers
 **copyright**, and copyright is about the code.
@@ -10,30 +10,28 @@ on trademarks by design.
 detects licences by matching the file against canonical text — an extra paragraph makes it report
 "Other" instead of MIT, losing the badge and the ability to filter for it. Keep `LICENSE` verbatim.)
 
-## What that means in practice
+## Current product identity
 
-**You may**, without asking:
+The current user-facing product name is **Model Pilot**. The older `LocalLLM` name remains in the
+repository path, default per-user install directory and internal identifiers so existing installs
+can upgrade without moving model weights, configuration or chat data. Those compatibility details
+are not the product's display name.
+
+You may, without asking:
 
 - fork this project and publish your fork
 - ship a product built on it, open or closed
-- say your product "is built on LocalLLM", "uses LocalLLM", or "is a fork of LocalLLM" —
-  accurate, factual references are fine and always will be
+- make accurate factual references to Model Pilot
 
-**Please don't**, without permission:
-
-- publish a modified version *as* "LocalLLM", or under a name close enough to be mistaken for it
-- use the name or the chip-and-bubble mark as the identity of your own product, in a way that
-  suggests it is this project or is endorsed by it
-
-The point is narrow: someone downloading a fork should be able to tell whose work they are
-running, and who to file a bug against. Pick your own name and the rest is yours.
+Please do not publish a modified version as **Model Pilot**, or use its name or mark in a way that
+suggests the fork is this project or is endorsed by it. The point is to let users identify whose
+software they are running and where to report a bug.
 
 ## Honesty about how strong this is
 
-"LocalLLM" is a descriptive name, which makes it a weak mark — it says what the software does, and
-that is exactly what trademark law protects least. This document is a statement of intent and a
-request, not a claim of a registered trademark. It is here so the expectation is written down
-rather than assumed.
+"Model Pilot" is the product name selected for this project. This document records that naming
+intent; it does not claim a registered trademark or that legal, domain or repository-name clearance
+has been completed.
 
 If you want to do something this doesn't obviously cover, just ask in an issue. The answer is
 usually yes.

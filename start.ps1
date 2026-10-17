@@ -1,9 +1,9 @@
-# Local LLM stack: bootstrap, launch, upgrade, uninstall, reset.
+# Model Pilot stack: bootstrap, launch, upgrade, uninstall, reset.
 #
 #   .\start.ps1                      # deploy (first run) + launch. Idempotent.
-#   .\start.ps1 -Action stop         # stop llama-swap, any llama-server, and the open-webui backend
-#   .\start.ps1 -Action restart      # stop, then launch again
-#   .\start.ps1 -Action restart -Component swap    # just llama-swap: how a new model becomes routable
+# Start, Stop and Restart are user-facing controls in the panel and tray. The stop/restart actions
+# remain internal adapters for those UI callers and legacy automation; do not promote them as
+# end-user CLI commands or remove them before the internal callers are migrated.
 #   .\start.ps1 -Action status       # what's installed vs. what's pinned vs. what's newest upstream
 #   .\start.ps1 -Action upgrade      # move to the versions pinned in $VER below
 #   .\start.ps1 -Action upgrade -Latest   # move to the newest upstream release of each component
@@ -33,7 +33,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy')]
+    [ValidateSet('deploy', 'upgrade', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -62,7 +62,7 @@ param(
     # add-model: which quantisation to pull from a repo that offers several.
     [string]$Quant = 'Q4_K_M',
 
-    # add-model: llama-swap model id to register (defaults to the file name, lowercased).
+    # add-model: model id to register; test-model: configured model id to send a real completion request.
     [string]$Id,
 
     # add-model: context size for the generated config.yaml entry.
@@ -73,6 +73,8 @@ param(
 
     # add-model: download only, don't touch llamaswap\config.yaml.
     [switch]$NoConfig,
+    # add-model: override the default llama.cpp\models download location.
+    [string]$ModelDir,
 
     # autotune: write the measured settings straight into config.yaml instead of printing them.
     [switch]$Apply,
@@ -146,7 +148,7 @@ $VER = @{
     llmfit    = 'v1.1.9'
     # uv (astral-sh/uv) - replaces winget for getting Python, and pip for installing into it.
     uv        = '0.12.3'
-    # macOS only: localllm.command greps this value out of this table and fetches a
+    # macOS only: ModelPilot.command greps this value out of this table and fetches a
     # self-contained pwsh into .pwsh/. Windows uses its built-in PowerShell 5.1 and ignores it.
     pwsh      = '7.6.5'
     # ComfyUI: the image and video backend. Separate from deploy for the same reason as prism -
@@ -163,7 +165,7 @@ $root         = $PSScriptRoot
 Assert-SupportedPlatform
 $llamaCpp     = Join-Path $root 'llama.cpp'
 $llamaPrism   = Join-Path $root 'llama.cpp-prism'   # PrismML fork, side by side with the stock build
-$modelsDir    = Join-Path $llamaCpp 'models'        # shared: both binaries read the same weights
+$modelsDir    = if ($ModelDir) { [IO.Path]::GetFullPath($ModelDir) } else { Join-Path $llamaCpp 'models' }
 $uvDir        = Join-Path $root 'uv'          # provides Python; nothing is installed system-wide
 $llmfitDir    = Join-Path $root 'llmfit'
 $llmfitExe    = Join-Path $llmfitDir (Get-ToolName 'llmfit')
@@ -224,12 +226,21 @@ function Initialize-SwapConfig {
 function Get-BigFile($url, $out, [long]$total = 0) {
     $curl = Get-CurlExe   # resolves and throws with a usable message if absent
     $part = "$out.part"
+    $expectedSha256 = Get-GitHubReleaseAssetDigest $url
     @{ total = $total; url = $url; started = (Get-Date).ToString('o') } |
         ConvertTo-Json -Compress | Set-Content -Path "$part.json" -Encoding utf8
     & $curl -L -C - --fail --progress-bar -o $part $url
     if ($LASTEXITCODE -ne 0) {
         $resume = if (Test-Path $part) { " Partial file kept at $part - re-run to resume." } else { "" }
         throw "Download failed (curl exit $LASTEXITCODE).$resume"
+    }
+    if ($expectedSha256) {
+        $actualSha256 = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $expectedSha256) {
+            Remove-Item $part, "$part.json" -Force -ErrorAction SilentlyContinue
+            throw "SHA-256 verification failed for $url. The downloaded file was discarded."
+        }
+        Write-Host "SHA-256 verified against the upstream GitHub release digest."
     }
     Move-Item $part $out -Force
     Remove-Item "$part.json" -Force -ErrorAction SilentlyContinue
@@ -274,6 +285,34 @@ function Get-GitHubRelease($repo, $tag) {
     catch { $null }
 }
 
+# GitHub's release API publishes a SHA-256 for many uploaded release assets. Use it when present;
+# a missing digest or unavailable API is a warning, not proof of integrity. Source archives and
+# downloads from other hosts do not match this URL shape and are outside this check.
+function Get-GitHubReleaseAssetDigest($url) {
+    try { $uri = [Uri]$url } catch { return $null }
+    if ($uri.Host -ne 'github.com' -or $uri.AbsolutePath -notmatch '^/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/]+)$') {
+        return $null
+    }
+    $repo = "$($Matches[1])/$($Matches[2])"
+    $tag = [Uri]::UnescapeDataString($Matches[3])
+    $name = [Uri]::UnescapeDataString($Matches[4])
+    $release = Get-GitHubRelease $repo $tag
+    if (-not $release) {
+        Write-Warning "Could not retrieve GitHub release metadata for $repo/$tag; download cannot be digest-verified."
+        return $null
+    }
+    $asset = @($release.assets | Where-Object name -CEQ $name) | Select-Object -First 1
+    if (-not $asset) {
+        Write-Warning "GitHub release metadata has no asset named '$name'; download cannot be digest-verified."
+        return $null
+    }
+    if ($asset.digest -notmatch '^sha256:([0-9a-fA-F]{64})$') {
+        Write-Warning "GitHub has no SHA-256 digest for $repo/$tag/$name; download cannot be digest-verified."
+        return $null
+    }
+    $Matches[1].ToLowerInvariant()
+}
+
 function Resolve-Latest($ver) {
     $out = $ver.Clone()
     Write-Host "Resolving newest upstream releases..."
@@ -312,15 +351,19 @@ function Get-WebuiProcess {
 
 function Get-ComfyProcess { Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $comfyDir }
 
-function Get-TrayProcess { Get-ProcessByCommandLine 'tray\.ps1' }
+function Get-TrayProcess {
+    # An uninstall from one install must never terminate another copy's tray.
+    Get-ProcessByCommandLine ([regex]::Escape((Join-Path $root 'tray.ps1')))
+}
 
 # The tray script self-deduplicates via a named mutex, so firing this off unconditionally is safe.
 function Start-Tray {
     $tray = Join-Path $root 'tray.ps1'
     if (-not (Test-Path $tray)) { return }
-    Start-Process powershell -WindowStyle Hidden `
-        -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $tray,
-                      '-SwapPort', "$swapPort", '-WebuiPort', "$webuiPort"
+    $trayArgs = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $tray,
+                  '-SwapPort', "$swapPort", '-WebuiPort', "$webuiPort")
+    $trayArgs = @($trayArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
+    Start-Process powershell -WindowStyle Hidden -ArgumentList $trayArgs
 }
 
 # 'swap' covers llama-swap and the llama-server processes it spawns - they're its children and
@@ -419,6 +462,27 @@ function Remove-OpenWebUI {
             $removed += $_.FullName
         }
     }
+    return $removed
+}
+
+function Remove-Comfy {
+    $removed = @()
+    if (-not (Test-Path -LiteralPath $comfyDir)) { return $removed }
+
+    # ComfyUI runs its own Python from this tree. Stop only that interpreter before deleting the
+    # optional runtime and its local models, input/output, workflows and settings.
+    $processes = @(Get-ComfyProcess)
+    foreach ($process in $processes) {
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($processes.Count) { Start-Sleep -Seconds 1 }
+
+    try { Remove-Item -LiteralPath $comfyDir -Recurse -Force -ErrorAction Stop }
+    catch { throw ("Could not remove ComfyUI data at {0}: {1}" -f $comfyDir, $_.Exception.Message) }
+    if (Test-Path -LiteralPath $comfyDir) {
+        throw ("ComfyUI files remain at {0}; close anything using that folder and retry." -f $comfyDir)
+    }
+    $removed += "$comfyDir (runtime, models, input/output and user data)"
     return $removed
 }
 
@@ -560,6 +624,9 @@ function Get-ResetTargets($component, [switch]$IncludeModels) {
         Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { Add-Target $_.FullName 'open-webui (chats and settings)' }
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { Add-Target $_.FullName 'parked old open-webui' }
     }
+    if ($all -and (Test-Path -LiteralPath $comfyDir)) {
+        Add-Target $comfyDir 'ComfyUI runtime, models, input/output and user data'
+    }
     if ($all -or $component -eq 'llmfit') { if (Test-Path $llmfitDir) { Add-Target $llmfitDir 'llmfit model picker' } }
     if ($all -or $component -eq 'uv') {
         if (Test-Path $uvDir) { Add-Target $uvDir 'uv' }
@@ -591,6 +658,7 @@ function Remove-AllComponents {
     $allRemoved += Remove-LlamaSwap
     $allRemoved += Remove-OpenWebUI -IncludeOldVersions
     $allRemoved += Remove-Llmfit
+    $allRemoved += Remove-Comfy
     $allRemoved += Remove-UV
     $allRemoved += Remove-Logs
     $allRemoved += Remove-Downloads
@@ -870,8 +938,12 @@ function Test-SwapConfig {
     # dies on spawn with nothing on screen mentioning encoding - exactly what this preflight exists
     # to turn into a sentence. Read-TextFile/Write-TextFile stop it recurring; this catches a file
     # already damaged, or hand-edited somewhere else.
-    $ctl = @([regex]::Matches($text, '[\p{Cc}\p{Cf}]') | Where-Object { $_.Value -notmatch '[
-	]' })
+    # Compared as characters, not by regex. The pattern form of this was written as '[\r\n\t]' and
+    # an editing pass turned those escapes into literal characters, so the class lost its CR and
+    # every carriage return in a CRLF file was reported as corruption - a preflight crying wolf on
+    # a perfectly good config is worse than no preflight.
+    $allow = [char]13, [char]10, [char]9
+    $ctl = @([regex]::Matches($text, '[\p{Cc}\p{Cf}]') | Where-Object { $allow -notcontains $_.Value[0] })
     if ($ctl.Count) {
         $line = ($text.Substring(0, $ctl[0].Index) -split "`n").Count
         Write-Warning ("config.yaml has {0} control character(s) - llama-swap will refuse the whole file. First is U+{1:X4} on line {2}." -f
@@ -988,7 +1060,7 @@ function Wait-Healthy($label, $url, $proc, $logFiles, $timeoutSec) {
 function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
     if (Test-ComponentRunning $component) {
         $what = if ($component -eq 'all') { 'Stack' } else { $component }
-        Write-Host "$what is already running - use '-Action restart' to bounce it, or '-Action stop' to stop it."
+        Write-Host "$what is already running. Use the Model Pilot panel or tray menu to stop or restart services."
         Write-Host "  llama-swap dashboard: http://127.0.0.1:$swapPort/ui"
         Write-Host "  open-webui chat:      http://127.0.0.1:$webuiPort"
         # Still worth doing: the user may have exited the tray and re-run this to get it back.
@@ -1017,9 +1089,10 @@ function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
         # within 5s, logging "reloading configuration" / "configuration reloaded".
         # A model already running keeps the flags it was spawned with until it unloads - a reload
         # rewrites the routing table, it does not restart a live llama-server.
+        $swapArgs = @('--config', $swapConfig, '--listen', ":$swapPort", '-watch-config')
+        $swapArgs = @($swapArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
         $swapProc = Start-Process -FilePath (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap')) `
-            -ArgumentList '--config', $swapConfig, '--listen', ":$swapPort", '-watch-config' `
-            -WorkingDirectory $llamaSwapDir -NoNewWindow -PassThru `
+            -ArgumentList $swapArgs -WorkingDirectory $llamaSwapDir -NoNewWindow -PassThru `
             -RedirectStandardOutput $swapLogs[1] -RedirectStandardError $swapLogs[0]
     }
 
@@ -1037,9 +1110,11 @@ function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
         $webuiFirstBoot = $freshTree -or -not (Test-Path (Join-Path $webui 'backend\data\webui.db'))
         if ($webuiFirstBoot) { Write-Host "  (first boot: migrating the database and fetching embedding weights - this one takes a few minutes)" }
         Write-Host "Starting open-webui on :$webuiPort ..."
+        $webuiArgs = @('-m', 'uvicorn', 'open_webui.main:app', '--host', '0.0.0.0', '--port', "$webuiPort",
+                       '--forwarded-allow-ips', "'*'", '--ws', 'auto')
+        $webuiArgs = @($webuiArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
         $webuiProc = Start-Process -FilePath (Get-VenvPython (Join-Path $webui '.venv')) `
-            -ArgumentList '-m', 'uvicorn', 'open_webui.main:app', '--host', '0.0.0.0', '--port', "$webuiPort", '--forwarded-allow-ips', "'*'", '--ws', 'auto' `
-            -WorkingDirectory (Join-Path $webui 'backend') -NoNewWindow -PassThru `
+            -ArgumentList $webuiArgs -WorkingDirectory (Join-Path $webui 'backend') -NoNewWindow -PassThru `
             -RedirectStandardOutput $webuiLogs[1] -RedirectStandardError $webuiLogs[0]
     }
 
@@ -1061,7 +1136,7 @@ function Start-Stack($webui, $component = 'all', [bool]$freshTree = $false) {
 
     Write-Host "`nllama-swap dashboard: http://127.0.0.1:$swapPort/ui"
     Write-Host "open-webui chat:      http://127.0.0.1:$webuiPort"
-    Write-Host "Logs: $logDir  (both run detached - stop with '.\start.ps1 -Action stop')"
+    Write-Host "Logs: $logDir  (both services run detached - stop them from the Model Pilot panel or tray menu)"
 }
 
 # ==========================================================================
@@ -1344,6 +1419,7 @@ function Test-ModelLoad {
            '--host', '127.0.0.1', '--port', "$Port")
     if ($null -ne $NCpuMoe) { $a += @('--n-cpu-moe', "$NCpuMoe") }
 
+    $a = @($a | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
     $p = Start-Process -FilePath $Exe -PassThru -NoNewWindow -ArgumentList $a `
         -RedirectStandardError $log -RedirectStandardOutput "$log.out"
 
@@ -1496,7 +1572,7 @@ if ($Action -eq 'autostart') {
     $lnk = Enable-Autostart $PSCommandPath $root
     Write-Host "Autostart set -> $lnk"
     if (-not (Test-AutostartEnabled)) {
-        Write-Warning "It is written but the system has it switched off - re-enable LocalLLM under Task Manager > Startup apps (Windows) or System Settings > General > Login Items (macOS)."
+        Write-Warning "It is written but the system has it switched off - re-enable Model Pilot under Task Manager > Startup apps (Windows) or System Settings > General > Login Items (macOS)."
     }
     Write-Host "The stack, and its tray indicator, will start at logon. Undo with '-Action autostart -Remove'."
     return
@@ -1646,7 +1722,8 @@ if ($Action -eq 'comfy') {
     $log = Join-Path $logDir 'comfyui.log'
     $args = @((Join-Path $comfyDir 'main.py')) + (Get-ComfyArgs)
     Write-Host "Starting ComfyUI on :8188 ..."
-    $p = Start-Process -FilePath $comfyPy -ArgumentList $args -WorkingDirectory $comfyDir `
+    $processArgs = @($args | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
+    $p = Start-Process -FilePath $comfyPy -ArgumentList $processArgs -WorkingDirectory $comfyDir `
              -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     # Its own health wait, for the same reason the rest of the stack has one: a backend that died
     # on startup is otherwise invisible until open-webui reports a failed generation minutes later.
@@ -2070,6 +2147,43 @@ switch ($Action) {
         }
     }
 
+    'test-model' {
+        if (-not $Id -or $Id -notmatch '^[A-Za-z0-9_.-]+$') {
+            throw "-Id must be a configured model id containing only letters, numbers, dot, underscore or hyphen."
+        }
+        if (-not (Test-Path $swapConfig)) { throw "llama-swap config.yaml is missing. Start setup first." }
+        $text = Read-TextFile $swapConfig
+        $parts = [regex]::Split($text, '(?m)^\s{2,}"([^"]+)"\s*:\s*$')
+        $entry = $null
+        for ($i = 1; $i -lt $parts.Count; $i += 2) {
+            if ($parts[$i] -ceq $Id) { $entry = $parts[$i + 1] }
+        }
+        if (-not $entry) { throw "Model '$Id' is not configured in config.yaml." }
+        $weights = [regex]::Match($entry, '-m\s+"?([^"\r\n]+?\.gguf)"?')
+        if (-not $weights.Success) { throw "Model '$Id' has no GGUF weight path in config.yaml." }
+        $weightPath = $weights.Groups[1].Value.Trim()
+        if (-not (Test-Path -LiteralPath $weightPath -PathType Leaf)) {
+            throw "Model '$Id' weights are missing: $weightPath"
+        }
+        try {
+            Invoke-WebRequest "http://127.0.0.1:$swapPort/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop | Out-Null
+        } catch { throw "llama-swap is not running. Start the services on Home, then try the response check again." }
+
+        Write-Host "Sending a real completion to '$Id'. A cold model load can take several minutes."
+        $payload = @{ model = $Id; messages = @(@{ role = 'user'; content = 'Reply with one short sentence confirming you are ready.' })
+                      max_tokens = 32; temperature = 0 } | ConvertTo-Json -Depth 5 -Compress
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $response = Invoke-RestMethod "http://127.0.0.1:$swapPort/v1/chat/completions" -Method Post `
+            -Body ([Text.Encoding]::UTF8.GetBytes($payload)) -ContentType 'application/json; charset=utf-8' -TimeoutSec 900
+        $timer.Stop()
+        $answer = [string]$response.choices[0].message.content
+
+        if ([string]::IsNullOrWhiteSpace($answer)) { throw "Model '$Id' returned an empty response." }
+        if ($answer.Length -gt 800) { $answer = $answer.Substring(0, 800) + '...' }
+        Write-Host ("[MODEL_RESPONSE_CHECK_PASSED] '$Id' returned text in {0:N1}s." -f $timer.Elapsed.TotalSeconds)
+        Write-Host "Response: $($answer.Trim())"
+    }
+
     'check-config' {
         # The same preflight the launch runs, on its own - so a config edit can be checked before
         # bouncing llama-swap, rather than by bouncing it and reading the warnings on the way past.
@@ -2268,6 +2382,7 @@ switch ($Action) {
         if (Test-Path (Join-Path $llamaSwapDir (Get-ToolName 'llama-swap'))) { $targets += "$llamaSwapDir\llama-swap.exe (config.yaml kept)" }
         Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
+        if (Test-Path -LiteralPath $comfyDir) { $targets += "$comfyDir (runtime, models, input/output and user data)" }
         if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
         # llmfit is 23 MB this script downloaded and installed, and it survived a full uninstall
         # silently - the same shape as uv and .python before it. .agent-compat.json goes too: it
