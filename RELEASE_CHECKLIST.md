@@ -36,7 +36,7 @@ Use this gate for every public release. A green build is not proof that the Wind
 
 ## Automated release build
 
-- [ ] Push a `release/<semver>` or `version/<semver>` branch and download its `model-pilot-<semver>` workflow artifact. Verify `Model-Pilot-Setup.exe` against its `SHA256SUMS.txt`.
+- [x] Push `release/v0.1.13` and download its `model-pilot-0.1.13` workflow artifact. Run [#39040488629](https://github.com/hgaaditya/modelpilot/actions/runs/39040488629) passed; its 2,213,370-byte installer matched `SHA256SUMS.txt` (`19260e31568d7a7b8c247f09aa1c16ede7d90ca97b65ca977f3c77e3089178f7`).
 - [ ] Obtain explicit release approval and push the matching `v<semver>` tag. Branch builds upload artifacts only; a tag creates the GitHub Release.
 - [ ] Confirm the tagged workflow passes script parsing, panel JavaScript syntax validation and installer compilation.
 - [ ] Inspect release page, product version, notes and attachments. Never describe an unsigned installer as publisher-signed.
