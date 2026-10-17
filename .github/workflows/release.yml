@@ -38,7 +38,7 @@ jobs:
           "value=$candidate" >> $env:GITHUB_OUTPUT
 
       - name: Install Inno Setup 6
-        run: choco install innosetup --version=6.7.3 --yes --no-progress
+        run: winget install --id JRSoftware.InnoSetup --exact --version 6.7.3 --scope user --silent --accept-package-agreements --accept-source-agreements
 
       - name: Validate shipped scripts and panel JavaScript
         shell: pwsh
@@ -56,8 +56,11 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler was not installed.' }
+          $iscc = @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup compiler was not installed.' }
           & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" installer\ModelPilot.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $installer = 'installer\output\Model-Pilot-Setup.exe'
