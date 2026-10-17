@@ -109,7 +109,7 @@
         "9",
         0
       ],
-      "filename_prefix": "localllm_video",
+      "filename_prefix": "model_pilot_video",
       "codec": "vp9",
       "fps": 16.0,
       "crf": 32.0

@@ -1,0 +1,100 @@
+name: release artifacts
+
+# A versioned release branch produces a downloadable QA artifact. Only an explicit v* tag creates
+# a GitHub Release, so pushing a branch can never publish an installer accidentally.
+on:
+  push:
+    branches:
+      - 'release/**'
+      - 'version/**'
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-installer:
+    name: Build Windows setup EXE
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Determine candidate version
+        id: version
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME
+          $candidate = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $ref -replace '^v', ''
+          } else {
+            $ref -replace '^(release|version)/v?', ''
+          }
+          if ($candidate -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Release branches must be named release/<semver> or version/<semver>; tags must be v<semver>. Got '$ref'."
+          }
+          "value=$candidate" >> $env:GITHUB_OUTPUT
+
+      - name: Install Inno Setup 6
+        run: winget install --id JRSoftware.InnoSetup --exact --version 6.7.3 --scope user --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Validate shipped scripts and panel JavaScript
+        shell: pwsh
+        run: |
+          $files = @('start.ps1', 'ui.ps1', 'tray.ps1', 'platform.ps1')
+          foreach ($file in $files) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors)
+            if ($errors) { throw "$file has PowerShell parse errors: $($errors -join '; ')" }
+          }
+          if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js is required for the panel syntax check.' }
+          & .\start.ps1 -Action check-ui
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup compiler was not installed.' }
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" installer\ModelPilot.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installer = 'installer\output\Model-Pilot-Setup.exe'
+          if (-not (Test-Path $installer)) { throw 'Installer output was not created.' }
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Model-Pilot-Setup.exe" | Set-Content installer\output\SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload installer candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: model-pilot-${{ steps.version.outputs.value }}
+          path: |
+            installer/output/Model-Pilot-Setup.exe
+            installer/output/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-github-release:
+    name: Publish tagged GitHub Release
+    needs: build-windows-installer
+    if: github.ref_type == 'tag'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: model-pilot-${{ needs.build-windows-installer.outputs.version }}
+          path: installer/output
+
+      - name: Publish setup EXE and checksum
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            installer/output/Model-Pilot-Setup.exe
+            installer/output/SHA256SUMS.txt

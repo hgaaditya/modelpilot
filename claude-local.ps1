@@ -361,7 +361,7 @@ $report = [ordered]@{ ok = $false; base = $base; model = $null; smallModel = $nu
 
 # 1. Is the router up at all?
 try { $null = Invoke-WebRequest "$base/health" -UseBasicParsing -TimeoutSec 3 }
-catch { $report.problem = "llama-swap isn't answering on $base - start the stack first (LocalLLM.cmd, or .\start.ps1)." }
+catch { $report.problem = "llama-swap isn't answering on $base - open Model Pilot, or start the stack from a terminal first." }
 
 # 2. Which models does it serve, and which of those can hold an agent's prompt?
 $known = @()

@@ -1,4 +1,4 @@
-# LocalLLM tray indicator - a system-tray dot showing whether the stack is up.
+# Model Pilot tray indicator - a system-tray dot showing whether the local AI stack is up.
 #
 # Launched automatically by start.ps1 after a successful start (suppress with -NoTray),
 # or on its own:  powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File .\tray.ps1
@@ -7,9 +7,8 @@
 #   yellow  one of the two is down
 #   red     neither is answering
 #
-# Double-click opens the chat UI; right-click for the menu. It notifies when the stack
-# goes down on its own, which is the whole point - a backend that dies at 2am is otherwise
-# invisible until you try to use it.
+# Double-click opens the chat UI; right-click for the menu. A balloon follows a sustained
+# outage, not a single missed probe or the brief interruption of a normal restart.
 
 param(
     [int]$SwapPort  = 9292,
@@ -67,8 +66,37 @@ function Get-LoadedModel {
     $null
 }
 
+$script:plannedActions = @()
+
 function Start-Detached($argList) {
-    Start-Process powershell -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $argList)
+    $p = Start-Process powershell -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs) + $argList) -PassThru
+    if ($p) { $script:plannedActions += $p }
+}
+
+function Test-LifecycleActionRunning {
+    $active = @()
+    foreach ($process in $script:plannedActions) {
+        try { if (-not $process.HasExited) { $active += $process } } catch { }
+    }
+    $script:plannedActions = $active
+    if ($active.Count) { return $true }
+
+    $jobs = Join-Path $script:logDir 'jobs'
+    if (-not (Test-Path $jobs)) { return $false }
+    foreach ($pidFile in Get-ChildItem -LiteralPath $jobs -Filter '*.pid' -File -ErrorAction SilentlyContinue) {
+        $name = [IO.Path]::GetFileNameWithoutExtension($pidFile.Name) -replace '-\d{6}$', ''
+        if ($name -notmatch '^(deploy|restart|stop|upgrade|reset|uninstall)(-.+)?$') { continue }
+        try {
+            $jobPid = [int](Get-Content -LiteralPath $pidFile.FullName -Raw).Trim()
+            $process = Get-Process -Id $jobPid -ErrorAction Stop
+            # The sidecar is written immediately after Start-Process. Matching its time to the
+            # process start prevents an old PID file from masking an unrelated process after PID reuse.
+            if ([Math]::Abs(($process.StartTime.ToUniversalTime() - $pidFile.LastWriteTimeUtc).TotalSeconds) -le 30) {
+                return $true
+            }
+        } catch { }
+    }
+    return $false
 }
 
 # The control panel is the app's main window; the tray is what it minimises to. Closing the
@@ -133,11 +161,11 @@ function Add-MenuItem($text, $action) {
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = $icons.down
-$notify.Text = 'LocalLLM: checking...'
+$notify.Text = 'Model Pilot: checking...'
 $notify.ContextMenuStrip = $menu
 $notify.Visible = $true
 
-$miPanel = Add-MenuItem 'Open LocalLLM'        { Open-Panel }
+$miPanel = Add-MenuItem 'Open Model Pilot'     { Open-Panel }
 $miPanel.Font = New-Object System.Drawing.Font($miPanel.Font, [System.Drawing.FontStyle]::Bold)
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $miChat = Add-MenuItem 'Open chat UI'          { Start-Process "http://127.0.0.1:$script:WebuiPort" }
@@ -205,7 +233,8 @@ $miStop = New-Object System.Windows.Forms.ToolStripMenuItem 'Stop'
 # and restoring it is what a user expects from double-clicking a tray icon.
 $notify.Add_DoubleClick({ Open-Panel })
 
-$script:lastState = $null
+$script:downSince = $null
+$script:alertSent = $false
 
 function Update-Status {
     $swapUp  = Test-Endpoint "http://127.0.0.1:$script:SwapPort/health"
@@ -215,7 +244,7 @@ function Update-Status {
     $script:notify.Icon = $script:icons[$state]
 
     $model = if ($swapUp) { Get-LoadedModel } else { $null }
-    $text = "LocalLLM  router:$(if ($swapUp) { 'up' } else { 'DOWN' })  ui:$(if ($webuiUp) { 'up' } else { 'DOWN' })"
+    $text = "Model Pilot  router:$(if ($swapUp) { 'up' } else { 'DOWN' })  ui:$(if ($webuiUp) { 'up' } else { 'DOWN' })"
     if ($model) { $text += "  [$model]" }
     # NotifyIcon.Text throws above 63 characters, and a long model id blows past that.
     if ($text.Length -gt 63) { $text = $text.Substring(0, 60) + '...' }
@@ -224,16 +253,29 @@ function Update-Status {
     $script:miChat.Enabled = $webuiUp
     $script:miDash.Enabled = $swapUp
 
-    if ($script:lastState -and $state -ne $script:lastState -and $state -ne 'up') {
-        $down = @()
-        if (-not $swapUp)  { $down += 'llama-swap' }
-        if (-not $webuiUp) { $down += 'open-webui' }
-        $script:notify.BalloonTipTitle = 'LocalLLM stack is down'
-        $script:notify.BalloonTipText  = "$($down -join ' and ') stopped answering. Check logs\ or restart from this menu."
-        $script:notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
-        $script:notify.ShowBalloonTip(8000)
+    # The icon reports health immediately, but a single missed 1-second probe or a deliberate
+    # lifecycle job must not look like a crash. Alert only after a sustained, unplanned outage.
+    if (Test-LifecycleActionRunning) {
+        $script:downSince = $null
+        $script:alertSent = $false
+    } elseif ($state -eq 'up') {
+        $script:downSince = $null
+        $script:alertSent = $false
+    } else {
+        if ($null -eq $script:downSince) {
+            $script:downSince = [DateTime]::UtcNow
+        } elseif (-not $script:alertSent -and
+            ([DateTime]::UtcNow - $script:downSince).TotalSeconds -ge 15) {
+            $down = @()
+            if (-not $swapUp)  { $down += 'llama-swap' }
+            if (-not $webuiUp) { $down += 'open-webui' }
+            $script:notify.BalloonTipTitle = 'Model Pilot service not responding'
+            $script:notify.BalloonTipText  = "$($down -join ' and ') has not answered for at least 15 seconds. Check logs or restart from this menu."
+            $script:notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
+            $script:notify.ShowBalloonTip(8000)
+            $script:alertSent = $true
+        }
     }
-    $script:lastState = $state
 }
 
 # ponytail: polls on the UI thread with a 1s timeout - a hung endpoint stalls the menu for a
