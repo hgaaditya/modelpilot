@@ -102,10 +102,9 @@ does not install custom nodes.
 For a public or low-risk issue **after a public release exists**, use its public issue tracker. For
 an unresolved vulnerability, do **not** publish exploit details. Report it privately to
 [modelpilot.app@gmail.com](mailto:modelpilot.app@gmail.com), with **“Security”** in the subject.
-Do not send passwords, API keys, private chat history, or model weights. The repository is currently
-private and GitHub's private vulnerability-reporting endpoint returned 404, so email is the available
-private route. Before public distribution, test this address from an account outside the maintainer
-team and configure GitHub private vulnerability reporting if it becomes available.
+Do not send passwords, API keys, private chat history, or model weights. The repository is public,
+but GitHub private vulnerability reporting is unavailable for it; email is the available private
+route.
 
 Please include the version (`.\start.ps1 -Action status`), what you did, and what happened. A
 proof of concept helps enormously — the CSRF issue above was fixed the day it was found because it
