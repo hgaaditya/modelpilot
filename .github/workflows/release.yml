@@ -80,14 +80,17 @@ jobs:
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  Model-Pilot-Setup.exe" | Set-Content installer\output\SHA256SUMS.txt -Encoding ascii
 
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item installer\output\Model-Pilot-Setup.exe, installer\output\SHA256SUMS.txt, supply-chain.json release-assets
+
       - name: Upload installer candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: model-pilot-${{ steps.version.outputs.value }}
-          path: |
-            installer/output/Model-Pilot-Setup.exe
-            installer/output/SHA256SUMS.txt
-            supply-chain.json
+          path: release-assets/*
           if-no-files-found: error
           retention-days: 30
 
@@ -105,13 +108,13 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: model-pilot-${{ needs.build-windows-installer.outputs.version }}
-          path: installer/output
+          path: release-assets
 
       - name: Publish setup EXE and checksum
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
-            installer/output/Model-Pilot-Setup.exe
-            installer/output/SHA256SUMS.txt
-            supply-chain.json
+            release-assets/Model-Pilot-Setup.exe
+            release-assets/SHA256SUMS.txt
+            release-assets/supply-chain.json
           body_path: RELEASE_NOTES.md
