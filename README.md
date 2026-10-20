@@ -83,6 +83,16 @@ short completion, may cold-load the model and shows the reply and any failure. T
 inference returned text; it does not assess accuracy or usefulness. Use **Open chat** to judge the
 model on your own tasks.
 
+**Updates and recovery.** Settings checks GitHub automatically for a newer Model Pilot release. When
+one is available, **Update now** downloads the release installer, verifies its SHA-256 against the
+attached checksum, preserves models/chats/settings, and restarts the panel. The same page can run a
+disk/RAM/accelerator readiness check and create a local ZIP backup of configuration and Open WebUI
+data. Backups deliberately exclude GGUF weights, logs and download caches; the ZIP includes session
+data, so store it privately.
+
+The Models table distinguishes a configured model from one that has returned text through the local
+router. See the [model support contract](MODEL_SUPPORT.md) for the precise boundary.
+
 **Home** summarizes service and hardware status. Long-running work appears under **Activity**.
 Troubleshooting details, local tools and sensor monitoring are grouped under **More** so the main
 navigation stays focused on everyday tasks.
@@ -118,6 +128,10 @@ can contain computer name, hardware and drive details, event-log text, model nam
 Redact anything identifying; do not attach weights, secrets or chat history unless you have
 deliberately checked and need to share it. For security vulnerabilities, follow
 [SECURITY.md](SECURITY.md) instead of posting exploit details publicly.
+
+The repository provides structured bug and installation-recovery reports. Use the panel's **GitHub
+support** link or [open an issue](https://github.com/hgaaditya/modelpilot/issues/new/choose) after
+running the local readiness check; redact the result before posting.
 
 
 ---
@@ -242,6 +256,11 @@ servers bind IPv4 only.
   llama-swap service. If you configure a remote provider or extension, that provider may receive
   the requests you send through it. See [SECURITY.md](SECURITY.md) for the network and trust
   boundaries.
+
+The shipped [supply-chain manifest](supply-chain.json) lists the pinned bootstrap components and
+their upstream distribution locations. GitHub release installers are accompanied by
+`SHA256SUMS.txt`; checksum matching detects corruption but, because this public release is unsigned,
+does not establish publisher identity.
 
 ## Where things live
 

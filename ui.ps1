@@ -39,6 +39,7 @@ $logDir     = Join-Path $root 'logs'
 $jobDir     = Join-Path $logDir 'jobs'
 $settingsFile = Join-Path $root '.ui-settings.json'
 $usageFile  = Join-Path $root '.ui-usage.json'
+$modelSupportFile = Join-Path $root '.model-support.json'
 $swapPort   = 9292
 $webuiPort  = 8080
 New-Item -ItemType Directory -Force -Path $jobDir | Out-Null
@@ -240,6 +241,16 @@ function Set-Settings($patch) {
     foreach ($p in $patch.PSObject.Properties) { $s[$p.Name] = $p.Value }
     $s | ConvertTo-Json | Set-Content $settingsFile -Encoding utf8
     $s
+}
+
+function Get-ModelSupport {
+    if (-not (Test-Path $modelSupportFile)) { return @{} }
+    try {
+        $out = @{}
+        $saved = Get-Content $modelSupportFile -Raw | ConvertFrom-Json
+        foreach ($p in $saved.PSObject.Properties) { $out[$p.Name] = $p.Value }
+        return $out
+    } catch { return @{} }
 }
 
 # ---------------------------------------------------------------- probes
@@ -958,6 +969,12 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
    <span id="autoss" style="color:var(--dim);font-size:11px"></span></div>
   <div class="hint">Brings llama-swap, the chat UI and the tray indicator back on their own after a restart or a crash. The panel itself stays on demand.</div>
  </fieldset>
+ <fieldset><legend>Updates and recovery</legend>
+  <div class="row"><button class="gh" onclick="checkProductUpdate(true)">Check for app updates</button><span id="appupd" style="color:var(--dim);font-size:11px">Checking GitHub for the current release...</span></div>
+  <div class="row" style="margin-top:10px"><button class="gh" onclick="runPreflight()">Check this PC before installing or upgrading</button><button class="gh" onclick="backupData()">Back up chats and settings</button></div>
+  <div id="preflight" class="hint" style="margin-top:8px">The backup is a local ZIP under this installation's backups folder. It includes settings and Open WebUI data, never GGUF model weights.</div>
+  <div class="hint" style="margin-top:8px">If setup or recovery fails, submit a redacted report at <a href="https://github.com/hgaaditya/modelpilot/issues/new/choose" target="_blank" rel="noreferrer">GitHub support</a>. Do not attach chats, model weights, tokens or unreviewed logs.</div>
+ </fieldset>
  <fieldset><legend>Remove parts of the install</legend>
  <div class="hint" style="margin-bottom:8px">Each selected runtime can be reinstalled by pressing Start. The checkbox only deletes GGUF weights inside this installation; model folders you selected elsewhere are always kept. Everything also removes optional ComfyUI models, inputs, outputs and user settings.</div>
   <div class="row" style="gap:8px;flex-wrap:wrap">
@@ -1257,6 +1274,33 @@ async function chk(){
   document.getElementById('vchk').textContent='checked '+VER.checked}
  catch(e){document.getElementById('vchk').textContent='check failed'}
  delete PEND['vercheck'];tick();
+}
+async function checkProductUpdate(manual){
+ const box=document.getElementById('appupd'); if(!box)return;
+ if(manual)box.textContent='Checking GitHub...';
+ try{
+  await fetch('/api/product-update?run=1');
+  const d=await waitFor('/api/product-update',30000);
+  if(d.error)throw new Error(d.error);
+  if(d.available)box.innerHTML='Version '+esc(d.latest)+' is ready. <button class="act" onclick="applyAppUpdate()">Update now</button>';
+  else box.textContent='Model Pilot '+d.current+' is up to date.';
+ }catch(e){box.textContent='Could not check for app updates. Try again when online.'}
+}
+async function applyAppUpdate(){
+ if(!await ask('Download the verified release installer, update this app, and restart the control panel?\n\nYour models, chats and settings are kept.',{ok:'Update and restart'}))return;
+ mark('app-update',1800000);await post('/api/app-update',{});document.getElementById('appupd').textContent='Downloading and applying the update. The panel will restart automatically.';
+}
+async function runPreflight(){
+ const box=document.getElementById('preflight');box.textContent='Checking disk, memory and accelerator headroom...';
+ try{
+  await fetch('/api/preflight?run=1');const d=await waitFor('/api/preflight',30000);
+  if(d.error)throw new Error(d.error);
+  box.innerHTML=(d.checks||[]).map(c=>'<div class="'+(c.ok?'':'miss')+'"><b>'+esc(c.name)+':</b> '+esc(c.value)+' — '+esc(c.detail)+'</div>').join('');
+ }catch(e){box.textContent='Could not complete the readiness check. See Activity for details.'}
+}
+async function backupData(){
+ if(!await ask('Create a local ZIP backup of chats, users, settings and configuration?\n\nModel weights, logs and download caches are excluded. The archive includes the Open WebUI session key, so keep it private.',{ok:'Create backup'}))return;
+ mark('backup',300000);await post('/api/backup',{});document.getElementById('preflight').textContent='Creating backup. Its location will appear in Activity.';
 }
 // Context and KV quantisation are just flags on the model's cmd, so they can be changed here -
 // unlike the weight quantisation (Q4_K_M vs Q6_K), which is a different file and means a
@@ -1705,7 +1749,7 @@ async function tick(){
    <td>${chat(m.ctx)}</td>
    <td class="adv">${m.ctx||'-'}</td><td class="adv">${m.kv||'-'}</td><td class="adv">${m.moe!==null?m.moe:'-'}</td>
    <td class="adv" style="color:var(--dim)">${m.lastUsed||'-'}</td><td class="adv">${m.loads||0}</td>
-   <td>${!m.engineOk?'<span class="miss">engine missing</span>':(on?'<span class="on2">loaded</span>':(loading?'<span style="color:var(--warn)">loading</span>':(m.present?'ready':'-')))}</td>
+   <td>${!m.engineOk?'<span class="miss">engine missing</span>':(on?'<span class="on2">loaded</span>':(loading?'<span style="color:var(--warn)">loading</span>':(m.present?(M.support&&M.support[m.id]?'<span class="on2">text response verified</span>':'<span style="color:var(--dim)">ready — verify response</span>'):'-')))}</td>
    <td>${m.present?B('gh','load:'+m.id,`load('${m.id}')`,'Load')+' '+
                    B('gh','edit:'+m.id,`edit('${m.id}')`,'Edit')+' '+
                    B('gh','autotune-'+m.id,`tune('${m.id}')`,'Tune')+' ':''}<button class="dz" onclick="del('${m.id}',${m.sizeGb})">Delete</button></td></tr>`}).join('');
@@ -1728,7 +1772,7 @@ async function tick(){
  }
  }finally{pollBusy=false}
 }
-tick();setInterval(tick,3000);
+tick();setTimeout(()=>checkProductUpdate(false),1000);setInterval(tick,3000);
 </script></body></html>
 '@
 
@@ -1830,7 +1874,7 @@ try {
                 }
                 '^/api/models$' {
                     $body = @{ models = @(Get-ConfiguredModels); orphans = @(Get-OrphanModels)
-                               downloads = @(Get-Downloads); settings = (Get-Settings) } | ConvertTo-Json -Depth 6 -Compress
+                               downloads = @(Get-Downloads); settings = (Get-Settings); support = (Get-ModelSupport) } | ConvertTo-Json -Depth 6 -Compress
                 }
                 # ConvertTo-Json on an empty array yields nothing at all, not "[]", so the
                 # array is forced with a leading comma to keep it an array of one dimension.
@@ -2053,6 +2097,38 @@ try {
                 '^/api/versions$' {
                     $refresh = [Web.HttpUtility]::ParseQueryString($req.Url.Query)['refresh'] -eq '1'
                     $body = (Get-Versions -Refresh:$refresh) | ConvertTo-Json -Depth 5 -Compress
+                }
+                '^/api/product-update$' {
+                    $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                    if ($q['run'] -eq '1') {
+                        Start-Async 'product-update' 'latest' @('-Action', 'update-check', '-Json')
+                        $body = '{"running":true}'
+                    } else {
+                        $result = Get-Async 'product-update' 'latest'
+                        if (-not $result -or $result.running) { $body = '{"running":true}' }
+                        elseif ($result.err) { $body = @{ error = $result.err } | ConvertTo-Json -Compress }
+                        else { $body = ($result.out -join "`n") }
+                    }
+                }
+                '^/api/preflight$' {
+                    $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                    if ($q['run'] -eq '1') {
+                        Start-Async 'preflight' 'current' @('-Action', 'preflight', '-Json')
+                        $body = '{"running":true}'
+                    } else {
+                        $result = Get-Async 'preflight' 'current'
+                        if (-not $result -or $result.running) { $body = '{"running":true}' }
+                        elseif ($result.err) { $body = @{ error = $result.err } | ConvertTo-Json -Compress }
+                        else { $body = ($result.out -join "`n") }
+                    }
+                }
+                '^/api/backup$' {
+                    Start-Job2 'backup' @('-Action', 'backup') | Out-Null
+                    $body = '{"ok":true}'
+                }
+                '^/api/app-update$' {
+                    Start-Job2 'app-update' @('-Action', 'update-app', '-PanelPid', $PID) | Out-Null
+                    $body = '{"ok":true}'
                 }
                 '^/api/install$' {
                     $p = Read-Body $req

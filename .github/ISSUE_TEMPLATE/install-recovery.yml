@@ -1,0 +1,35 @@
+name: Installation or recovery problem
+description: Report setup, upgrade, startup, or recovery failures.
+title: "install: "
+labels: [installation, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        First, use Settings → **Check this PC** and review Activity. Share only redacted error text. Never attach chats, `.env` files, API tokens, model weights, or full unreviewed logs.
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where did it fail?
+      options:
+        - Installer
+        - First setup/download
+        - Starting services
+        - In-app update
+        - Backup or recovery
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Model Pilot version
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Redacted error and actions already tried
+      description: Include the first meaningful error line and the result of the PC check if available.
+    validations:
+      required: true

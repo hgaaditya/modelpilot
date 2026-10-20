@@ -40,6 +40,8 @@ Source: "..\local-agent.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\diagnose.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bench\run.py"; DestDir: "{app}\bench"; Flags: ignoreversion
 Source: "..\bench\tasks.jsonl"; DestDir: "{app}\bench"; Flags: ignoreversion
+Source: "..\VERSION"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\supply-chain.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD-PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -122,6 +124,8 @@ Type: files; Name: "{app}\diagnose.ps1"
 Type: files; Name: "{app}\bench\run.py"
 Type: files; Name: "{app}\bench\tasks.jsonl"
 Type: files; Name: "{app}\llamaswap\config.example.yaml"
+Type: files; Name: "{app}\VERSION"
+Type: files; Name: "{app}\supply-chain.json"
 Type: files; Name: "{app}\LICENSE"
 Type: files; Name: "{app}\THIRD-PARTY.md"
 Type: dirifempty; Name: "{app}\llamaswap"

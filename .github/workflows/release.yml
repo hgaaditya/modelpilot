@@ -37,6 +37,18 @@ jobs:
           }
           "value=$candidate" >> $env:GITHUB_OUTPUT
 
+      - name: Validate shipped product metadata
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.value }}'
+          if ((Get-Content VERSION -Raw).Trim() -ne $version) {
+            throw "VERSION must match the release version $version."
+          }
+          $manifest = Get-Content supply-chain.json -Raw | ConvertFrom-Json
+          if ($manifest.metadata.component.version -ne $version) {
+            throw "supply-chain.json must identify Model Pilot $version."
+          }
+
       - name: Install Inno Setup 6
         run: winget install --id JRSoftware.InnoSetup --exact --version 6.7.3 --scope user --silent --accept-package-agreements --accept-source-agreements
 
@@ -75,6 +87,7 @@ jobs:
           path: |
             installer/output/Model-Pilot-Setup.exe
             installer/output/SHA256SUMS.txt
+            supply-chain.json
           if-no-files-found: error
           retention-days: 30
 
@@ -100,4 +113,5 @@ jobs:
           files: |
             installer/output/Model-Pilot-Setup.exe
             installer/output/SHA256SUMS.txt
+            supply-chain.json
           body_path: RELEASE_NOTES.md

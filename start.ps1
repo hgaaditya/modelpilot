@@ -33,7 +33,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
+    [ValidateSet('deploy', 'upgrade', 'update-check', 'update-app', 'backup', 'preflight', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -121,6 +121,9 @@ param(
     # the control panel shows the user what they are about to lose before they agree to it.
     [switch]$DryRun,
 
+    # update-app: the panel process to restart once the verified installer has finished.
+    [int]$PanelPid,
+
     # uninstall: skip the confirmation prompt.
     [switch]$Force
 )
@@ -176,6 +179,9 @@ $swapConfig   = Join-Path $llamaSwapDir 'config.yaml'
 $swapConfigTpl= Join-Path $llamaSwapDir 'config.example.yaml'
 $logDir       = Join-Path $root 'logs'
 $stampFile    = Join-Path $root '.stack-versions.json'
+$versionFile  = Join-Path $root 'VERSION'
+$backupDir    = Join-Path $root 'backups'
+$modelSupportFile = Join-Path $root '.model-support.json'
 $dl           = Join-Path $env:TEMP 'localllm-dl'
 $swapPort     = 9292
 $webuiPort    = 8080
@@ -2115,6 +2121,123 @@ if ($Action -eq 'add-model') {
     return
 }
 
+# --- operations: readiness, backup, product updates -----------------------------------------
+function Get-ProductVersion {
+    if (Test-Path $versionFile) { return (Get-Content $versionFile -Raw).Trim() }
+    return '0.0.0'
+}
+
+function Get-ResourcePreflight {
+    $checks = @()
+    $diskFreeGb = 0
+    try {
+        $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($root))
+        $diskFreeGb = [math]::Round($drive.AvailableFreeSpace / 1GB, 1)
+    } catch { }
+    $installed = (Test-Path (Join-Path $llamaCpp (Get-ToolName 'llama-server'))) -and (Test-Path (Find-WebuiDir))
+    $diskNeedGb = if ($installed) { 2 } else { 5 }
+    $checks += @{ name = 'Free disk space'; value = "$diskFreeGb GB available"; ok = ($diskFreeGb -ge $diskNeedGb)
+                  detail = if ($diskFreeGb -ge $diskNeedGb) { 'Enough room for normal operation.' } else { "Keep at least $diskNeedGb GB free for the stack, downloads and upgrades." } }
+
+    $ram = Get-SystemMemoryUsage
+    $freeRamGb = [math]::Round($ram.TotalGb - $ram.UsedGb, 1)
+    $checks += @{ name = 'System memory'; value = "$freeRamGb GB free of $($ram.TotalGb) GB"; ok = ($ram.TotalGb -ge 8)
+                  detail = if ($ram.TotalGb -ge 8) { 'Enough RAM for the launcher and a small local model.' } else { '8 GB or more is recommended; large models will be constrained.' } }
+
+    $acc = Get-AcceleratorInfo
+    if ($acc.Present) {
+        $checks += @{ name = 'Accelerator memory'; value = "$($acc.FreeMib) MiB free of $($acc.TotalMib) MiB"; ok = ($acc.FreeMib -ge 2048)
+                      detail = if ($acc.FreeMib -ge 2048) { 'Model fitting uses currently free accelerator memory.' } else { 'Free GPU memory by closing other GPU-heavy applications before loading a model.' } }
+    } else {
+        $checks += @{ name = 'Accelerator'; value = 'No supported accelerator detected'; ok = $true
+                      detail = 'CPU mode remains available; model generation will be slower.' }
+    }
+    @{ ready = -not (@($checks | Where-Object { -not $_.ok })); checks = @($checks); checked = (Get-Date).ToString('o') }
+}
+
+function Backup-UserData {
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $stage = Join-Path $env:TEMP "model-pilot-backup-$stamp"
+    $archive = Join-Path $backupDir "model-pilot-user-data-$stamp.zip"
+    New-Item -ItemType Directory -Force -Path $stage, $backupDir | Out-Null
+    try {
+        $webui = Find-WebuiDir
+        $items = @(
+            @{ source = $swapConfig; destination = 'llamaswap\config.yaml' },
+            @{ source = (Join-Path $root '.ui-settings.json'); destination = '.ui-settings.json' },
+            @{ source = (Join-Path $root '.ui-usage.json'); destination = '.ui-usage.json' },
+            @{ source = $stampFile; destination = '.stack-versions.json' },
+            @{ source = (Join-Path $root '.agent-compat.json'); destination = '.agent-compat.json' }
+        )
+        if ($webui) {
+            $items += @{ source = (Join-Path $webui 'backend\data'); destination = 'open-webui\backend\data' }
+            $items += @{ source = (Join-Path $webui '.env'); destination = 'open-webui\.env' }
+        }
+        foreach ($item in $items) {
+            if (-not (Test-Path -LiteralPath $item.source)) { continue }
+            $dest = Join-Path $stage $item.destination
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
+            Copy-Item -LiteralPath $item.source -Destination $dest -Recurse -Force
+        }
+        @{ product = 'Model Pilot'; version = (Get-ProductVersion); created = (Get-Date).ToString('o')
+           excludes = @('GGUF model weights', 'download caches', 'logs', 'runtime binaries') } |
+            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $stage 'backup-manifest.json') -Encoding utf8
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal -Force
+        Write-Host "Backup created: $archive"
+        Write-Host "Includes configuration, panel preferences, Open WebUI users/chats/settings and its session key. It does not include model weights."
+    } finally {
+        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ProductUpdate {
+    $current = Get-ProductVersion
+    $release = Get-GitHubRelease 'hgaaditya/modelpilot' $null
+    if (-not $release) { throw 'Could not reach GitHub to check for a Model Pilot release.' }
+    $latest = ([string]$release.tag_name) -replace '^v', ''
+    try { $available = ([version]$latest -gt [version]$current) } catch { throw "GitHub returned an invalid release version '$latest'." }
+    @{ current = $current; latest = $latest; available = $available; published = $release.published_at; url = $release.html_url }
+}
+
+function Update-Application {
+    if (-not $Plat.IsWindows) { throw 'In-app updates currently use the Windows setup package.' }
+    if (-not (Get-ChildItem (Join-Path $root 'uninstall') -Filter 'unins*.exe' -ErrorAction SilentlyContinue)) {
+        throw 'This is a source checkout, not an installed Model Pilot release. Download and run the current setup package instead.'
+    }
+    $release = Get-GitHubRelease 'hgaaditya/modelpilot' $null
+    if (-not $release) { throw 'Could not reach GitHub to check for a Model Pilot release.' }
+    $latest = ([string]$release.tag_name) -replace '^v', ''
+    $current = Get-ProductVersion
+    try {
+        if ([version]$latest -le [version]$current) { Write-Host "Already on Model Pilot $current."; return }
+    } catch { throw "GitHub returned an invalid release version '$latest'." }
+    $setup = @($release.assets | Where-Object { $_.name -eq 'Model-Pilot-Setup.exe' } | Select-Object -First 1)
+    $sums = @($release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1)
+    if (-not $setup -or -not $sums) { throw "Release $($release.tag_name) is missing its installer or SHA256SUMS.txt." }
+    New-Item -ItemType Directory -Force -Path $dl | Out-Null
+    $setupPath = Join-Path $dl "Model-Pilot-Setup-$latest.exe"
+    $sumsPath = Join-Path $dl "Model-Pilot-$latest-SHA256SUMS.txt"
+    Get-BigFile $setup.browser_download_url $setupPath 0
+    Get-File $sums.browser_download_url $sumsPath
+    $expected = [regex]::Match((Get-Content $sumsPath -Raw), '(?im)^([a-f0-9]{64})\s+\*?Model-Pilot-Setup\.exe\s*$').Groups[1].Value.ToLowerInvariant()
+    $actual = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if (-not $expected -or $actual -ne $expected) {
+        Remove-Item $setupPath -Force -ErrorAction SilentlyContinue
+        throw 'Installer SHA-256 did not match the release checksum; the download was discarded.'
+    }
+    $updater = Join-Path $env:TEMP "model-pilot-update-$([guid]::NewGuid().ToString('N')).ps1"
+    @"
+param([string]`$Installer, [string]`$Root, [int]`$PanelPid)
+`$p = Start-Process -FilePath `$Installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"`$Root`"") -Wait -PassThru
+if (`$p.ExitCode -ne 0) { exit `$p.ExitCode }
+if (`$PanelPid -gt 0) { Stop-Process -Id `$PanelPid -Force -ErrorAction SilentlyContinue }
+Start-Process -FilePath (Join-Path `$Root 'ModelPilot.cmd') -ArgumentList '-RestartPanel' -WorkingDirectory `$Root
+"@ | Set-Content -Path $updater -Encoding utf8
+    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $updater, '-Installer', $setupPath, '-Root', $root, '-PanelPid', $PanelPid)
+    Start-Process powershell -WindowStyle Hidden -ArgumentList @($args | ForEach-Object { ConvertTo-ProcessArgument "$_" })
+    Write-Host "Verified Model Pilot $latest. Applying the update and restarting the panel..."
+}
+
 $installed = Read-Stamp
 $target    = $VER.Clone()
 
@@ -2126,6 +2249,32 @@ if ($Latest) {
 }
 
 switch ($Action) {
+    'update-check' {
+        $update = Get-ProductUpdate
+        if ($Json) { $update | ConvertTo-Json -Depth 4 -Compress }
+        else { Write-Host "Model Pilot $($update.current); latest release $($update.latest)$(if ($update.available) { ' (update available)' } else { ' (up to date)' })" }
+    }
+
+    'preflight' {
+        $result = Get-ResourcePreflight
+        if ($Json) { $result | ConvertTo-Json -Depth 5 -Compress }
+        else {
+            Write-Host "Resource readiness:"
+            foreach ($check in $result.checks) {
+                Write-Host "  $(if ($check.ok) { '[ok]' } else { '[needs attention]' }) $($check.name): $($check.value)"
+                Write-Host "       $($check.detail)"
+            }
+        }
+    }
+
+    'backup' {
+        Backup-UserData
+    }
+
+    'update-app' {
+        Update-Application
+    }
+
 
     'set-tuning' {
         # autotune measures these numbers; this just writes ones you already decided on, through
@@ -2180,6 +2329,16 @@ switch ($Action) {
 
         if ([string]::IsNullOrWhiteSpace($answer)) { throw "Model '$Id' returned an empty response." }
         if ($answer.Length -gt 800) { $answer = $answer.Substring(0, 800) + '...' }
+        $support = @{}
+        if (Test-Path $modelSupportFile) {
+            try {
+                $saved = Get-Content $modelSupportFile -Raw | ConvertFrom-Json
+                foreach ($p in $saved.PSObject.Properties) { $support[$p.Name] = $p.Value }
+            } catch { }
+        }
+        $support[$Id] = @{ textVerifiedAt = (Get-Date).ToString('o'); responseSeconds = [math]::Round($timer.Elapsed.TotalSeconds, 1)
+                           contract = 'text-response-only' }
+        $support | ConvertTo-Json -Depth 4 | Set-Content $modelSupportFile -Encoding utf8
         Write-Host ("[MODEL_RESPONSE_CHECK_PASSED] '$Id' returned text in {0:N1}s." -f $timer.Elapsed.TotalSeconds)
         Write-Host "Response: $($answer.Trim())"
     }

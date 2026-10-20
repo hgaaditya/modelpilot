@@ -1,0 +1,38 @@
+name: issue triage
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  acknowledge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const existing = issue.labels.map(label => label.name);
+            const labels = ['needs-triage'];
+            if (/^(install|setup|upgrade|backup):/i.test(issue.title) || existing.includes('installation')) {
+              labels.push('installation');
+            } else if (!existing.includes('bug')) {
+              labels.push('bug');
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels
+            });
+            if (context.payload.action === 'opened') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Thanks for the report. It has been queued for triage. Please keep credentials, chats, model weights, and unredacted logs out of this public issue.'
+              });
+            }
