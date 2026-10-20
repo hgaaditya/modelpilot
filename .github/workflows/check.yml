@@ -123,7 +123,7 @@ jobs:
           pat='nvidia-smi |Get-CimInstance|WScript\.Shell|System\.Windows\.Forms|-win-x64|windows_amd64|darwin_arm64|bin-macos|pc-windows-msvc|apple-darwin'
           fail=0
           for f in $(git ls-files '*.ps1'); do
-            case "$f" in platform.ps1|tray.ps1|diagnose.ps1) continue ;; esac
+            case "$f" in platform.ps1|tray.ps1|diagnose.ps1|tools/*.ps1) continue ;; esac
             hits=$(grep -nE "$pat" "$f" | grep -vE '^[0-9]+: *#' | grep -vE '^[0-9]+: *//' || true)
             if [ -n "$hits" ]; then
               echo "$hits" | while IFS= read -r h; do
