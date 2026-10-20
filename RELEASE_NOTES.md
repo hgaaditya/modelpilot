@@ -1,4 +1,19 @@
+# Model Pilot 0.1.15
+
+## Operations update
+
+- The panel checks GitHub for new Model Pilot releases and can download, SHA-256 verify, install,
+  and restart into an update while keeping models, chats, and settings.
+- Settings now creates a local backup ZIP for configuration, panel preferences, and Open WebUI
+  users/chats/settings. It deliberately excludes GGUF weights, runtime binaries, logs, and caches.
+- A readiness check reports available disk, RAM, and accelerator memory before install or upgrade.
+- Model state now distinguishes files that are merely configured from a model whose local text
+  response was verified.
+- Structured GitHub bug and installation-recovery reports now enter automated issue triage.
+- `supply-chain.json` is included in the installer and published with every release.
+
 # Model Pilot 0.1.14
+
 
 ## Install
 

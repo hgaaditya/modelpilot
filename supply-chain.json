@@ -8,7 +8,7 @@
     "component": {
       "type": "application",
       "name": "Model Pilot",
-      "version": "0.1.14",
+      "version": "0.1.15",
       "licenses": [{ "license": { "id": "MIT" } }]
     }
   },

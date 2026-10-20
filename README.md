@@ -28,7 +28,7 @@ weights. The stack downloads its dependencies the first time you press **Start**
 
 ### 1. Download and run the setup EXE
 
-> **Release status:** `0.1.14` is an unsigned public Model Pilot release.
+> **Release status:** `0.1.15` is an unsigned public Model Pilot release.
 > Windows may show an **Unknown Publisher** or SmartScreen warning. Continue only when you downloaded
 > the installer from this project's Releases page and its SHA-256 matches the attached
 > `SHA256SUMS.txt`; neither check establishes publisher identity.
