@@ -1,0 +1,49 @@
+name: dependency candidates
+
+on:
+  schedule:
+    - cron: '17 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  propose:
+    name: Discover reviewable upstream candidates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: master
+
+      - name: Find supported upstream releases
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./tools/Update-DependencyCandidates.ps1 -Apply
+
+      - name: Create or refresh dependency candidate pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo 'No supported upstream candidates.'
+            exit 0
+          fi
+          branch='automation/dependency-candidates'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B "$branch"
+          git add start.ps1 supply-chain.json
+          git commit -m 'chore: propose upstream dependency updates'
+          git push --force origin "$branch"
+          body='Automated candidate update. Hosted CI can validate metadata, assets, and packaging only. Before merge, complete the real Windows/GPU compatibility gate in docs/DEPENDENCY_UPDATES.md: cold model load, real completion, Open WebUI response, and upgrade/rollback check.'
+          number="$(gh pr list --head "$branch" --base master --state open --json number --jq '.[0].number')"
+          if [ -z "$number" ]; then
+            gh pr create --base master --head "$branch" --title 'chore: dependency update candidates' --body "$body" --label dependencies --label needs-runtime-test
+          else
+            gh pr edit "$number" --body "$body" --add-label dependencies --add-label needs-runtime-test
+          fi

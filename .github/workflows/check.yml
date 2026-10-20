@@ -159,6 +159,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path installer\output\Model-Pilot-Setup.exe)) { throw 'Installer output was not created.' }
 
+  supply-chain:
+    name: Supply-chain manifest matches pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Regeneration is clean
+        shell: pwsh
+        run: ./tools/Sync-SupplyChainManifest.ps1 -Check
+
+  dependency-candidate:
+    name: Validate dependency candidate assets
+    if: github.event_name == 'pull_request' && github.head_ref == 'automation/dependency-candidates'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate pinned and candidate upstream assets
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./tools/Update-DependencyCandidates.ps1 -Json
+
   docs:
     name: Docs and links
     runs-on: ubuntu-latest

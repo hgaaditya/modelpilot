@@ -286,3 +286,6 @@ at a pinned version. One of those licences has a clause people miss — see
 [THIRD-PARTY.md](THIRD-PARTY.md). Model weights carry their own separate terms.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the project's development ground rules.
+
+Maintainers: [dependency update and release promotion](docs/DEPENDENCY_UPDATES.md) documents the
+automated candidate workflow and the required real-hardware acceptance gate.
