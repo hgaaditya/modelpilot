@@ -170,9 +170,7 @@ Only the answer comes back. The **Tools** tab in the panel does the same thing w
 after measuring it: on a 12 GB card, a fresh session asked to make a one-line change to a 12-line
 file ran **219 tool calls over 29 minutes**, never replied, and changed nothing. The plumbing is
 fine — single requests and single tool calls work — but a model this size does not converge on a
-multi-step agent loop, and a button that cannot finish is worse than no button. `claude-local.ps1`
-is still in the repo for one-shot questions; [CLAUDE.md](CLAUDE.md) has the measurements, and the
-client bugs found along the way.
+multi-step agent loop, and a button that cannot finish is worse than no button.
 
 ## Monitoring
 
@@ -268,6 +266,4 @@ Nothing third-party is redistributed here; every component is downloaded from it
 at a pinned version. One of those licences has a clause people miss — see
 [THIRD-PARTY.md](THIRD-PARTY.md). Model weights carry their own separate terms.
 
-[CONTRIBUTING.md](CONTRIBUTING.md) has the ground rules that aren't guessable from the code, and
-[CLAUDE.md](CLAUDE.md) explains how the whole thing fits together — it's long, and it's the good
-kind of long: nearly every paragraph exists because something failed and the reason wasn't obvious.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the project's development ground rules.

@@ -7,10 +7,6 @@ downloaded, not vendored — so a change here is usually to `start.ps1` (the CLI
 or `ui.ps1` (the panel, which is a face on that CLI and should never become a second
 implementation).
 
-Read [CLAUDE.md](CLAUDE.md) before changing anything. It is long, and it is the good kind of long:
-almost every paragraph exists because something failed and the reason wasn't obvious. It will save
-you from re-discovering that `--context-shift` defaults off, that `Start-Process -ArgumentList`
-doesn't quote spaces, or that `localhost` and `127.0.0.1` are not interchangeable here.
 
 ## Ground rules that aren't obvious
 

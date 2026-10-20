@@ -2411,7 +2411,7 @@ switch ($Action) {
         } else {
             Write-Warning "Model weights in $modelsDir WILL be deleted - these are multi-GB and slow to re-download."
         }
-        Write-Host "start.ps1, CLAUDE.md and llamaswap\config.yaml are kept."
+        Write-Host "start.ps1 and llamaswap\config.yaml are kept."
 
         if (-not $Force) {
             $answer = Read-Host "`nType 'yes' to proceed"
