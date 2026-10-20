@@ -1,7 +1,7 @@
 # Model Pilot product status
 
 **Updated:** 2026-10-20
-**State:** Model Pilot `0.1.14` is approved for public publication as an unsigned release.
+**State:** Model Pilot `0.1.14` was published as an unsigned public release: [GitHub Release v0.1.14](https://github.com/hgaaditya/modelpilot/releases/tag/v0.1.14).
 
 ## Product decisions
 
@@ -53,6 +53,7 @@
 - A live download of the llama-swap v244 Windows zip matched GitHub's API-published digest; controlled downloader fixtures proved valid hashes pass and mismatches discard both `.part` and sidecar files.
 
 - Both workflow YAML files parsed locally. The hosted `release artifacts` workflow passed for `release/v0.1.13` run [#39040488629](https://github.com/hgaaditya/modelpilot/actions/runs/39040488629): it built and uploaded `model-pilot-0.1.13`, and the downloaded `Model-Pilot-Setup.exe` (2,213,370 bytes) matched its SHA-256 manifest: `19260e31568d7a7b8c247f09aa1c16ede7d90ca97b65ca977f3c77e3089178f7`. The tag-only publish job was skipped as intended. Pull request [#1](https://github.com/hgaaditya/modelpilot/pull/1) then passed all six hosted `check` jobs: docs, benchmark consent, platform boundary, Windows/macOS PowerShell parse and lint, and Windows installer compilation.
+- Public release `v0.1.14` was built and published by [release-artifact workflow #39385869400](https://github.com/hgaaditya/modelpilot/actions/runs/39385869400) from `91b547f97a7b19b32e02db1514aa45b63c57dac8`. The published `Model-Pilot-Setup.exe` is 2,213,385 bytes, version `0.1.14`, unsigned (`NotSigned`), and matches its published SHA-256 manifest: `79546466783499175804c69c2d11a6742c5408b9538001f303b7d129b6ca9ecb`.
 - `bench/test_consent.py` passed using the installed Python environment. Its deliberate Python grading task was skipped; the test restored the prior consent-file state.
 
 ## Remaining release risks
@@ -72,4 +73,3 @@
 2. Configure or verify GitHub private vulnerability reporting if it becomes available.
 3. Test the tray menu actions, a real ComfyUI install/reset if that feature ships, native Windows high contrast and Narrator, and another user profile/machine when available.
 4. Obtain non-maintainer feedback and publish only support claims backed by observed Windows/hardware coverage.
-5. Push `release/v0.1.14`, verify its workflow artifact, then push `v0.1.14` to publish the GitHub Release and compare its installer/checksum with the workflow artifact.

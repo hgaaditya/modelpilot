@@ -38,9 +38,10 @@ Use this gate for every public release. A green build is not proof that the Wind
 
 - [x] Push `release/v0.1.13` and download its `model-pilot-0.1.13` workflow artifact. Run [#39040488629](https://github.com/hgaaditya/modelpilot/actions/runs/39040488629) passed; its 2,213,370-byte installer matched `SHA256SUMS.txt` (`19260e31568d7a7b8c247f09aa1c16ede7d90ca97b65ca977f3c77e3089178f7`).
 - [x] Open pull request [#1](https://github.com/hgaaditya/modelpilot/pull/1) and pass all six hosted `check` jobs: docs, benchmark consent, platform boundary, Windows/macOS PowerShell parse and lint, and Windows installer compilation.
-- [ ] Obtain explicit release approval and push the matching `v<semver>` tag. Branch builds upload artifacts only; a tag creates the GitHub Release.
-- [ ] Confirm the tagged workflow passes script parsing, panel JavaScript syntax validation and installer compilation.
-- [ ] Inspect release page, product version, notes and attachments. Never describe an unsigned installer as publisher-signed.
+- [x] Push `release/v0.1.14` and download its `model-pilot-0.1.14` workflow artifact. Run [#39385421482](https://github.com/hgaaditya/modelpilot/actions/runs/39385421482) passed; its installer matched the artifact manifest: `c73ac5947f46c66e1774f8faa2ddabf414f7493f874c79a0f170dc6055eca791`.
+- [x] Explicitly approve public unsigned release `0.1.14` and push matching `v0.1.14` tag.
+- [x] Confirm tagged [workflow #39385869400](https://github.com/hgaaditya/modelpilot/actions/runs/39385869400) passed script parsing, panel JavaScript syntax validation and installer compilation.
+- [x] Inspect [release v0.1.14](https://github.com/hgaaditya/modelpilot/releases/tag/v0.1.14): product version is `0.1.14`; notes disclose its unsigned state; attachments are `Model-Pilot-Setup.exe` and `SHA256SUMS.txt`; the published installer is 2,213,385 bytes and matches SHA-256 `79546466783499175804c69c2d11a6742c5408b9538001f303b7d129b6ca9ecb`.
 
 ## Before broad public distribution
 
@@ -53,4 +54,4 @@ Use this gate for every public release. A green build is not proof that the Wind
 
 ## Current local artifact and evidence
 
-The current candidate is `0.1.13-localqa`, `installer/output/Model-Pilot-Setup.exe`, 2,213,262 bytes, SHA-256 `64504bd8e24692193b9e19ec96644e2dd7ce3c4151a633e05a5a534b768e18f5`; `installer/output/SHA256SUMS.txt` matches. It is unsigned and unpublished. The earlier `LocalLLM-Setup.exe` remains only as pre-rename evidence. No second Windows machine or disposable user profile was available. See [STATUS.md](STATUS.md) for the detailed test record, privacy boundaries and open release risks.
+The current public release is [`v0.1.14`](https://github.com/hgaaditya/modelpilot/releases/tag/v0.1.14), with `Model-Pilot-Setup.exe` (2,213,385 bytes) and `SHA256SUMS.txt`; its SHA-256 is `79546466783499175804c69c2d11a6742c5408b9538001f303b7d129b6ca9ecb`. It is intentionally unsigned (`NotSigned`) and its release notes disclose the resulting Windows prompts. The earlier `0.1.13-localqa` artifact remains historical QA evidence only. No second Windows machine or disposable user profile was available. See [STATUS.md](STATUS.md) for the detailed test record, privacy boundaries and open release risks.
