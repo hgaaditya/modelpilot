@@ -33,7 +33,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'update-check', 'update-app', 'backup', 'preflight', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
+    [ValidateSet('deploy', 'upgrade', 'update-check', 'update-app', 'backup', 'restore', 'diagnostics', 'preflight', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -95,17 +95,13 @@ param(
     # reset: keep the multi-GB .gguf weights when resetting llama.cpp (kept by default).
     [switch]$KeepModels,
 
-    # suggest: narrow llmfit's recommendations. 'any' drops the filter - an empty string cannot,
-    # because `-Capability ''` through `powershell -File` is a parameter with no value and fails
-    # before the script runs. Capability defaults to tool_use because a model
-    # that cannot call tools is useless for the coding-agent path, which is the reason most people
-    # are picking a model here at all - and it is the property they otherwise find out last.
+    # suggest: narrow llmfit's recommendations. 'any' drops the capability filter; an empty
+    # string cannot, because `-Capability ''` through `powershell -File` is a parameter with no
+    # value and fails before the script runs. Chat is the default product journey, so tool calling
+    # must be explicitly requested rather than silently filtering ordinary conversation models out.
     [ValidateSet('general', 'coding', 'reasoning', 'chat', 'multimodal', 'embedding')]
     [string]$UseCase,
-    [string]$Capability = 'tool_use',
-    [ValidateSet('perfect', 'good', 'marginal')]
-    [string]$MinFit = 'good',
-    [int]$Top = 8,
+    [string]$Capability = 'any',
 
     # suggest: machine-readable, for the control panel.
     [switch]$Json,
@@ -123,6 +119,9 @@ param(
 
     # update-app: the panel process to restart once the verified installer has finished.
     [int]$PanelPid,
+
+    # restore: archive selected from the panel's local backup list.
+    [string]$BackupPath,
 
     # uninstall: skip the confirmation prompt.
     [switch]$Force
@@ -569,11 +568,6 @@ function Remove-Metadata {
         $removed += $stampFile
     }
 
-    $compat = Join-Path $root '.agent-compat.json'
-    if (Test-Path $compat) {
-        Remove-Item $compat -Force -ErrorAction SilentlyContinue
-        $removed += $compat
-    }
 
     $shortcut = Get-StartupShortcut
     if (Test-Path $shortcut) {
@@ -586,9 +580,7 @@ function Remove-Metadata {
 
 # What a reset or uninstall would delete, without deleting it. One list, used by three callers:
 # the reset dry run, the uninstall confirmation, and the panel - which has to show the user what
-# they are about to lose before they agree to it. It was written twice before this (once in each
-# action) and the two copies had already diverged: uninstall listed the startup shortcut and
-# .agent-compat.json, reset's 'all' listed them only under 'metadata'.
+# they are about to lose before they agree to it.
 #
 # Returns objects, not strings, so a caller can render size as well as path.
 function Get-ResetTargets($component, [switch]$IncludeModels) {
@@ -644,8 +636,6 @@ function Get-ResetTargets($component, [switch]$IncludeModels) {
     if ($all -or $component -eq 'downloads') { if (Test-Path $dl) { Add-Target $dl 'download cache' } }
     if ($all -or $component -eq 'metadata') {
         if (Test-Path $stampFile) { Add-Target $stampFile 'version stamp' }
-        $compat = Join-Path $root '.agent-compat.json'
-        if (Test-Path $compat) { Add-Target $compat 'agent compatibility verdicts' }
         if (Test-Path (Get-StartupShortcut)) { Add-Target (Get-StartupShortcut) 'start-at-logon shortcut' }
     }
     return $script:__t
@@ -2127,6 +2117,14 @@ function Get-ProductVersion {
     return '0.0.0'
 }
 
+function Test-LocalEndpoint([string]$Url) {
+    try {
+        (Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop).StatusCode -eq 200
+    } catch {
+        $false
+    }
+}
+
 function Get-ResourcePreflight {
     $checks = @()
     $diskFreeGb = 0
@@ -2166,8 +2164,7 @@ function Backup-UserData {
             @{ source = $swapConfig; destination = 'llamaswap\config.yaml' },
             @{ source = (Join-Path $root '.ui-settings.json'); destination = '.ui-settings.json' },
             @{ source = (Join-Path $root '.ui-usage.json'); destination = '.ui-usage.json' },
-            @{ source = $stampFile; destination = '.stack-versions.json' },
-            @{ source = (Join-Path $root '.agent-compat.json'); destination = '.agent-compat.json' }
+            @{ source = $stampFile; destination = '.stack-versions.json' }
         )
         if ($webui) {
             $items += @{ source = (Join-Path $webui 'backend\data'); destination = 'open-webui\backend\data' }
@@ -2187,6 +2184,130 @@ function Backup-UserData {
         Write-Host "Includes configuration, panel preferences, Open WebUI users/chats/settings and its session key. It does not include model weights."
     } finally {
         Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-UserBackups {
+    if (-not (Test-Path $backupDir)) { return @() }
+    @(Get-ChildItem -LiteralPath $backupDir -Filter 'model-pilot-user-data-*.zip' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object {
+            [pscustomobject]@{
+                name = $_.Name
+                path = $_.FullName
+                bytes = $_.Length
+                created = $_.LastWriteTime.ToString('o')
+            }
+        })
+}
+
+function Restore-UserData {
+    if (-not $BackupPath) { throw 'Choose a backup before restoring.' }
+    $archive = [IO.Path]::GetFullPath($BackupPath)
+    $allowedRoot = [IO.Path]::GetFullPath($backupDir).TrimEnd('\') + '\'
+    if (-not $archive.StartsWith($allowedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Choose a backup created in Model Pilot''s backups folder.'
+    }
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'The selected backup no longer exists.' }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+    try {
+        $allowed = @(
+            'backup-manifest.json',
+            'llamaswap/config.yaml',
+            '.ui-settings.json',
+            '.ui-usage.json',
+            '.stack-versions.json',
+            'open-webui/.env'
+        )
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/').TrimStart('/')
+            $knownDirectory = $name -in @('llamaswap/', 'open-webui/', 'open-webui/backend/', 'open-webui/backend/data/')
+            if (-not $name -or $name -match '(^|/)\.\.(/|$)' -or
+                (-not $knownDirectory -and ($allowed -notcontains $name) -and -not $name.StartsWith('open-webui/backend/data/'))) {
+                throw 'The selected backup has an unexpected file layout and was not restored.'
+            }
+        }
+        $manifestEntry = $zip.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'backup-manifest.json' } | Select-Object -First 1
+        if (-not $manifestEntry) { throw 'The selected ZIP is not a Model Pilot backup.' }
+        $reader = [IO.StreamReader]::new($manifestEntry.Open())
+        try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        if ($manifest.product -ne 'Model Pilot') { throw 'The selected ZIP is not a Model Pilot backup.' }
+        $hasChatData = @($zip.Entries | Where-Object { $_.FullName.Replace('\', '/').StartsWith('open-webui/backend/data/') }).Count -gt 0
+    } finally {
+        $zip.Dispose()
+    }
+
+    $webui = Find-WebuiDir
+    if ($hasChatData -and -not $webui) {
+        throw 'Set up the Chat component before restoring chats and settings from this backup.'
+    }
+
+    # Preserve the current state first. Restore is destructive for chat data and configuration,
+    # so a fresh local backup makes this reversible even when the wrong archive was selected.
+    Backup-UserData
+    Stop-Stack
+    $stage = Join-Path $env:TEMP "model-pilot-restore-$([guid]::NewGuid().ToString('N'))"
+    try {
+        Expand-Archive -LiteralPath $archive -DestinationPath $stage -Force
+        $files = @(
+            @{ source = 'llamaswap\config.yaml'; destination = $swapConfig },
+            @{ source = '.ui-settings.json'; destination = (Join-Path $root '.ui-settings.json') },
+            @{ source = '.ui-usage.json'; destination = (Join-Path $root '.ui-usage.json') },
+            @{ source = '.stack-versions.json'; destination = $stampFile }
+        )
+        foreach ($item in $files) {
+            $source = Join-Path $stage $item.source
+            if (Test-Path -LiteralPath $source) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $item.destination -Parent) | Out-Null
+                Copy-Item -LiteralPath $source -Destination $item.destination -Force
+            }
+        }
+        if ($webui) {
+            $sourceData = Join-Path $stage 'open-webui\backend\data'
+            $targetData = Join-Path $webui 'backend\data'
+            if (Test-Path -LiteralPath $sourceData) {
+                Remove-Item -LiteralPath $targetData -Recurse -Force -ErrorAction SilentlyContinue
+                Copy-Item -LiteralPath $sourceData -Destination $targetData -Recurse -Force
+            }
+            $sourceEnv = Join-Path $stage 'open-webui\.env'
+            if (Test-Path -LiteralPath $sourceEnv) {
+                Copy-Item -LiteralPath $sourceEnv -Destination (Join-Path $webui '.env') -Force
+            }
+        }
+        Write-Host "Restore completed from: $archive"
+        Write-Host 'The stack was stopped so restored chats and settings take effect on the next Start.'
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Export-RedactedDiagnostics {
+    $diagnosticDir = Join-Path $root 'diagnostics'
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $stage = Join-Path $env:TEMP "model-pilot-diagnostics-$stamp"
+    $archive = Join-Path $diagnosticDir "model-pilot-diagnostics-$stamp.zip"
+    New-Item -ItemType Directory -Force -Path $stage, $diagnosticDir | Out-Null
+    try {
+        $checks = Get-ResourcePreflight
+        @{
+            product = 'Model Pilot'
+            version = Get-ProductVersion
+            exported = (Get-Date).ToUniversalTime().ToString('o')
+            privacy = 'No chats, prompts, logs, model paths, usernames, tokens, machine name, or model weights are included.'
+            windows = @{ version = [Environment]::OSVersion.Version.ToString() }
+            services = @{
+                modelServiceReachable = Test-LocalEndpoint "http://127.0.0.1:$swapPort/health"
+                chatReachable = Test-LocalEndpoint "http://127.0.0.1:$webuiPort/health"
+            }
+            preflight = $checks.checks
+        } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $stage 'diagnostics.json') -Encoding utf8
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal -Force
+        Write-Host "Redacted diagnostics created: $archive"
+        Write-Host 'Review the ZIP before sharing it. It contains no chats, logs, paths, usernames, tokens or model weights.'
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -2269,6 +2390,14 @@ switch ($Action) {
 
     'backup' {
         Backup-UserData
+    }
+
+    'restore' {
+        Restore-UserData
+    }
+
+    'diagnostics' {
+        Export-RedactedDiagnostics
     }
 
     'update-app' {
@@ -2543,13 +2672,9 @@ switch ($Action) {
         Get-ChildItem $root -Directory -Filter '_old-open-webui-*' -ErrorAction SilentlyContinue | ForEach-Object { $targets += $_.FullName }
         if (Test-Path -LiteralPath $comfyDir) { $targets += "$comfyDir (runtime, models, input/output and user data)" }
         if (Test-Path (Get-StartupShortcut)) { $targets += (Get-StartupShortcut) }
-        # llmfit is 23 MB this script downloaded and installed, and it survived a full uninstall
-        # silently - the same shape as uv and .python before it. .agent-compat.json goes too: it
-        # records which models Claude Code drove successfully *against this build*, and keeping it
-        # past a wipe lets a fresh install inherit a verdict about binaries that no longer exist.
+        # llmfit is an optional component installed by this product, so full uninstall removes it
+        # with every other downloaded runtime rather than leaving a silent private binary behind.
         if (Test-Path $llmfitDir) { $targets += $llmfitDir }
-        $compat = Join-Path $root '.agent-compat.json'
-        if (Test-Path $compat) { $targets += $compat }
         if (Test-Path $logDir)    { $targets += $logDir }
         if (Test-Path $stampFile) { $targets += $stampFile }
         if (Test-Path $dl)        { $targets += $dl }

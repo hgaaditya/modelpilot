@@ -26,6 +26,13 @@ Uninstallable=yes
 [InstallDelete]
 ; Remove the old launcher; the upgrade migrates its owned shortcuts to the new branded entry point.
 Type: files; Name: "{app}\LocalLLM.cmd"
+; Removed product workflows from older releases. The installer owns these files, so an update
+; deletes them rather than leaving unsupported launchers behind.
+Type: files; Name: "{app}\claude-local.ps1"
+Type: files; Name: "{app}\local-agent.ps1"
+Type: files; Name: "{app}\local-llm.ps1"
+Type: files; Name: "{app}\.agent-compat.json"
+
 
 [Files]
 Source: "..\ModelPilot.cmd"; DestDir: "{app}"; Flags: ignoreversion
@@ -33,10 +40,7 @@ Source: "..\start.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\ui.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tray.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\platform.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\local-llm.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\claude-local.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\llamaswap\config.example.yaml"; DestDir: "{app}\llamaswap"; Flags: ignoreversion
-Source: "..\local-agent.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\diagnose.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bench\run.py"; DestDir: "{app}\bench"; Flags: ignoreversion
 Source: "..\bench\tasks.jsonl"; DestDir: "{app}\bench"; Flags: ignoreversion
@@ -117,9 +121,6 @@ Type: files; Name: "{app}\start.ps1"
 Type: files; Name: "{app}\ui.ps1"
 Type: files; Name: "{app}\tray.ps1"
 Type: files; Name: "{app}\platform.ps1"
-Type: files; Name: "{app}\local-llm.ps1"
-Type: files; Name: "{app}\claude-local.ps1"
-Type: files; Name: "{app}\local-agent.ps1"
 Type: files; Name: "{app}\diagnose.ps1"
 Type: files; Name: "{app}\bench\run.py"
 Type: files; Name: "{app}\bench\tasks.jsonl"

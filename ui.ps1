@@ -40,6 +40,7 @@ $jobDir     = Join-Path $logDir 'jobs'
 $settingsFile = Join-Path $root '.ui-settings.json'
 $usageFile  = Join-Path $root '.ui-usage.json'
 $modelSupportFile = Join-Path $root '.model-support.json'
+$backupDir  = Join-Path $root 'backups'
 $swapPort   = 9292
 $webuiPort  = 8080
 New-Item -ItemType Directory -Force -Path $jobDir | Out-Null
@@ -378,6 +379,20 @@ function Get-Downloads {
     }
 }
 
+function Get-Backups {
+    if (-not (Test-Path $backupDir)) { return @() }
+    @(Get-ChildItem -LiteralPath $backupDir -Filter 'model-pilot-user-data-*.zip' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object {
+            [pscustomobject]@{
+                name = $_.Name
+                path = $_.FullName
+                bytes = $_.Length
+                created = $_.LastWriteTime.ToString('o')
+            }
+        })
+}
+
 function Get-ModelIdFromFileName($path) {
     $id = [IO.Path]::GetFileNameWithoutExtension($path).ToLowerInvariant() -replace '[^a-z0-9_-]+', '-'
     $id.Trim('-')
@@ -414,18 +429,13 @@ function Get-Dashboard {
     $cfg = Get-Settings
     $mem = Get-SystemMemoryUsage
     @{
-        # 'selected' marks what Start/Stop act on. opencode is a CLI invoked per task, not a
-        # service with a lifecycle, so it is reported but never started or stopped - selectable
-        # would imply a button that cannot do anything.
         services = @(
-            @{ key = 'swap'; name = 'llama-swap'; role = 'model router'; managed = $true; selected = [bool]$cfg.useSwap
+            @{ key = 'swap'; name = 'Model service'; role = 'loads and runs your local models'; managed = $true; selected = [bool]$cfg.useSwap
                up = $swapUp; url = "http://127.0.0.1:$swapPort/ui"
                installed = (Test-Path (Join-Path $root 'llamaswap\llama-swap.exe')) }
-            @{ key = 'webui'; name = 'open-webui'; role = 'chat interface'; managed = $true; selected = [bool]$cfg.useWebui
+            @{ key = 'webui'; name = 'Chat'; role = 'the private chat interface in your browser'; managed = $true; selected = [bool]$cfg.useWebui
                up = $webuiUp; url = "http://127.0.0.1:$webuiPort"
                installed = [bool](Get-ChildItem $root -Directory -Filter 'open-webui-*' -ErrorAction SilentlyContinue) }
-            @{ key = 'opencode'; name = 'opencode'; role = 'local coding agent (per-task CLI)'; managed = $false; selected = $false
-               up = $false; url = ''; installed = [bool](Get-Command opencode -ErrorAction SilentlyContinue) }
         )
         gpu     = $gpu
         loaded  = $loaded
@@ -457,21 +467,6 @@ function Get-Sensors {
     @{ sensors = @($out); loaded = $script:lastLoaded }
 }
 
-# What a coding agent needs to know, cheaply enough to poll: which CLIs are on PATH, and which
-# configured models could actually back one. Deliberately does NOT probe /v1/messages - that can
-# load a multi-GB model and take a minute, so it lives behind the Test button instead.
-function Get-Agents {
-    # The Claude Code handoff used to live here too, with a model chooser, a context
-    # threshold and a .agent-compat.json verdict behind it. All of it is gone: a local
-    # model drives opencode-style one-shot work fine and does not converge on a real
-    # agent loop, so the panel offers the one that works and says why the other left.
-    @{
-        opencode = [bool](Get-Command opencode -ErrorAction SilentlyContinue)
-        delegate = (Join-Path $root 'local-llm.ps1')
-        agentScript = (Join-Path $root 'local-agent.ps1')
-        projectDir = (Get-Settings).projectDir
-    }
-}
 
 # What this stack exposes to anything else on the machine. llama-swap speaks both the OpenAI and
 # the Anthropic shapes on one port and routes by the "model" field, so any tool that can be given
@@ -492,8 +487,8 @@ function Get-Endpoints {
             @{ what = 'OpenAI chat completions'; url = "$swap/v1/chat/completions"
                note = 'Most tools. Set the base URL to ' + $swap + '/v1 and pick a model id.' }
             @{ what = 'OpenAI models list'; url = "$swap/v1/models"; note = 'What ids are available.' }
-            @{ what = 'Anthropic messages'; url = "$swap/v1/messages"
-               note = 'What Claude Code uses. ANTHROPIC_BASE_URL=' + $swap }
+            @{ what = 'Anthropic-compatible messages'; url = "$swap/v1/messages"
+               note = 'For compatible clients. Set the base URL to ' + $swap }
             @{ what = 'llama-swap dashboard'; url = "$swap/ui"; note = 'Its own web UI: running models, logs.' }
             @{ what = 'Chat UI (open-webui)'; url = "http://127.0.0.1:$($s.webuiPort)"; note = 'The browser chat.' }
         )
@@ -823,59 +818,55 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
  <button data-pane="5" onclick="tab(5,this)">Activity</button>
  <button data-pane="6" onclick="tab(6,this)">Settings</button>
  <details class="nav-more" id="navMore"><summary id="moreNav" aria-label="More navigation">More</summary><div class="nav-menu">
-  <button onclick="tab(1,this)">Engine details</button>
-  <button onclick="tab(3,this)">Tools</button>
+  <button onclick="tab(1,this)">System</button>
   <button onclick="tab(4,this)">Monitoring</button>
  </div></details>
 </nav>
 <main>
 
 <div class="pane on" id="p0">
- <div class="section-head"><div><div class="eyebrow">YOUR LOCAL AI WORKSPACE</div><h1>Home</h1><p>Start your services, choose a model, then chat on your own machine.</p></div></div>
+ <div class="section-head"><div><div class="eyebrow">YOUR LOCAL AI</div><h1>Home</h1><p>Set up a private model once, then chat on your own machine.</p></div></div>
  <div id="homeLoading" class="hint" role="status" aria-live="polite">Checking this PC and the local services. This can take a few seconds.</div>
  <div id="guide"></div>
  <div id="verifyResult" class="verify-result" role="status" aria-live="polite" style="display:none"></div>
  <div class="home-grid">
-  <section class="surface"><div class="surface-head"><div><h2>Your services</h2><p>Choose which parts of the local AI stack should run.</p></div><div class="row">
+  <section class="surface"><div class="surface-head"><div><h2>What is running</h2><p>Start or stop the local model service and chat.</p></div><div class="row">
    <button class="gh" id="homeRestart" onclick="act('restart')">Restart</button><button class="gh" id="homeStop" onclick="act('stop')">Stop</button></div></div>
    <div id="svc" class="service-grid"><div class="hint" style="grid-column:1/-1">Checking installed services...</div></div>
   </section>
-  <section class="surface"><div class="surface-head"><div><h2>This PC</h2><p>Hardware available to your models.</p></div></div><div class="kv" id="hw"><span>Hardware</span><div>Reading memory and accelerator information...</div></div></section>
+  <section class="surface"><div class="surface-head"><div><h2>This PC</h2><p>Available memory for local models.</p></div></div><div class="kv" id="hw"><span>Hardware</span><div>Reading memory and accelerator information...</div></div></section>
  </div>
 </div>
 
 <div class="pane" id="p1">
- <div class="section-head"><div><div class="eyebrow">SYSTEM STATUS</div><h1>Engine details</h1><p>Versions, services and API endpoints for troubleshooting and integrations.</p></div></div>
+ <div class="section-head"><div><div class="eyebrow">ADVANCED</div><h1>System</h1><p>Component details and local API endpoints for troubleshooting or integrations.</p></div></div>
  <div class="row" style="margin-bottom:9px">
-  <button class="gh" onclick="chk()">Check for updates</button>
-  <button class="gh" onclick="inst('components')">Install / repair all</button>
-  <button class="gh" onclick="inst('upgrade')">Upgrade to pinned</button>
-  <button class="gh" onclick="inst('upgrade-latest')">Upgrade to latest</button>
+  <button class="gh" onclick="chk()">Check component updates</button>
+  <button class="gh" onclick="inst('components')">Repair components</button>
+  <button class="gh" onclick="inst('upgrade')">Upgrade pinned components</button>
   <span id="vchk" style="color:var(--dim);font-size:11px"></span>
  </div>
  <div id="comps"></div>
- <fieldset><legend>Running llama-server processes</legend>
+ <fieldset><legend>Running model processes</legend>
   <table><thead><tr><th>PID</th><th>Memory</th></tr></thead><tbody id="e4"></tbody></table>
-  <div class="hint" style="margin:7px 0 0">llama-server is not started directly - llama-swap spawns one per model on demand and stops it after the model's idle timeout.</div>
+  <div class="hint" style="margin:7px 0 0">The model service starts a model only when you use it and unloads it after its idle timeout.</div>
  </fieldset>
- <fieldset><legend>Endpoints you can use from other tools</legend>
-  <div class="mode">One port speaks both the OpenAI and the Anthropic shapes and routes by the <code>model</code> field, so anything that takes a base URL and a model name works - continue.dev, Zed, aider, a shell script.</div>
+ <fieldset><legend>Endpoints for compatible tools</legend>
+  <div class="mode">Model Pilot offers local OpenAI-compatible and Anthropic-compatible endpoints. Choose a listed model id in the tool you connect.</div>
   <table class="ep"><tbody id="eps"></tbody></table>
   <div id="epmodels" class="hint" style="margin:7px 0 0"></div>
  </fieldset>
 </div>
 
 <div class="pane" id="p2">
- <div class="section-head"><div><div class="eyebrow">MODEL LIBRARY</div><h1>Models</h1><p>Find one that fits, bring in a model you already have, and manage what's ready to use.</p></div></div>
+ <div class="section-head"><div><div class="eyebrow">MODEL LIBRARY</div><h1>Models</h1><p>Choose a model that fits this PC, or add one you already downloaded.</p></div></div>
  <section class="surface picker">
-  <div class="eyebrow">RECOMMENDED</div><h2>Find a model for this PC</h2>
-  <p>Recommendations use your available memory and hardware. You can review the fit before downloading.</p>
+  <div class="eyebrow">START HERE</div><h2>Find a model for this PC</h2>
+  <p>We rank models against the memory available on this PC. Review the download size before choosing.</p>
   <div class="row">
    <select id="sgcase" aria-label="Recommendation use case" style="width:auto">
-    <option value="">Any use case</option><option value="coding">Coding</option>
-    <option value="reasoning">Reasoning</option><option value="general">General</option><option value="chat">Chat</option>
+    <option value="chat">Everyday chat</option><option value="general">General use</option><option value="reasoning">Reasoning</option><option value="coding">Coding</option>
    </select>
-   <label class="check-label"><input type="checkbox" id="sgtools"> Needs tool calling</label>
    <button class="act" id="sgbtn" onclick="suggest()">Find models</button>
    <span id="sgmsg" class="subtle"></span>
   </div>
@@ -905,33 +896,6 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
  </section>
 </div>
 
-<div class="pane" id="p3">
- <div class="section-head"><div><div class="eyebrow">LOCAL WORKFLOWS</div><h1>Tools</h1><p>Run local tasks or delegate large-file reading to a model on this PC.</p></div></div>
- <fieldset><legend>Project</legend>
-  <div class="row"><input id="pdir" aria-label="Project folder" placeholder="C:\path\to\your\project" style="flex:1"></div>
-  <div class="hint" style="margin:7px 0 0">Used by the two Run buttons below.</div>
-  <div id="agstat" style="color:var(--dim);font-size:11px;margin-top:5px"></div>
- </fieldset>
-
- <fieldset><legend>Why Claude Code is not here</legend>
-  <div class="mode">Measured on this box: a fresh session with plugins off, asked to make <code>load_items</code> skip blank lines in a 12-line file, ran <b>219 tool calls over 29 minutes</b>, never produced a single line of reply, and left the file unchanged. Every earlier failure had a harness cause - this one had none, so it is a model limit rather than a wiring bug. The panel does not offer a session it cannot finish.</div>
-  <div class="hint" style="margin:7px 0 0">The script is still installed for direct questions: <code>claude-local.ps1 -Prompt "..."</code>. Note <code>-Check</code> passes this same model in 33s, so it does not predict whether a real session converges.</div>
- </fieldset>
-
- <fieldset><legend>opencode, on a local model</legend>
-  <div class="mode">A local agent does the whole task itself, start to finish. Nothing reaches Anthropic at any point.</div>
-  <div class="row"><input id="agtask" aria-label="Local agent task" placeholder="what it should do, e.g. add a guard clause to divide()" style="flex:1">
-   <button class="gh" onclick="runLocal('agent')">Run</button></div>
- </fieldset>
-
- <fieldset><legend>Delegate the reading</legend>
-  <div class="mode">Claude Code stays on the cloud model and keeps its judgement; only the bulk reading happens here, so a huge file costs you almost no quota.</div>
-  <div class="row"><input id="dgfile" aria-label="File to read, optional" placeholder="file to read (optional)" style="flex:1.2">
-   <input id="dgtask" aria-label="What to extract from the file" placeholder="what to extract" style="flex:1.4">
-   <button class="gh" onclick="runLocal('delegate')">Run</button></div>
- </fieldset>
- <div class="hint">Results from the two Run buttons appear under Models &gt; Activity.</div>
-</div>
 
 <div class="pane" id="p4">
  <div class="section-head"><div><div class="eyebrow">LIVE HARDWARE</div><h1>Monitoring</h1><p>Sensor history is sampled only while this view is open.</p></div></div>
@@ -955,7 +919,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 </div>
 
 <div class="pane" id="p6">
- <div class="section-head"><div><div class="eyebrow">PREFERENCES</div><h1>Settings</h1><p>Manage storage, integrations and optional components.</p></div></div>
+ <div class="section-head"><div><div class="eyebrow">PREFERENCES</div><h1>Settings</h1><p>Keep your local data protected, up to date and easy to recover.</p></div></div>
  <fieldset><legend>Model storage</legend>
   <div class="row"><input id="mdir" aria-label="Model download folder" style="flex:1" readonly><button class="gh" onclick="browseDir()">Choose folder</button></div>
   <div class="hint" style="margin-top:8px">New downloads are saved here. To find and register existing files, go to Models &gt; Find models on your drive. Files stay in place.</div>
@@ -969,11 +933,19 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
    <span id="autoss" style="color:var(--dim);font-size:11px"></span></div>
   <div class="hint">Brings llama-swap, the chat UI and the tray indicator back on their own after a restart or a crash. The panel itself stays on demand.</div>
  </fieldset>
- <fieldset><legend>Updates and recovery</legend>
+ <fieldset><legend>Keep Model Pilot current</legend>
   <div class="row"><button class="gh" onclick="checkProductUpdate(true)">Check for app updates</button><span id="appupd" style="color:var(--dim);font-size:11px">Checking GitHub for the current release...</span></div>
-  <div class="row" style="margin-top:10px"><button class="gh" onclick="runPreflight()">Check this PC before installing or upgrading</button><button class="gh" onclick="backupData()">Back up chats and settings</button></div>
-  <div id="preflight" class="hint" style="margin-top:8px">The backup is a local ZIP under this installation's backups folder. It includes settings and Open WebUI data, never GGUF model weights.</div>
-  <div class="hint" style="margin-top:8px">If setup or recovery fails, submit a redacted report at <a href="https://github.com/hgaaditya/modelpilot/issues/new/choose" target="_blank" rel="noreferrer">GitHub support</a>. Do not attach chats, model weights, tokens or unreviewed logs.</div>
+ </fieldset>
+ <fieldset><legend>Back up and restore</legend>
+  <div class="row"><button class="gh" onclick="backupData()">Create backup</button><button class="gh" onclick="loadBackups()">Refresh backups</button></div>
+  <div class="hint" style="margin-top:8px">Backups keep chats, users, settings and configuration in a private local ZIP. Model weights, logs and download caches are never included.</div>
+  <div class="row" style="margin-top:10px"><select id="backups" aria-label="Local backups" style="flex:1;min-width:240px"><option>Loading backups...</option></select><button class="gh" id="restoreBackup" onclick="restoreBackup()" disabled>Restore selected backup</button></div>
+  <div id="backupNote" class="hint" style="margin-top:8px">Restoring first creates a fresh backup, then stops the stack so restored chats and settings can take effect safely.</div>
+ </fieldset>
+ <fieldset><legend>Help and recovery</legend>
+  <div class="row"><button class="gh" onclick="runPreflight()">Check this PC</button><button class="gh" onclick="exportDiagnostics()">Create redacted diagnostic report</button></div>
+  <div id="preflight" class="hint" style="margin-top:8px">The PC check looks at disk, memory and accelerator headroom before setup or an upgrade.</div>
+  <div class="hint" style="margin-top:8px">The diagnostic ZIP excludes chats, logs, local paths, usernames, tokens and model weights. Review it before sharing through <a href="https://github.com/hgaaditya/modelpilot/issues/new/choose" target="_blank" rel="noreferrer">GitHub support</a>.</div>
  </fieldset>
  <fieldset><legend>Remove parts of the install</legend>
  <div class="hint" style="margin-bottom:8px">Each selected runtime can be reinstalled by pressing Start. The checkbox only deletes GGUF weights inside this installation; model folders you selected elsewhere are always kept. Everything also removes optional ComfyUI models, inputs, outputs and user settings.</div>
@@ -987,7 +959,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
     <option value="uv">Private Python</option>
     <option value="downloads">Download cache</option>
     <option value="logs">Logs</option>
-    <option value="metadata">Version stamp, agent verdicts, logon shortcut</option>
+    <option value="metadata">Version stamp and logon shortcut</option>
     <option value="all">Everything (full uninstall)</option>
    </select>
    <button class="gh" onclick="rstShow()">Show what this removes</button>
@@ -1100,7 +1072,7 @@ const TOK='@@TOKEN@@';
 const _f=window.fetch;
 window.fetch=(u,o)=>{o=o||{};o.headers=Object.assign({},o.headers,{'X-LocalLLM-Token':TOK});return _f(u,o)};
 function tab(i,b){
- document.querySelectorAll('.pane').forEach((p,n)=>p.classList.toggle('on',n===i));
+ document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p'+i));
  document.querySelectorAll('nav button').forEach(x=>{x.classList.remove('on');x.removeAttribute('aria-current')});
  const primary=document.querySelector(`nav button[data-pane="${i}"]`);
  const more=document.getElementById('moreNav'),menu=document.getElementById('navMore');
@@ -1110,34 +1082,15 @@ function tab(i,b){
   primary.classList.add('on');primary.setAttribute('aria-current','page');
   more.textContent='More';more.setAttribute('aria-label','More navigation');more.classList.remove('on');
  }else{
-  const label={1:'Engine details',3:'Tools',4:'Monitoring'}[i]||'More';
+  const label={1:'System',4:'Monitoring'}[i]||'More';
   more.textContent='More · '+label;more.setAttribute('aria-label','More navigation, current section: '+label);
   more.setAttribute('aria-current','page');more.classList.add('on');if(b)b.classList.add('on');
  }
  // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
  // while the tab that shows it is actually in front.
  monRun(i===4);
- if(i===3)agents();
  if(i===1)tick();
- if(i===6)auto();
-}
-// ---- coding agents
-let AG={};
-function pdir(){return document.getElementById('pdir').value.trim()}
-async function agents(){
- try{AG=await (await fetch('/api/agents')).json()}catch(e){return}
- const dir=document.getElementById('pdir');
- if(document.activeElement!==dir&&!dir.value&&AG.projectDir)dir.value=AG.projectDir;
- document.getElementById('agstat').innerHTML=AG.opencode?'':'<span class="miss">opencode not on PATH - only Delegate the reading will run</span>';
-}
-async function runLocal(kind){
- const task=document.getElementById(kind==='agent'?'agtask':'dgtask').value.trim();
- if(!task){msg('Say what it should do first.');return}
- spin(kind==='agent'?'opencode':'delegate',1800000);
- const r=await (await fetch('/api/run-local',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({kind,prompt:task,dir:pdir(),file:document.getElementById('dgfile').value.trim()})})).json();
- if(r.error)msg(r.error);
- setTimeout(tick,700);
+ if(i===6){auto();loadBackups()}
 }
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
@@ -1186,7 +1139,7 @@ function selected(){
 function jkey(a,comp){return (comp&&comp!=='all')?a+'-'+comp:a}
 async function act(a,c){
  const comp=(c!==undefined)?c:selected();
- if(comp===null){msg('No services are ticked, so Start, Stop and Restart have nothing to act on.\n\nTick llama-swap and/or open-webui on the Dashboard.');return}
+ if(comp===null){msg('No services are selected. Choose a service under System, then try again.');return}
  const k=jkey(a,comp);
  spin(k,a==='deploy'?600000:60000);
  try{
@@ -1299,8 +1252,24 @@ async function runPreflight(){
  }catch(e){box.textContent='Could not complete the readiness check. See Activity for details.'}
 }
 async function backupData(){
- if(!await ask('Create a local ZIP backup of chats, users, settings and configuration?\n\nModel weights, logs and download caches are excluded. The archive includes the Open WebUI session key, so keep it private.',{ok:'Create backup'}))return;
- mark('backup',300000);await post('/api/backup',{});document.getElementById('preflight').textContent='Creating backup. Its location will appear in Activity.';
+ if(!await ask('Create a private local ZIP backup of chats, users, settings and configuration?\n\nModel weights, logs and download caches are excluded. The archive includes the Open WebUI session key, so keep it private.',{ok:'Create backup'}))return;
+ mark('backup',300000);await post('/api/backup',{});document.getElementById('backupNote').textContent='Creating the backup. Its location will appear in Activity.';setTimeout(loadBackups,1200);
+}
+async function loadBackups(){
+ const sel=document.getElementById('backups'),go=document.getElementById('restoreBackup');if(!sel||!go)return;
+ try{
+  const d=await (await fetch('/api/backups')).json(),items=d.backups||[];
+  sel.innerHTML=items.length?items.map(x=>`<option value="${esc(x.path)}">${esc(x.name)} — ${fmtB(x.bytes)} — ${new Date(x.created).toLocaleString()}</option>`).join(''):'<option value="">No local backups yet</option>';
+  go.disabled=!items.length;
+ }catch(e){sel.innerHTML='<option value="">Could not read backups</option>';go.disabled=true}
+}
+async function restoreBackup(){
+ const sel=document.getElementById('backups'),path=sel&&sel.value;if(!path)return;
+ if(!await ask('Restore chats, settings and configuration from the selected backup?\n\nA fresh backup is created first. The stack is then stopped; press Start when the restore finishes.',{ok:'Restore backup',danger:true}))return;
+ mark('restore',600000);await post('/api/restore',{path});document.getElementById('backupNote').textContent='Restoring the selected backup. A fresh safety backup is created first; see Activity for progress.';setTimeout(tick,900);
+}
+async function exportDiagnostics(){
+ mark('diagnostics',120000);await post('/api/diagnostics',{});document.getElementById('preflight').textContent='Creating a redacted diagnostic ZIP. Its location will appear in Activity.';setTimeout(tick,700);
 }
 // Context and KV quantisation are just flags on the model's cmd, so they can be changed here -
 // unlike the weight quantisation (Q4_K_M vs Q6_K), which is a different file and means a
@@ -1353,14 +1322,13 @@ async function waitFor(url,ms){
   await new Promise(r=>setTimeout(r,1500));
  }
 }
-function relaxUse(){document.getElementById('sgcase').value='';suggest()}
-function relaxTools(on){document.getElementById('sgtools').checked=on;suggest()}
+function relaxUse(){document.getElementById('sgcase').value='general';suggest()}
 async function suggest(minfit){
  const b=document.getElementById('sgbtn');b.classList.add('busy');b.disabled=true;
- const use=document.getElementById('sgcase').value, tools=document.getElementById('sgtools').checked;
+ const use=document.getElementById('sgcase').value;
  document.getElementById('sgmsg').textContent='scoring models against this hardware...';
  try{
-  const qs='/api/suggest?usecase='+encodeURIComponent(use)+'&tools='+(tools?'1':'0')+(minfit?'&minfit='+minfit:'');
+  const qs='/api/suggest?usecase='+encodeURIComponent(use)+(minfit?'&minfit='+minfit:'');
   spin('suggest',180000);
   const started=await (await fetch(qs+'&run=1')).json();
   const d=started.needInstall?started:await waitFor(qs,180000);
@@ -1386,15 +1354,13 @@ async function suggest(minfit){
      <div class="model-stats"><span>~${esc(x.sizeGb)} GB download</span><span>~${esc(x.tps)} tok/s estimate</span><span>Trained context up to ${esc(x.ctx||'unknown')} tokens</span>${x.moe?'<span>MoE architecture</span>':''}${license}</div>
      <button class="act" onclick="dl(decodeURIComponent('${repo}'),decodeURIComponent('${quant}'))">Download ~${esc(x.sizeGb)} GB</button></article>`
    }).join('')+'</div><div class="subtle" style="margin-top:12px">Speed is an estimate from memory bandwidth, not a benchmark. Context shown is the trained maximum; Tune measures what fits on this PC.</div>'
-   :'<div class="hint"><b>No recommendations for these filters.</b> This is not proof that no model can run on this PC - '
-    +(use?'the <b>'+esc(use)+'</b> use case':'the current filters')
-    +' ruled everything out'+(minfit?' even at a looser fit':'')+'. Try a broader filter or scan files already on your drive.<div class="row" style="margin-top:7px">'
-    +(use?'<button class="gh" onclick="relaxUse()">Try any use case</button>':'')
-    +'<button class="gh" onclick="relaxTools('+(tools?'false':'true')+')">'
-    +(tools?'Drop the tool-calling requirement':'Require tool calling')+'</button>'
+   :'<div class="hint"><b>No recommendations for this choice.</b> This is not proof that no model can run on this PC - '
+    +(use?'the <b>'+esc(use)+'</b> use case':'the current choice')
+    +' ruled everything out'+(minfit?' even at a looser fit':'')+'. Try a broader choice or scan files already on your drive.<div class="row" style="margin-top:7px">'
+    +(use?'<button class="gh" onclick="relaxUse()">Try general use</button>':'')
     +(minfit?'':'<button class="gh" onclick="suggest(&quot;marginal&quot;)">Include tighter fits</button>')
     +'<button class="gh" onclick="focusModelScanner()">Scan local files</button>'
-    +'</div><div class="note" style="margin-top:6px">These filters change llmfit\'s ranking rather than simply narrowing a fixed list, so turning a filter on can produce results where off produced none. Estimates are not measured runs.</div></div>';
+    +'</div><div class="note" style="margin-top:6px">These are hardware-fit estimates, not measured model runs.</div></div>';
   document.getElementById('sgmsg').textContent='';
  }catch(e){document.getElementById('sug').innerHTML='<div class="hint miss">'+e+'</div>'}
  finally{b.classList.remove('busy');b.disabled=false;document.getElementById('sgmsg').textContent='';delete PEND['suggest'];activity([])}
@@ -1419,7 +1385,7 @@ async function verifyModel(id){
 }
 function firstModel(){
  gotoModels();
- document.getElementById('sgtools').checked=false;   // a first model is for chatting, not tools
+ document.getElementById('sgcase').value='chat';
  suggest();
 }
 async function installPicker(){
@@ -1546,8 +1512,9 @@ const JOBS_SAY={
  'verify-model':['Checking a real model response','Sends one short completion and records the model reply here. A cold load can take several minutes.'],
  unload:['Freeing VRAM',''],
  vercheck:['Checking for newer versions','Asks GitHub and nodejs.org.'],
- opencode:['The local agent is working','It edits files in your project directly.'],
- delegate:['The local model is reading your file','Long files are split into chunks and answered in turn.']
+ backup:['Creating your backup','Chats, users, settings and configuration are being archived locally.'],
+ restore:['Restoring your backup','A fresh safety backup is created first, then restored data replaces chats and settings.'],
+ diagnostics:['Creating a redacted diagnostic report','The ZIP excludes chats, logs, local paths, usernames, tokens and model weights.']
 };
 function jobSay(k){
  if(k==='verify-model')return JOBS_SAY[k];
@@ -1758,12 +1725,6 @@ async function tick(){
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
  if(!VER.rows&&document.getElementById('p1').classList.contains('on')){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
  document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
- // The agents tab refreshes on the normal poll while it is in front. The session list does NOT:
- // it is server-cached for 30s, but the *request* still queues on a single-threaded listener,
- // and adding a seventh call to a 3s tick was enough to saturate it - /api/ping, which does no
- // work at all, was taking a second. Sessions change on the timescale of starting a project, so
- // once every 30s is plenty.
- if(document.getElementById('p3').classList.contains('on'))agents()
  const md=document.getElementById('mdir');
  if(M.settings){
   if(document.activeElement!==md)md.value=M.settings.modelsDir;
@@ -1848,24 +1809,16 @@ try {
                 '^/api/status$' { $body = Get-Dashboard | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/engine$' { $body = Get-Engine | ConvertTo-Json -Depth 6 -Compress }
                 '^/api/sensors$' { $body = Get-Sensors | ConvertTo-Json -Depth 5 -Compress }
-                '^/api/agents$'  { $body = Get-Agents | ConvertTo-Json -Depth 5 -Compress }
                 '^/api/endpoints$' { $body = Get-Endpoints | ConvertTo-Json -Depth 5 -Compress }
-                '^/api/run-local$' {
-                    # opencode and local-llm both run to completion and print an answer, so they
-                    # are jobs like everything else and read out in Activity.
+                '^/api/backups$' { $body = @{ backups = @(Get-Backups) } | ConvertTo-Json -Depth 4 -Compress }
+                '^/api/restore$' {
                     $p = Read-Body $req
-                    if (-not $p.prompt) { throw "Give it something to do." }
-                    if ($p.kind -eq 'agent') {
-                        if (-not $p.dir) { throw "Pick a project directory first." }
-                        if (-not (Test-Path $p.dir)) { throw "'$($p.dir)' does not exist." }
-                        Set-Settings ([pscustomobject]@{ projectDir = $p.dir }) | Out-Null
-                        Start-Job2 'opencode' @('-Directory', $p.dir, '-Prompt', $p.prompt) (Join-Path $root 'local-agent.ps1') | Out-Null
-                    } else {
-                        if ($p.file -and -not (Test-Path $p.file)) { throw "'$($p.file)' does not exist." }
-                        $a = @('-Prompt', $p.prompt)
-                        if ($p.file) { $a += @('-File', $p.file) }
-                        Start-Job2 'delegate' $a (Join-Path $root 'local-llm.ps1') | Out-Null
-                    }
+                    if (-not $p.path) { throw 'Choose a backup before restoring.' }
+                    Start-Job2 'restore' @('-Action', 'restore', '-BackupPath', [string]$p.path) | Out-Null
+                    $body = '{"ok":true}'
+                }
+                '^/api/diagnostics$' {
+                    Start-Job2 'diagnostics' @('-Action', 'diagnostics') | Out-Null
                     $body = '{"ok":true}'
                 }
                 '^/api/install-picker$' {
@@ -1963,14 +1916,13 @@ try {
                 }
                 '^/api/suggest$' {
                     $q = [Web.HttpUtility]::ParseQueryString($req.Url.Query)
-                    $key = "$($q['usecase'])|$($q['tools'])|$($q['minfit'])"
+                    $key = "$($q['usecase'])|$($q['minfit'])"
                     if (-not (Test-Path (Join-Path $root 'llmfit\llmfit.exe'))) { $body = '{"needInstall":true}' }
                     else {
                         # run=1 is the button; every other request is the page polling for the answer.
                         if ($q['run'] -eq '1') {
                             $a = @('-Action', 'suggest', '-Json', '-Top', '8')
                             if ($q['usecase']) { $a += @('-UseCase', $q['usecase']) }
-                            if ($q['tools'] -ne '1') { $a += @('-Capability', 'any') }
                             # Whitelisted rather than passed through, since it lands on a command line.
                             if ($q['minfit'] -in 'good', 'marginal', 'poor') { $a += @('-MinFit', $q['minfit']) }
                             Start-Async 'suggest' $key $a

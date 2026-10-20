@@ -28,7 +28,7 @@ weights. The stack downloads its dependencies the first time you press **Start**
 
 ### 1. Download and run the setup EXE
 
-> **Release status:** `0.1.15` is an unsigned public Model Pilot release.
+> **Release status:** `0.1.16` is an unsigned public Model Pilot release.
 > Windows may show an **Unknown Publisher** or SmartScreen warning. Continue only when you downloaded
 > the installer from this project's Releases page and its SHA-256 matches the attached
 > `SHA256SUMS.txt`; neither check establishes publisher identity.
@@ -86,16 +86,19 @@ model on your own tasks.
 **Updates and recovery.** Settings checks GitHub automatically for a newer Model Pilot release. When
 one is available, **Update now** downloads the release installer, verifies its SHA-256 against the
 attached checksum, preserves models/chats/settings, and restarts the panel. The same page can run a
-disk/RAM/accelerator readiness check and create a local ZIP backup of configuration and Open WebUI
-data. Backups deliberately exclude GGUF weights, logs and download caches; the ZIP includes session
-data, so store it privately.
+disk/RAM/accelerator readiness check, create a local ZIP backup, restore one of those backups, and
+create a redacted diagnostics ZIP for support. Backups deliberately exclude GGUF weights, logs and
+download caches; the ZIP includes session data, so store it privately.
 
 The Models table distinguishes a configured model from one that has returned text through the local
 router. See the [model support contract](MODEL_SUPPORT.md) for the precise boundary.
 
-**Home** summarizes service and hardware status. Long-running work appears under **Activity**.
-Troubleshooting details, local tools and sensor monitoring are grouped under **More** so the main
-navigation stays focused on everyday tasks.
+**Home** guides you through the next needed step: set up the local services, choose a model, test a
+real response, then open chat. Long-running work appears under **Activity**. Component details and
+hardware monitoring are under **More → System** and **More → Monitoring**.
+
+The supported product boundary and interface decisions are recorded in
+[docs/PRODUCT_SCOPE.md](docs/PRODUCT_SCOPE.md).
 
 <!-- SCREENSHOT: the Models page showing recommendations and the model-folder scanner.
      Suggested filename: docs/img/models.png -->
@@ -169,22 +172,6 @@ you, and it measures rather than guesses.
   install** removes downloaded runtime and local state; model weights in this install are kept unless
   you select the checkbox. Model folders outside the install are always preserved.
 
-## Offloading heavy reading from Claude Code
-
-Keep Claude Code on the cloud model and hand only the token-heavy reading to a local one, so a
-200,000-token log costs nothing against your quota:
-
-```bash
-powershell -ExecutionPolicy Bypass -File .\local-llm.ps1 -Prompt "List every distinct error and its frequency" -File logs\app.log
-```
-
-Only the answer comes back. The **Tools** tab in the panel does the same thing with two boxes.
-
-**Running whole Claude Code sessions on a local model is not offered.** It was, and it was removed
-after measuring it: on a 12 GB card, a fresh session asked to make a one-line change to a 12-line
-file ran **219 tool calls over 29 minutes**, never replied, and changed nothing. The plumbing is
-fine — single requests and single tool calls work — but a model this size does not converge on a
-multi-step agent loop, and a button that cannot finish is worse than no button.
 
 ## Monitoring
 
