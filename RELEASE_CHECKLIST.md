@@ -44,10 +44,10 @@ Use this gate for every public release. A green build is not proof that the Wind
 
 ## Before broad public distribution
 
-- [ ] Resolve Authenticode signing or explicitly accept the unknown-publisher/SmartScreen experience. No eligible code-signing certificate with a private key was found in the current-user or local-machine certificate stores.
+- [x] Explicitly accept the unsigned-installer/SmartScreen experience for public `0.1.14`. The installer remains `NotSigned`; `SHA256SUMS.txt` detects an altered download only when obtained from the trusted release page and does not establish publisher identity.
 - [ ] Extend independent hash/signature verification to source archives, Node.js, package registries, model providers and other upstream downloads. GitHub's release API digest is useful corruption detection, not an independent publisher identity.
 - [x] Test the dedicated `modelpilot.app@gmail.com` contact from an external account for general support and private vulnerability reports; delivery and reply succeeded.
-- [ ] Configure GitHub private vulnerability reporting if it becomes available. The repository is currently private, issues are collaborator-only, and the GitHub endpoint previously returned 404.
+- [ ] Configure GitHub private vulnerability reporting if it becomes available. The repository and public issue tracker are now public; the enablement API returned 404 during release preparation, so email remains the private route.
 - [ ] Review installed/upstream package licence notices and each selected model's usage terms. `THIRD-PARTY.md` is an inventory, not a complete licence audit.
 - [ ] Publish only Windows/hardware support claims supported by testing; a single maintainer PC is not compatibility coverage.
 

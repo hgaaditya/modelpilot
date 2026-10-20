@@ -28,14 +28,14 @@ weights. The stack downloads its dependencies the first time you press **Start**
 
 ### 1. Download and run the setup EXE
 
-> **Release status:** `0.1.13-localqa` is an unsigned, unpublished Model Pilot QA candidate.
-> Do not redistribute it; wait for an approved public release.
+> **Release status:** `0.1.14` is an unsigned public Model Pilot release.
+> Windows may show an **Unknown Publisher** or SmartScreen warning. Continue only when you downloaded
+> the installer from this project's Releases page and its SHA-256 matches the attached
+> `SHA256SUMS.txt`; neither check establishes publisher identity.
 
-When an approved release is available, download `Model-Pilot-Setup.exe` and `SHA256SUMS.txt` from
-the project's Releases page and run the installer. It installs into your user's Local AppData by
-default and offers Start Menu and optional Desktop shortcuts. The checksum can detect a damaged or
-altered download only if you obtain the checksum from a trusted release page; it does not verify the
-publisher or replace code signing.
+Download `Model-Pilot-Setup.exe` and `SHA256SUMS.txt` from the project's Releases page and run the
+installer. It installs into your user's Local AppData by default and offers Start Menu and optional
+Desktop shortcuts.
 
 Upgrades from the earlier LocalLLM-branded build keep the existing `%LOCALAPPDATA%\LocalLLM`
 installation folder in place so models, configuration and chat data do not need to move. The
@@ -111,9 +111,8 @@ is always kept.
 
 ### Getting help
 
-This repository is currently private, so its issue tracker is available only to collaborators. The
-local QA candidate is not for end-user distribution. For general support or release questions, email
-[modelpilot.app@gmail.com](mailto:modelpilot.app@gmail.com). Include the app version, Windows
+This repository is public; use its issue tracker for general support or release questions. The local
+QA candidate is not for end-user distribution. Include the app version, Windows
 version, steps to reproduce and exact error. Review logs or diagnostics before attaching them: they
 can contain computer name, hardware and drive details, event-log text, model names and local paths.
 Redact anything identifying; do not attach weights, secrets or chat history unless you have

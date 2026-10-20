@@ -1,7 +1,7 @@
 # Model Pilot product status
 
-**Updated:** 2026-10-17
-**State:** Model Pilot QA candidate `0.1.13-localqa` is installed locally. It is unsigned and unpublished.
+**Updated:** 2026-10-20
+**State:** Model Pilot `0.1.14` is approved for public publication as an unsigned release.
 
 ## Product decisions
 
@@ -11,7 +11,7 @@
 - Existing GGUF files are registered in place. Import does not copy, move or delete source weights.
 - The setup EXE installs the launcher/scripts per-user. Its uninstaller removes those files and shortcuts while preserving the downloaded stack and user data.
 - Settings → Remove parts of the install is the explicit runtime/data reset. ComfyUI runtime, models, inputs, outputs and user settings are part of **Everything**. The model-weight checkbox deletes only weights inside the legacy LocalLLM installation directory; model folders selected elsewhere are preserved.
-- No public release, tag or publication is authorized by this work.
+- The public `0.1.14` installer is intentionally unsigned by explicit release decision. Windows may show Unknown Publisher or SmartScreen; the release page and `SHA256SUMS.txt` provide distribution-integrity evidence, not publisher identity.
 
 ## Implemented
 
@@ -58,19 +58,18 @@
 ## Remaining release risks
 
 - A same-profile runtime wipe and reinstall passed, but no second Windows user profile or machine was available. This does not establish compatibility across Windows versions, accounts, GPUs or hardware.
-- The candidate is unsigned. No unexpired code-signing certificate with a private key and code-signing usage was found in the current-user or local-machine certificate stores; SmartScreen/unknown-publisher experience remains unresolved.
+- The public `0.1.14` installer is intentionally unsigned. This was explicitly accepted for this release; users must expect SmartScreen/unknown-publisher prompts, and the SHA-256 manifest does not authenticate the publisher.
 - GitHub release downloads verify the API-published SHA-256 when available, but source archives and Node, PyPI/npm, Hugging Face, ComfyUI and other downloads are not covered. The API digest shares GitHub's trust boundary and is not a publisher signature; independent verification remains incomplete.
-- The authenticated GitHub API confirms the origin repository is private and issue tracking is enabled for collaborators. The dedicated contact `modelpilot.app@gmail.com` is published for general support and private vulnerability reports; delivery and reply were verified from an external account. GitHub's private vulnerability-reporting endpoint remains unverified.
+- The origin repository is public and its issue tracker is available for general support. The dedicated contact `modelpilot.app@gmail.com` is published for private vulnerability reports; delivery and reply were verified from an external account. GitHub private vulnerability reporting remains unavailable: its enablement API returned 404 during release preparation.
 - Native Windows Forced Colors and screen-reader testing were unavailable. The browser automation engine rejected `forced-colors` emulation; the stylesheet includes a forced-colors rule, but that is not a native validation. True OS display scaling and a complete accessibility review remain open.
 - Tray singleton and status monitoring were tested, but direct tray-menu Stop/Restart actions remain unverified. UI Automation exposed similarly named dashboard controls, not the native tray context menu; the three service endpoints remained healthy afterward.
 - ComfyUI was not installed in the real user environment during this pass; full-reset deletion was verified using an isolated dummy runtime and reset preview, not real ComfyUI model data.
 - No non-maintainer feedback or broad hardware compatibility testing has been collected.
 
-## Next gates before public release
+## Remaining release work
 
-1. Obtain a trusted Authenticode signing certificate/private key, or explicitly decide whether to distribute an unsigned installer with the unknown-publisher warning.
-2. Extend upstream integrity verification beyond GitHub release assets with independently trusted hashes/signatures where available; the current check is partial and does not cover package registries or source/model downloads.
-3. Configure or verify GitHub private vulnerability reporting if it becomes available.
-4. Test the tray menu actions, a real ComfyUI install/reset if that feature ships, native Windows high contrast and Narrator, and another user profile/machine when available.
-5. Obtain non-maintainer feedback and publish only support claims backed by observed Windows/hardware coverage.
-6. Push a `release/<semver>` or `version/<semver>` branch and verify its workflow artifact before release approval; only then push the matching `v<semver>` tag to publish a GitHub Release and compare its artifact/checksum with the local candidate.
+1. Extend upstream integrity verification beyond GitHub release assets with independently trusted hashes/signatures where available; the current check is partial and does not cover package registries or source/model downloads.
+2. Configure or verify GitHub private vulnerability reporting if it becomes available.
+3. Test the tray menu actions, a real ComfyUI install/reset if that feature ships, native Windows high contrast and Narrator, and another user profile/machine when available.
+4. Obtain non-maintainer feedback and publish only support claims backed by observed Windows/hardware coverage.
+5. Push `release/v0.1.14`, verify its workflow artifact, then push `v0.1.14` to publish the GitHub Release and compare its installer/checksum with the workflow artifact.
