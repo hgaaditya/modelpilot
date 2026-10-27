@@ -113,6 +113,11 @@ end;
 [Run]
 Filename: "{app}\ModelPilot.cmd"; Parameters: "-RestartPanel"; Description: "Launch Model Pilot"; WorkingDir: "{app}"; Flags: postinstall shellexec skipifsilent
 
+[UninstallRun]
+; Stop only processes launched from this install before their scripts are deleted. Runtime data is
+; deliberately retained by the uninstaller, but live services and the detached panel must not outlive it.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\start.ps1"" -Action shutdown"; Flags: runhidden waituntilterminated
+
 [UninstallDelete]
 ; Remove only installer-owned application files. Runtime, data and logs are deliberately retained.
 Type: files; Name: "{app}\ModelPilot.cmd"

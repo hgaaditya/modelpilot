@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -22,7 +23,13 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./tools/Update-DependencyCandidates.ps1 -Apply
+        run: |
+          $current = (Get-Content VERSION -Raw).Trim()
+          if ($current -notmatch '^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$') {
+            throw "VERSION must be a stable semver before creating a dependency candidate. Got '$current'."
+          }
+          $candidate = "$($Matches.major).$($Matches.minor).$([int]$Matches.patch + 1)-deps.$env:GITHUB_RUN_NUMBER"
+          ./tools/Update-DependencyCandidates.ps1 -Apply -CandidateVersion $candidate
 
       - name: Create or refresh dependency candidate pull request
         shell: bash
@@ -37,10 +44,13 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -B "$branch"
-          git add start.ps1 supply-chain.json
+          git add start.ps1 VERSION supply-chain.json
           git commit -m 'chore: propose upstream dependency updates'
           git push --force origin "$branch"
-          body='Automated candidate update. Hosted CI can validate metadata, assets, and packaging only. Before merge, complete the real Windows/GPU compatibility gate in docs/DEPENDENCY_UPDATES.md: cold model load, real completion, Open WebUI response, and upgrade/rollback check.'
+          # A push authenticated with GITHUB_TOKEN does not trigger another workflow. Dispatch the
+          # offline-test installer explicitly; release.yml can publish only from an actual v* tag.
+          gh workflow run release.yml --ref "$branch"
+          body='Automated candidate update. Download its release-artifacts workflow artifact for offline testing. Hosted CI can validate metadata, assets, and packaging only. Before merge, complete the real Windows/GPU compatibility gate in docs/DEPENDENCY_UPDATES.md: cold model load, real completion, Open WebUI response, and upgrade/rollback check.'
           number="$(gh pr list --head "$branch" --base master --state open --json number --jq '.[0].number')"
           if [ -z "$number" ]; then
             gh pr create --base master --head "$branch" --title 'chore: dependency update candidates' --body "$body" --label dependencies --label needs-runtime-test

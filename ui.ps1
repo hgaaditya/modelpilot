@@ -645,7 +645,7 @@ $html = @'
 *{box-sizing:border-box}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 @media(forced-colors:active){:focus-visible{outline-color:Highlight}.dot{border:1px solid CanvasText}.bar{border:1px solid CanvasText}.bar i{background:Highlight}}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 "Segoe UI",system-ui,sans-serif;user-select:none}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 "Segoe UI",system-ui,sans-serif}
 header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:12px 26px;background:rgba(255,255,255,.96);border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}
 header b{font-size:16px;font-weight:650;letter-spacing:-.02em}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%}.up{background:var(--ok)}.down{background:var(--bad)}.part{background:var(--warn)}
@@ -734,7 +734,8 @@ input[type=checkbox]{accent-color:var(--acc)}
 .subtle-list{margin-top:12px}
 .download-box{padding:12px;margin:12px 0;background:#f8faff;border:1px solid var(--line);border-radius:9px}
 .subtle,.note{color:var(--dim);font-size:12px}
-@media(max-width:760px){header{padding:8px 12px;gap:8px}header .gh,header .act{padding:6px 7px;font-size:12px}main{padding:18px 14px 32px}.home-grid{grid-template-columns:1fr}.section-head{align-items:flex-start}.hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%}nav{padding:7px 10px;overflow:visible}nav button,nav summary{padding:8px 9px}.service-card{grid-template-columns:1fr}.service-meta{grid-column:1}.service-card .service-choice{grid-column:1}}
+.model-choice{display:flex;align-items:center;justify-content:space-between;gap:16px}.model-choice h2{margin:0}.model-choice p{margin:3px 0 0}.model-choice .row{flex-shrink:0}.acquisition-path[hidden]{display:none}.danger-zone{border-color:#ecc8ca;background:#fffafa}.danger-zone legend{color:var(--bad)}.danger-zone .hint{background:#fff3f3;border-color:#ecc8ca;color:#6c2730}
+@media(max-width:760px){header{padding:8px 12px;gap:8px}header .gh,header .act{padding:6px 7px;font-size:12px}header .header-secondary{display:none}main{padding:18px 14px 32px}.home-grid{grid-template-columns:1fr}.section-head{align-items:flex-start}.hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%}nav{padding:7px 10px;overflow:visible}nav button,nav summary{padding:8px 9px}.service-card{grid-template-columns:1fr}.service-meta{grid-column:1}.service-card .service-choice{grid-column:1}.model-choice{align-items:flex-start;flex-direction:column}.model-choice .row{width:100%}.model-choice button{flex:1}}
 @media(max-width:760px){.hero-actions{max-width:none;min-width:0}}
 @media(max-width:760px){.import-table{display:block;width:100%}.import-table thead{display:none}.import-table tbody{display:block;width:100%}.import-table tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:12px 0;border-bottom:1px solid var(--line)}.import-table td{display:block;min-width:0;padding:0 2px}.import-table td:first-child{grid-column:1/-1}.import-table td:first-child .subtle{overflow-wrap:anywhere;word-break:break-word;white-space:normal}.import-table td:nth-child(2){grid-column:1}.import-table td:nth-child(3){grid-column:2;max-width:100%;text-align:right}.import-table .miss{display:block;max-width:100%;overflow-wrap:anywhere}}
 @media(max-width:760px){#modelTable{display:block;width:100%;min-width:0}#modelTable thead{display:none}#modelTable tbody{display:block;width:100%}#modelTable tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:11px 0;border-bottom:1px solid var(--line)}#modelTable td{display:block;min-width:0;padding:2px 0}#modelTable td.adv{display:none}#modelTable td:first-child{grid-column:1;overflow-wrap:anywhere}#modelTable td:nth-child(2){display:none}#modelTable td:nth-child(3){grid-column:1;color:var(--dim);font-size:12px}#modelTable td:nth-child(9){grid-column:2;grid-row:1;white-space:nowrap}#modelTable td:nth-child(10){grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px}#modelTable td:nth-child(10) button{font-size:11px;padding:6px 8px}}
@@ -808,10 +809,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 </symbol></svg>
 <header><svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><use href="#mark"/></svg>
 <b>Model Pilot</b><span id="d" class="dot down" title="stack status"></span><span id="sub" style="color:var(--dim);font-size:11px"></span>
-<span style="flex:1"></span>
- <button class="gh" id="hre" aria-label="Restart selected services" onclick="act('restart')" disabled>Restart</button>
- <button class="gh" id="hst" aria-label="Stop selected services" onclick="act('stop')" disabled>Stop</button>
- <button class="act" id="go" aria-label="Start selected services" onclick="act('deploy')" disabled>Start</button></header>
+<span style="flex:1"></span></header>
 <nav aria-label="Main navigation">
  <button class="on" data-pane="0" aria-current="page" onclick="tab(0,this)">Home</button>
  <button data-pane="2" onclick="tab(2,this)">Models</button>
@@ -825,13 +823,12 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 <main>
 
 <div class="pane on" id="p0">
- <div class="section-head"><div><div class="eyebrow">YOUR LOCAL AI</div><h1>Home</h1><p>Set up a private model once, then chat on your own machine.</p></div></div>
+ <div class="section-head"><div><h1>Home</h1><p>Set up a private model once, then chat on your own machine.</p></div></div>
  <div id="homeLoading" class="hint" role="status" aria-live="polite">Checking this PC and the local services. This can take a few seconds.</div>
  <div id="guide"></div>
  <div id="verifyResult" class="verify-result" role="status" aria-live="polite" style="display:none"></div>
  <div class="home-grid">
-  <section class="surface"><div class="surface-head"><div><h2>What is running</h2><p>Start or stop the local model service and chat.</p></div><div class="row">
-   <button class="gh" id="homeRestart" onclick="act('restart')">Restart</button><button class="gh" id="homeStop" onclick="act('stop')">Stop</button></div></div>
+  <section class="surface"><div class="surface-head"><div><h2>Services</h2><p>Local services managed by Model Pilot.</p></div></div>
    <div id="svc" class="service-grid"><div class="hint" style="grid-column:1/-1">Checking installed services...</div></div>
   </section>
   <section class="surface"><div class="surface-head"><div><h2>This PC</h2><p>Available memory for local models.</p></div></div><div class="kv" id="hw"><span>Hardware</span><div>Reading memory and accelerator information...</div></div></section>
@@ -859,8 +856,9 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 </div>
 
 <div class="pane" id="p2">
- <div class="section-head"><div><div class="eyebrow">MODEL LIBRARY</div><h1>Models</h1><p>Choose a model that fits this PC, or add one you already downloaded.</p></div></div>
- <section class="surface picker">
+ <div class="section-head"><div><h1>Models</h1><p>Choose a model that fits this PC, or add one you already downloaded.</p></div></div>
+ <section class="surface model-choice"><div><h2>Add a model</h2><p>Choose one path now. You can manage configured models below.</p></div><div class="row"><button class="act" id="recommendChoice" aria-pressed="true" onclick="modelPath('recommend')">Find a recommended model</button><button class="gh" id="importChoice" aria-pressed="false" onclick="modelPath('import')">I already have a GGUF</button></div></section>
+ <section class="surface picker acquisition-path" id="recommendPath">
   <div class="eyebrow">START HERE</div><h2>Find a model for this PC</h2>
   <p>We rank models against the memory available on this PC. Review the download size before choosing.</p>
   <div class="row">
@@ -872,7 +870,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
   </div>
   <div id="sug"></div>
  </section>
- <div class="home-grid model-tools">
+ <div class="home-grid model-tools acquisition-path" id="importPath" hidden>
   <section class="surface"><div class="eyebrow">ALREADY DOWNLOADED?</div><h2>Find models on your drive</h2>
    <p>Choose a folder and scan for GGUF files. Adding one creates a model entry with 16k context and q8_0 KV defaults; the file stays where it is and is never copied or moved. Tune can measure settings for this PC later.</p>
    <div class="row"><button class="gh" onclick="browseDir()">Choose model folder</button><button class="gh" id="scanModelsBtn" onclick="scanModels()">Scan folder</button></div>
@@ -919,7 +917,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 </div>
 
 <div class="pane" id="p6">
- <div class="section-head"><div><div class="eyebrow">PREFERENCES</div><h1>Settings</h1><p>Keep your local data protected, up to date and easy to recover.</p></div></div>
+ <div class="section-head"><div><h1>Settings</h1><p>Keep your local data protected, up to date and easy to recover.</p></div></div>
  <fieldset><legend>Model storage</legend>
   <div class="row"><input id="mdir" aria-label="Model download folder" style="flex:1" readonly><button class="gh" onclick="browseDir()">Choose folder</button></div>
   <div class="hint" style="margin-top:8px">New downloads are saved here. To find and register existing files, go to Models &gt; Find models on your drive. Files stay in place.</div>
@@ -947,7 +945,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
   <div id="preflight" class="hint" style="margin-top:8px">The PC check looks at disk, memory and accelerator headroom before setup or an upgrade.</div>
   <div class="hint" style="margin-top:8px">The diagnostic ZIP excludes chats, logs, local paths, usernames, tokens and model weights. Review it before sharing through <a href="https://github.com/hgaaditya/modelpilot/issues/new/choose" target="_blank" rel="noreferrer">GitHub support</a>.</div>
  </fieldset>
- <fieldset><legend>Remove parts of the install</legend>
+ <fieldset class="danger-zone"><legend>Remove parts of the install</legend>
  <div class="hint" style="margin-bottom:8px">Each selected runtime can be reinstalled by pressing Start. The checkbox only deletes GGUF weights inside this installation; model folders you selected elsewhere are always kept. Everything also removes optional ComfyUI models, inputs, outputs and user settings.</div>
   <div class="row" style="gap:8px;flex-wrap:wrap">
    <select id="rstc" aria-label="Install component to remove">
@@ -1083,14 +1081,20 @@ function tab(i,b){
   more.textContent='More';more.setAttribute('aria-label','More navigation');more.classList.remove('on');
  }else{
   const label={1:'System',4:'Monitoring'}[i]||'More';
-  more.textContent='More · '+label;more.setAttribute('aria-label','More navigation, current section: '+label);
+  more.textContent='More - '+label;more.setAttribute('aria-label','More navigation, current section: '+label);
   more.setAttribute('aria-current','page');more.classList.add('on');if(b)b.classList.add('on');
  }
- // Sampling costs an nvidia-smi spawn per second on a single-threaded server, so it only runs
- // while the tab that shows it is actually in front.
  monRun(i===4);
  if(i===1)tick();
  if(i===6){auto();loadBackups()}
+}
+function modelPath(path){
+ const recommendation=path==='recommend';
+ document.getElementById('recommendPath').hidden=!recommendation;
+ document.getElementById('importPath').hidden=recommendation;
+ const rec=document.getElementById('recommendChoice'),imp=document.getElementById('importChoice');
+ rec.className=recommendation?'act':'gh';imp.className=recommendation?'gh':'act';
+ rec.setAttribute('aria-pressed',String(recommendation));imp.setAttribute('aria-pressed',String(!recommendation));
 }
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
@@ -1512,17 +1516,21 @@ const JOBS_SAY={
  'verify-model':['Checking a real model response','Sends one short completion and records the model reply here. A cold load can take several minutes.'],
  unload:['Freeing VRAM',''],
  vercheck:['Checking for newer versions','Asks GitHub and nodejs.org.'],
+ 'product-update':['Checking Model Pilot updates','Checks the latest published release.'],
+ preflight:['Checking this PC','Checks disk, memory and accelerator headroom.'],
  backup:['Creating your backup','Chats, users, settings and configuration are being archived locally.'],
  restore:['Restoring your backup','A fresh safety backup is created first, then restored data replaces chats and settings.'],
  diagnostics:['Creating a redacted diagnostic report','The ZIP excludes chats, logs, local paths, usernames, tokens and model weights.']
 };
 function jobSay(k){
  if(k==='verify-model')return JOBS_SAY[k];
+ const direct=JOBS_SAY[k];
+ if(direct)return direct;
  const base=k.split(/[:\-]/)[0], who=k.slice(base.length+1);
  if(base==='load')  return ['Loading '+who,'Reading multi-GB weights into VRAM. Ten seconds to a minute.'];
  if(base==='edit')  return ['Saving settings for '+who,''];
  if(base==='autotune')return['Measuring what fits for '+who,'Loads the model repeatedly at different settings. Several minutes.'];
- const e=JOBS_SAY[base]||JOBS_SAY[k];
+ const e=JOBS_SAY[base];
  if(e)return [e[0]+(who&&who!=='all'?' ('+who+')':''),e[1]];
  return [k,''];
 }
@@ -1549,6 +1557,53 @@ function activity(dls){
    ${note?`<div class="note">${esc(note)}</div>`:''}
    <div class="bar${pct===null?' indet':''}"><i${pct===null?'':` style="width:${pct.toFixed(1)}%"`}></i></div>
    ${line?`<pre>${esc(line).slice(0,200)}</pre>`:''}</div>`
+ }).join('');
+}
+
+function jobJson(tail){
+ for(const line of tail.split('\n').reverse()){
+  try{return JSON.parse(line)}catch(e){}
+ }
+ return null;
+}
+function jobAge(seconds){
+ if(seconds<60)return seconds+'s ago';
+ const minutes=Math.floor(seconds/60);
+ if(minutes<60)return minutes+'m ago';
+ const hours=Math.floor(minutes/60);
+ if(hours<48)return hours+'h ago';
+ return Math.floor(hours/24)+'d ago';
+}
+function jobResult(j){
+ const data=jobJson(j.tail||'');
+ if(j.name==='product-update'&&data){
+  return data.available?`Version ${data.latest} is ready to install.`:`Model Pilot ${data.current||data.latest} is up to date.`;
+ }
+ if(j.name==='preflight'&&data&&Array.isArray(data.checks)){
+  const issues=data.checks.filter(c=>!c.ok);
+  return data.ready?'This PC is ready for setup and local models.':issues.map(c=>`${c.name}: ${c.detail}`).join(' ');
+ }
+ const last=(j.tail||'').split('\n').filter(Boolean).pop();
+ return last||(j.running?'Working...':'Finished without additional output.');
+}
+function recentJobs(){
+ const box=document.getElementById('jobs');
+ if(!JOBS.length){box.innerHTML='<span style="color:var(--dim)">Nothing has run recently.</span>';return}
+ const rows=[];
+ for(const job of JOBS){
+  const prior=!job.running&&rows.find(row=>!row.running&&row.name===job.name);
+  if(prior){prior.count++;continue}
+  rows.push({...job,count:1});
+ }
+ box.innerHTML=rows.map(j=>{
+  const [title,note]=jobSay(j.name);
+  const status=j.running?'<span class="tag" style="color:var(--warn)">running</span>':'<span class="tag">finished</span>';
+  const detail=esc(jobResult(j));
+  const raw=esc(j.tail||'(no output yet)');
+  const history=j.count>1?` <span class="subtle">${j.count} completed checks grouped</span>`:'';
+  return `<section class="job"><div class="row"><b>${esc(title)}</b>${status}<span class="subtle">${jobAge(j.age)}</span>${history}</div>
+   ${note?`<div class="note">${esc(note)}</div>`:''}<div>${detail}</div>
+   <details><summary>Technical details</summary><pre>${raw}</pre></details></section>`;
  }).join('');
 }
 let DLP={};
@@ -1602,17 +1657,15 @@ async function tick(){
   if(p&&p.id===j.id&&!j.running)delete PEND[j.name]});
  // A load has no job behind it, so its mark clears on the outcome instead - the model is loaded.
  if(S.loaded)delete PEND['load:'+S.loaded];
- // Health is judged only against ticked services - a deselected one being down is not a fault.
+ // Health is judged only against selected services - a deselected one being down is not a fault.
  const mine=S.services.filter(s=>s.managed&&s.selected);
  const up=mine.filter(s=>s.up).length, need=mine.length;
- // The header is visible before the first status response; hold lifecycle controls until the
- // selected services are known, so an early click cannot be mistaken for "nothing selected".
- const ready=Array.isArray(S.services);
- const sel=ready?selected():null;
- [['go','deploy'],['hre','restart'],['hst','stop'],['homeRestart','restart'],['homeStop','stop']].forEach(([el,a])=>{
-  const e=document.getElementById(el),b=ready&&busy(jkey(a,sel));
-  e.classList.toggle('busy',b);e.disabled=!ready||b||(el==='go'&&need>0&&up===need);
- });
+ const fresh=mine.some(s=>!s.installed), noModels=M.models&&M.models.length===0;
+ const noWeights=M.models&&M.models.length>0&&M.models.every(m=>!m.present);
+ const testable=(M.models||[]).find(m=>m.id===S.loaded&&m.present&&m.engineOk)||(M.models||[]).find(m=>m.present&&m.engineOk);
+ const routerUp=S.services.some(s=>s.key==='swap'&&s.up);
+ const verified=testable&&M.support&&M.support[testable.id];
+ const testBusy=busy('verify-model'),testId=testable?encodeURIComponent(testable.id).replace(/'/g,'%27'):'';
  document.getElementById('d').className='dot '+(need===0?'down':up===need?'up':up?'part':'down');
  document.getElementById('sub').textContent=need===0?'nothing selected':up===need?'running':up?'partly running':'stopped';
  document.getElementById('svc').innerHTML=S.services.map(s=>{
@@ -1620,7 +1673,7 @@ async function tick(){
   return `<article class="service-card">
    <div><h3>${esc(s.name)}</h3><p>${esc(s.role)}</p></div>
    <div class="service-meta"><span class="status-pill ${state[1]}">${state[0]}</span>${s.url&&s.up?`<a href="${esc(s.url)}" target="_blank"><button class="gh">Open</button></a>`:''}</div>
-   ${s.managed?`<label class="service-choice"><input type="checkbox" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)"> Include in Start and Stop</label>`:''}
+   ${s.managed&&!fresh?`<label class="service-choice"><input type="checkbox" ${s.selected?'checked':''} onchange="toggleSvc('${s.key}',this.checked)"> Include in Start and Stop</label>`:''}
   </article>`
  }).join('');
  const gpuTotal=Number(S.gpu.total)||0,gpuUsed=Number(S.gpu.used)||0;
@@ -1631,25 +1684,17 @@ async function tick(){
   <span>GPU load</span><div>${gpuTotal?`${S.gpu.util}% &nbsp; ${S.gpu.temp} &deg;C`:'Not reported'}</div>
   <span>System RAM</span><div>${S.ramUsed} / ${S.ramTot} GB<div class="bar"><i style="width:${100*S.ramUsed/S.ramTot}%"></i></div></div>
   <span>Loaded model</span><div>${S.loaded||'<span style="color:var(--dim)">idle</span>'}</div>`;
- // First-run walkthrough. Someone who just unzipped this has three things to do in order -
- // install the components, fetch a model, open the chat - and no way to know that from a panel
- // that only reports state. Each step names the next action and disappears once it is done.
- const fresh=mine.some(s=>!s.installed), noModels=M.models&&M.models.length===0;
- const noWeights=M.models&&M.models.length>0&&M.models.every(m=>!m.present);
- let hero={step:'LOCAL STATUS',title:'Your workspace',text:'Your local model services run on this PC.',button:'',action:''};
- if(need===0) hero={step:'SETUP',title:'Choose what to run',text:'Select llama-swap and/or the chat interface below, then start your local workspace.',button:'',action:''};
- else if(fresh) hero={step:'STEP 1 - SET UP',title:'Set up your local AI workspace',text:'Install the local engine, model router and chat interface. This downloads the runtime once; model files are added separately.',button:'Install and start',action:"act('deploy')"};
- else if(!up) hero={step:'READY WHEN YOU ARE',title:'Your services are stopped',text:'Start the selected services to use your local models.',button:'Start services',action:"act('deploy')"};
- else if(up<need) hero={step:'CHECKING SERVICES',title:'Part of your workspace is running',text:'Restart the selected services to bring the rest back online.',button:'Restart services',action:"act('restart')"};
- else if(noModels) hero={step:'STEP 2 - CHOOSE A MODEL',title:'Your workspace is ready for a model',text:'Find a recommendation sized for this PC or register a GGUF file you already have.',button:'Find a model',action:'firstModel()'};
- else if(noWeights) hero={step:'MODEL FILES NEEDED',title:'Your models need their weight files',text:'Choose a folder containing the GGUF files, or download a model from the library.',button:'Manage models',action:'gotoModels()'};
- else if(M.models&&M.models.every(m=>!m.loads&&!m.lastUsed)) hero={step:'STEP 3 - FIRST CHAT',title:'Ready for your first chat',text:'Open the chat interface and choose one of your models. The first request loads it into memory.',button:'Open chat',action:'openChat()'};
- else hero={step:'ALL SYSTEMS READY',title:'Your local AI is ready',text:'Open the chat interface to continue. Your conversations stay on this PC.',button:'Open chat',action:'openChat()'};
- const testable=(M.models||[]).find(m=>m.id===S.loaded&&m.present&&m.engineOk)||(M.models||[]).find(m=>m.present&&m.engineOk);
- const routerUp=S.services.some(s=>s.key==='swap'&&s.up);
- const testBusy=busy('verify-model'),testId=testable?encodeURIComponent(testable.id).replace(/'/g,'%27'):'';
- const testButton=testable&&routerUp?`<div><button class="gh" id="verifyModelBtn" onclick="verifyModel(decodeURIComponent('${testId}'))" ${testBusy?'disabled':''}>${testBusy?'Checking response...':'Test a real response'}</button><div class="subtle">Checks ${esc(testable.id)}; may switch the loaded model and use VRAM. It confirms that the model returns text, not that the answer is accurate or useful.</div></div>`:'';
- document.getElementById('guide').innerHTML=`<section class="hero"><div><div class="eyebrow">${hero.step}</div><h2>${hero.title}</h2><p>${hero.text}</p></div><div class="hero-actions">${hero.button?`<button class="act" onclick="${hero.action}">${hero.button}</button>`:''}${testButton}</div></section>`;
+ // Home teaches the shortest path to a real local response. Service maintenance stays in System.
+let hero={title:'Your local workspace',text:'Your local model services run on this PC.',button:'',action:''};
+if(need===0) hero={title:'Choose what to run',text:'Select the local services below, then start your local workspace.',button:'',action:''};
+ else if(fresh) hero={title:'Set up Model Pilot',text:'Step 1 of 4. One setup downloads the local runtime and starts it. You choose a model afterwards.',button:'Set up Model Pilot',action:"act('deploy')"};
+ else if(!up) hero={title:'Start your services',text:'Step 1 of 4. Start the local services already installed on this PC.',button:'Start services',action:"act('deploy')"};
+ else if(up<need) hero={title:'Finish starting services',text:'Restart the selected services to bring the local workspace back online.',button:'Restart services',action:"act('restart')"};
+ else if(noModels) hero={title:'Choose a model',text:'Step 2 of 4. Find a model sized for this PC or register a GGUF file you already have.',button:'Choose a model',action:'firstModel()'};
+ else if(noWeights) hero={title:'Add model files',text:'Choose a folder containing the GGUF files, or download a model from the library.',button:'Manage models',action:'gotoModels()'};
+ else if(testable&&routerUp&&!verified) hero={title:'Test a real response',text:'Step 3 of 4. Confirm that your model loads and returns text before opening chat.',button:testBusy?'Checking response...':'Test this model',action:`verifyModel(decodeURIComponent('${testId}'))`};
+ else hero={title:'Open your first chat',text:'Step 4 of 4. Choose a local model in chat and start a private conversation.',button:'Open chat',action:'openChat()'};
+ document.getElementById('guide').innerHTML=`<section class="hero"><div><h2>${hero.title}</h2><p>${hero.text}</p></div><div class="hero-actions">${hero.button?`<button class="act" onclick="${hero.action}" ${testBusy?'disabled':''}>${hero.button}</button>`:''}</div></section>`;
 
  if(document.getElementById('p1').classList.contains('on'))try{E=await (await fetch('/api/engine')).json()}catch(e){}
  if(E.llamacpp){
@@ -1724,7 +1769,7 @@ async function tick(){
  }
  // Cached versions only; the -Latest query costs GitHub round-trips so it waits for the button.
  if(!VER.rows&&document.getElementById('p1').classList.contains('on')){try{VER=await (await fetch('/api/versions')).json()}catch(e){}}
- document.getElementById('jobs').innerHTML=JOBS.length?JOBS.map(x=>`<div style="margin-bottom:6px"><b style="font-size:11px">${x.id}</b> ${x.running?'<span class="tag" style="color:var(--warn)">running</span>':''} <span style="color:var(--dim);font-size:11px">${x.age}s ago</span><pre>${(x.tail||'(no output yet)').replace(/</g,'&lt;')}</pre></div>`).join(''):'<span style="color:var(--dim)">nothing running</span>';
+ recentJobs();
  const md=document.getElementById('mdir');
  if(M.settings){
   if(document.activeElement!==md)md.value=M.settings.modelsDir;

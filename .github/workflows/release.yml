@@ -1,12 +1,13 @@
 name: release artifacts
 
-# A versioned release branch produces a downloadable QA artifact. Only an explicit v* tag creates
-# a GitHub Release, so pushing a branch can never publish an installer accidentally.
+# A dependency-candidate branch produces a downloadable prerelease installer for offline testing.
+# Only an explicit v* tag creates a GitHub Release, so candidate builds cannot publish accidentally.
 on:
   push:
     branches:
       - 'release/**'
       - 'version/**'
+      - 'automation/dependency-candidates'
     tags: ['v*']
   workflow_dispatch:
 
@@ -26,14 +27,12 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $ref = $env:GITHUB_REF_NAME
-          $candidate = if ($env:GITHUB_REF_TYPE -eq 'tag') {
-            $ref -replace '^v', ''
-          } else {
-            $ref -replace '^(release|version)/v?', ''
-          }
+          $candidate = (Get-Content VERSION -Raw).Trim()
           if ($candidate -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
-            throw "Release branches must be named release/<semver> or version/<semver>; tags must be v<semver>. Got '$ref'."
+            throw "VERSION must be semver. Got '$candidate'."
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$candidate") {
+            throw "Tag $env:GITHUB_REF_NAME must match VERSION $candidate."
           }
           "value=$candidate" >> $env:GITHUB_OUTPUT
 

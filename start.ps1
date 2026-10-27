@@ -33,7 +33,7 @@
 # parameter happens to be next in the declaration order.
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('deploy', 'upgrade', 'update-check', 'update-app', 'backup', 'restore', 'diagnostics', 'preflight', 'uninstall', 'reset', 'status', 'stop', 'restart', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
+    [ValidateSet('deploy', 'upgrade', 'update-check', 'update-app', 'backup', 'restore', 'diagnostics', 'preflight', 'uninstall', 'reset', 'status', 'stop', 'restart', 'shutdown', 'add-model', 'tray', 'bench', 'install-prism', 'inspect', 'autotune', 'check-config', 'set-tuning', 'install-llmfit', 'suggest', 'check-ui', 'autostart', 'install-comfy', 'comfy', 'test-model')]
     [string]$Action = 'deploy',
 
     # bench: passed straight through to bench\run.py (--models, --tasks, --repeat, --compare).
@@ -359,6 +359,28 @@ function Get-ComfyProcess { Get-ProcessUnderPath ('python' + (Get-ExeSuffix)) $c
 function Get-TrayProcess {
     # An uninstall from one install must never terminate another copy's tray.
     Get-ProcessByCommandLine ([regex]::Escape((Join-Path $root 'tray.ps1')))
+}
+
+function Get-PanelProcess {
+    # The installer uninstaller must stop its detached panel server before removing ui.ps1.
+    Get-ProcessByCommandLine ([regex]::Escape((Join-Path $root 'ui.ps1')))
+}
+
+function Stop-ApplicationShell {
+    # Scope both process queries to this install. A second Model Pilot copy must remain untouched.
+    $seen = @{}
+    $stopped = 0
+    $processes = @()
+    $processes += @(Get-PanelProcess)
+    $processes += @(Get-TrayProcess)
+    foreach ($process in $processes) {
+        if (-not $process -or $seen.ContainsKey($process.ProcessId)) { continue }
+        $seen[$process.ProcessId] = $true
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        $stopped++
+    }
+    if ($stopped) { Write-Host "Stopped $stopped Model Pilot panel or tray process(es)." }
+    else { Write-Host 'No Model Pilot panel or tray process was running.' }
 }
 
 # The tray script self-deduplicates via a named mutex, so firing this off unconditionally is safe.
@@ -805,22 +827,27 @@ function Invoke-Deploy($ver) {
     # --- 7. frontend build (production single-port serving) ---
     if (-not (Test-Path (Join-Path $webui 'build'))) {
         Write-Host "Building open-webui frontend (first run only, several minutes)..."
-        Push-Location $webui
-        & $npmCmd install
-        if ($LASTEXITCODE -ne 0) { Pop-Location; throw "npm install failed" }
-        # vite/rollup peaked at 3.8 GB building this frontend and died on `node`'s default
-        # old-space cap of roughly 4 GB: "FATAL ERROR: Ineffective mark-compacts near heap limit".
-        # Found by deploying a clean clone on a 16 GB machine - it failed at the last step of a
-        # 25-minute install, which is the worst possible place for a first run to break. The cap is
-        # a v8 default, not a memory shortage: there were 7 GB free at the time. Set for this
-        # process only, so nothing else on the machine inherits it.
+        $oldPath = $env:PATH
         $oldNodeOpts = $env:NODE_OPTIONS
-        $env:NODE_OPTIONS = '--max-old-space-size=6144'
-        & $npmCmd run build
-        $buildRc = $LASTEXITCODE
-        $env:NODE_OPTIONS = $oldNodeOpts
-        if ($buildRc -ne 0) { Pop-Location; throw "npm run build failed" }
-        Pop-Location
+        $env:PATH = "$nodeDir$([IO.Path]::PathSeparator)$oldPath"
+        Push-Location $webui
+        try {
+            & $npmCmd install
+            if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+            # vite/rollup peaked at 3.8 GB building this frontend and died on `node`'s default
+            # old-space cap of roughly 4 GB: "FATAL ERROR: Ineffective mark-compacts near heap limit".
+            # Found by deploying a clean clone on a 16 GB machine - it failed at the last step of a
+            # 25-minute install, which is the worst possible place for a first run to break. The cap is
+            # a v8 default, not a memory shortage: there were 7 GB free at the time. Set for this
+            # process only, so nothing else on the machine inherits it.
+            $env:NODE_OPTIONS = '--max-old-space-size=6144'
+            & $npmCmd run build
+            if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
+        } finally {
+            $env:NODE_OPTIONS = $oldNodeOpts
+            Pop-Location
+            $env:PATH = $oldPath
+        }
 
         # The frontend build is static: the Python backend serves build\ and never invokes node.
         # Verified - neither backend\start_windows.bat nor main.py references node or node_modules.
@@ -1534,6 +1561,14 @@ function Invoke-Autotune {
 
 # These don't touch versions at all - handle them before any stamp/release resolution.
 if ($Action -eq 'stop') { Stop-Stack $Component; return }
+
+# Used only by the setup uninstaller while its scripts still exist. Unlike uninstall, this keeps
+# runtimes, models and local data intact; it only prevents launcher processes from being orphaned.
+if ($Action -eq 'shutdown') {
+    Stop-Stack
+    Stop-ApplicationShell
+    return
+}
 
 # A named mutex keeps the tray to one instance, so firing this at an already-running tray
 # does nothing - and it used to report that it had started one anyway.

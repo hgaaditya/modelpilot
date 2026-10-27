@@ -1,8 +1,7 @@
 # The runtime stack downloads upstream binaries at first run, but the setup EXE is compiled by
 # Inno Setup in CI. This workflow checks script syntax/lint, the benchmark consent gate, platform
-# boundaries, docs links and installer compilation. The release-artifact workflow builds a candidate
-# for `release/<semver>` or `version/<semver>` branches; only an explicit `v<semver>` tag publishes
-# that candidate as a GitHub Release.
+# boundaries, docs links and installer compilation. Dependency-candidate branches also build a
+# retained offline-test installer; only an explicit `v<semver>` tag publishes a GitHub Release.
 #
 # Windows runners are free on public repositories.
 

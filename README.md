@@ -22,6 +22,17 @@ weights. The stack downloads its dependencies the first time you press **Start**
      Suggested filename: docs/img/dashboard.png  (~1040x720, the panel's native size) -->
 ![The Model Pilot control panel](docs/img/dashboard.png)
 
+## Development status
+
+`0.1.16` remains the latest public release. The default branch contains unreleased work that:
+
+- prepares a next-patch `-deps.<run>` installer artifact when a compatible upstream dependency update is found;
+- never creates a product tag or GitHub Release until a maintainer completes offline Windows/GPU testing;
+- keeps Home to one state-driven action, separates recommended-model and existing-GGUF paths, groups repeated Activity history, and marks destructive removal controls clearly.
+
+The latest live upstream scan is intentionally blocked: `llama.cpp v0.7.0` no longer provides the
+expected Windows CPU archive name. Current pins stay unchanged until replacement assets are verified.
+
 ---
 
 ## How to install it
@@ -106,21 +117,21 @@ The supported product boundary and interface decisions are recorded in
 
 ### Every time after that
 
-Launch Model Pilot from the Start Menu or Desktop shortcut and press **Start** again. It skips
-everything that's already installed, so it just brings the servers up — a few seconds, not minutes.
-Closing the panel window doesn't shut anything down. It minimises to an icon in the system tray and
-your models keep serving. To actually stop everything, right-click that tray icon and choose Stop.
+Launch Model Pilot from the Start Menu or Desktop shortcut. Home presents the one next action, such
+as **Start services**, and skips everything already installed—seconds rather than minutes. Closing
+the panel window doesn't shut anything down. It minimises to an icon in the system tray and your
+models keep serving. To actually stop everything, right-click that tray icon and choose Stop.
 
 ### If something goes wrong
 
 Downloads and start-up write to the `logs` folder, and the **Activity** tab shows the same output
-live. Uninstalling the setup removes its launcher and shortcuts, but deliberately leaves the stack,
-including an optional ComfyUI installation, model weights, configuration, chats and logs in place.
-To remove downloaded components and local
-chat data, use **Settings → Remove parts of the install → Everything** in the panel. That reset also
-removes optional ComfyUI models, inputs, outputs and user settings. The model-weight checkbox applies
-only to `llama.cpp\models` inside this Model Pilot installation; a model folder you selected elsewhere
-is always kept.
+live. Uninstalling the setup first stops Model Pilot's local services, panel and tray, then removes
+its launcher and shortcuts. It deliberately leaves the downloaded stack, including an optional
+ComfyUI installation, model weights, configuration, chats and logs in place. To remove downloaded
+components and local chat data, use **Settings → Remove parts of the install → Everything** in the
+panel. That reset also removes optional ComfyUI models, inputs, outputs and user settings. The
+model-weight checkbox applies only to `llama.cpp\models` inside this Model Pilot installation; a
+model folder you selected elsewhere is always kept.
 
 ### Getting help
 

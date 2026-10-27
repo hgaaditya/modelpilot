@@ -15,10 +15,10 @@ The local API endpoints remain available under **More → System** for advanced 
 
 ## Interface priorities
 
-- **Home** shows one state-driven next action: set up, start, choose a model, verify a response, or open chat.
-- **Models** defaults to an everyday-chat recommendation. Existing GGUF import and manual source entry are secondary paths.
-- **Activity** explains long-running work.
-- **Settings** owns updates, private backups, restore, preflight, redacted diagnostics, storage, and startup behavior.
+- **Home** shows one state-driven next action: set up, start, choose a model, verify a response, or open chat. Service maintenance remains outside Home.
+- **Models** starts with an explicit choice between everyday-chat recommendations and registering an existing GGUF; manual source entry remains secondary.
+- **Activity** explains long-running work and groups equivalent completed jobs while retaining technical details on demand.
+- **Settings** owns updates, private backups, restore, preflight, redacted diagnostics, storage, startup behavior, and clearly separated removal actions.
 - **System** and **Monitoring** are advanced views under More; technical implementation names stay out of normal setup copy.
 
 ## Recovery contract

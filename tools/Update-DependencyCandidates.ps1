@@ -1,13 +1,21 @@
 [CmdletBinding()]
 param(
     [switch]$Apply,
-    [switch]$Json
+    [switch]$Json,
+    [string]$CandidateVersion
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $headers = @{ 'User-Agent' = 'model-pilot-dependency-check' }
 if ($env:GITHUB_TOKEN) { $headers.Authorization = "Bearer $env:GITHUB_TOKEN" }
+
+if ($CandidateVersion -and -not $Apply) {
+    throw 'CandidateVersion requires -Apply.'
+}
+if ($CandidateVersion -and $CandidateVersion -notmatch '^\d+\.\d+\.\d+-deps\.\d+$') {
+    throw "CandidateVersion must be a dependency prerelease such as 0.1.17-deps.123. Got '$CandidateVersion'."
+}
 
 function Get-LatestNode22 {
     $text = (Invoke-WebRequest -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing).Content
@@ -65,8 +73,8 @@ $assetError = $null
 try { Test-ReleaseAssets $candidates } catch { $assetError = $_.Exception.Message }
 if ($assetError) {
     $result = [ordered]@{ changed = $false; changes = @(); pins = $pins; candidates = $candidates; blocked = $assetError }
-    if ($Json) { $result | ConvertTo-Json -Depth 6 -Compress } else { Write-Warning "No PR created: $assetError" }
-    return
+    if ($Json) { $result | ConvertTo-Json -Depth 6 -Compress }
+    throw "No PR created: $assetError"
 }
 
 $changes = @()
@@ -74,6 +82,9 @@ foreach ($key in 'llamaCpp', 'llamaSwap', 'openWebUI', 'node', 'uv', 'llmfit') {
     if ($pins[$key] -ne $candidates[$key]) { $changes += [ordered]@{ component = $key; from = $pins[$key]; to = $candidates[$key] } }
 }
 if ($Apply -and $changes.Count) {
+    if ($CandidateVersion) {
+        [IO.File]::WriteAllText((Join-Path $root 'VERSION'), $CandidateVersion + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    }
     $path = Join-Path $root 'start.ps1'
     $text = Get-Content $path -Raw
     foreach ($change in $changes) {

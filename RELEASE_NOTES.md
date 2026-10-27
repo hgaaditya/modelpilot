@@ -1,3 +1,17 @@
+# Unreleased development status
+
+- Dependency scans now prepare a next-patch `-deps.<run>` installer artifact for offline Windows/GPU
+  testing. They do not create tags or GitHub Releases.
+- Fresh setup now adds its downloaded private Node runtime to the frontend build process, so the
+  Open WebUI build does not depend on Node or npm already being installed on Windows.
+- The installer uninstaller now stops the local stack, panel and tray before it removes launcher
+  files. Downloaded runtimes, models and local data remain intact.
+- Home is a single four-step path: set up, choose a model, test a real response, then open chat.
+  Start, stop and restart no longer compete with that path in the header; maintenance remains in
+  **More → System** and the tray.
+- Models separates recommended downloads from existing-GGUF import; Activity groups equivalent
+  completed jobs; Settings visually separates removal actions.
+
 # Model Pilot 0.1.16
 
 ## Simpler everyday workflow
