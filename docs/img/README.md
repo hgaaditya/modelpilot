@@ -1,11 +1,10 @@
-# README images
+# Optional README screenshots
 
-`model-pilot-path.svg` is the checked-in visual for the public README. It shows the supported
-four-step path: start the local services, choose or import a GGUF, verify a real response, then
-open local chat.
+The public README uses a GitHub-rendered diagram for the supported four-step path: start the local
+services, choose or import a GGUF, verify a real response, then open local chat.
 
-Optional product screenshots can be added here later when they are captured from a representative
-local installation:
+Product screenshots can be added here later when they are captured from a representative local
+installation:
 
 | File | What to capture |
 | --- | --- |

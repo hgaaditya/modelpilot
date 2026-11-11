@@ -17,8 +17,12 @@
 
 ## Your first local model
 
-<img src="docs/img/model-pilot-path.svg" width="960" alt="Four steps in Model Pilot: start local services, choose a model, verify a real response, then open local chat.">
-
+```mermaid
+flowchart LR
+  start["1. Start<br/>Set up local services"] --> choose["2. Choose<br/>Find or import a GGUF"]
+  choose --> verify["3. Verify<br/>Get a real response"]
+  verify --> chat["4. Chat<br/>Open a private local UI"]
+```
 Model Pilot is a Windows desktop control panel for a local chat stack. It installs per user, keeps its runtime private to its install folder, and gives you **one next step** instead of a pile of services to connect.
 
 | You want to… | Model Pilot does |
