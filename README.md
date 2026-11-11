@@ -17,12 +17,10 @@
 
 ## Your first local model
 
-```mermaid
-flowchart LR
-  start["1. Start<br/>Set up local services"] --> choose["2. Choose<br/>Find or import a GGUF"]
-  choose --> verify["3. Verify<br/>Get a real response"]
-  verify --> chat["4. Chat<br/>Open a private local UI"]
-```
+<p align="center">
+  <img src="docs/img/dashboard.png" width="960" alt="The Model Pilot Home screen with local model and chat services running, a guided next action, and this PC's available memory.">
+</p>
+
 Model Pilot is a Windows desktop control panel for a local chat stack. It installs per user, keeps its runtime private to its install folder, and gives you **one next step** instead of a pile of services to connect.
 
 | You want to… | Model Pilot does |
@@ -69,6 +67,10 @@ Open **Models** and choose one of two paths:
 - **Find models on your drive** — register existing GGUF weights without moving them.
 
 When a model is ready, Home offers **Test a real response**. It may cold-load the model, then shows the result or the specific failure. Open chat when that test succeeds.
+
+<p align="center">
+  <img src="docs/img/models.png" width="960" alt="The Model Pilot Models screen showing the recommended-model and existing-GGUF source selector, plus real hardware-fit recommendations.">
+</p>
 
 ---
 
@@ -125,6 +127,10 @@ Phones, tablets, macOS, and Linux are not supported install targets.
 | **More → Monitoring** | Live GPU/CPU sensor readings while the view is open. |
 
 Closing the panel minimizes it to the system tray; active models keep serving. To stop everything, use the tray menu’s **Stop** command.
+
+<p align="center">
+  <img src="docs/img/monitoring.png" width="960" alt="The Model Pilot Monitoring screen showing current, minimum, maximum, and average local hardware sensor readings.">
+</p>
 
 <details>
 <summary><strong>Recovery, removal, and privacy details</strong></summary>
