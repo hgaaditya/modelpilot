@@ -103,6 +103,13 @@ param(
     [string]$UseCase,
     [string]$Capability = 'any',
 
+    # suggest: match the panel's initial "recommended" result set, then allow its explicit
+    # "Include tighter fits" action to lower this to marginal.
+    [ValidateSet('perfect', 'good', 'marginal')]
+    [string]$MinFit = 'good',
+    [ValidateRange(1, 50)]
+    [int]$Top = 8,
+
     # suggest: machine-readable, for the control panel.
     [switch]$Json,
 
