@@ -734,10 +734,9 @@ input[type=checkbox]{accent-color:var(--acc)}
 .subtle-list{margin-top:12px}
 .download-box{padding:12px;margin:12px 0;background:#f8faff;border:1px solid var(--line);border-radius:9px}
 .subtle,.note{color:var(--dim);font-size:12px}
-.model-choice{display:flex;align-items:center;justify-content:space-between;gap:16px}.model-choice h2{margin:0}.model-choice p{margin:3px 0 0}.model-choice .row{flex-shrink:0}.acquisition-path[hidden]{display:none}.danger-zone{border-color:#ecc8ca;background:#fffafa}.danger-zone legend{color:var(--bad)}.danger-zone .hint{background:#fff3f3;border-color:#ecc8ca;color:#6c2730}
-@media(max-width:760px){header{padding:8px 12px;gap:8px}header .gh,header .act{padding:6px 7px;font-size:12px}header .header-secondary{display:none}main{padding:18px 14px 32px}.home-grid{grid-template-columns:1fr}.section-head{align-items:flex-start}.hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%}nav{padding:7px 10px;overflow:visible}nav button,nav summary{padding:8px 9px}.service-card{grid-template-columns:1fr}.service-meta{grid-column:1}.service-card .service-choice{grid-column:1}.model-choice{align-items:flex-start;flex-direction:column}.model-choice .row{width:100%}.model-choice button{flex:1}}
+.model-choice{display:flex;align-items:center;justify-content:space-between;gap:16px}.model-choice h2{margin:0}.model-choice p{margin:3px 0 0}.model-path-tabs{display:flex;flex-shrink:0;padding:3px;background:var(--soft);border:1px solid var(--line);border-radius:10px}.model-path-tab{min-height:36px;padding:7px 13px;background:transparent;border:0;border-radius:7px;color:var(--dim);font:600 13px/1.2 inherit;cursor:pointer}.model-path-tab:hover{color:var(--fg)}.model-path-tab[aria-selected="true"]{background:var(--panel);color:var(--acc);box-shadow:0 1px 3px rgba(26,42,74,.12)}.acquisition-path[hidden]{display:none}.danger-zone{border-color:#ecc8ca;background:#fffafa}.danger-zone legend{color:var(--bad)}.danger-zone .hint{background:#fff3f3;border-color:#ecc8ca;color:#6c2730}
+@media(max-width:760px){header{padding:8px 12px;gap:8px}header .gh,header .act{padding:6px 7px;font-size:12px}header .header-secondary{display:none}main{padding:18px 14px 32px}.home-grid{grid-template-columns:1fr}.section-head{align-items:flex-start}.hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%}nav{padding:7px 10px;overflow:visible}nav button,nav summary{padding:8px 9px}.service-card{grid-template-columns:1fr}.service-meta{grid-column:1}.service-card .service-choice{grid-column:1}.model-choice{align-items:flex-start;flex-direction:column}.model-path-tabs{width:100%}.model-path-tab{flex:1}.import-table{display:block;width:100%}.import-table thead{display:none}.import-table tbody{display:block;width:100%}.import-table tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:12px 0;border-bottom:1px solid var(--line)}.import-table td{display:block;min-width:0;padding:0 2px}.import-table td:first-child{grid-column:1/-1}.import-table td:first-child .subtle{overflow-wrap:anywhere;word-break:break-word;white-space:normal}.import-table td:nth-child(2){grid-column:1}.import-table td:nth-child(3){grid-column:2;max-width:100%;text-align:right}.import-table .miss{display:block;max-width:100%;overflow-wrap:anywhere}}
 @media(max-width:760px){.hero-actions{max-width:none;min-width:0}}
-@media(max-width:760px){.import-table{display:block;width:100%}.import-table thead{display:none}.import-table tbody{display:block;width:100%}.import-table tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:12px 0;border-bottom:1px solid var(--line)}.import-table td{display:block;min-width:0;padding:0 2px}.import-table td:first-child{grid-column:1/-1}.import-table td:first-child .subtle{overflow-wrap:anywhere;word-break:break-word;white-space:normal}.import-table td:nth-child(2){grid-column:1}.import-table td:nth-child(3){grid-column:2;max-width:100%;text-align:right}.import-table .miss{display:block;max-width:100%;overflow-wrap:anywhere}}
 @media(max-width:760px){#modelTable{display:block;width:100%;min-width:0}#modelTable thead{display:none}#modelTable tbody{display:block;width:100%}#modelTable tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:11px 0;border-bottom:1px solid var(--line)}#modelTable td{display:block;min-width:0;padding:2px 0}#modelTable td.adv{display:none}#modelTable td:first-child{grid-column:1;overflow-wrap:anywhere}#modelTable td:nth-child(2){display:none}#modelTable td:nth-child(3){grid-column:1;color:var(--dim);font-size:12px}#modelTable td:nth-child(9){grid-column:2;grid-row:1;white-space:nowrap}#modelTable td:nth-child(10){grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px}#modelTable td:nth-child(10) button{font-size:11px;padding:6px 8px}}
 /* Anything slow gets a card in the corner saying what is happening, how long it usually takes,
    and its latest line of output. Every long action already routes through spin(), so the card is
@@ -857,8 +856,8 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
 
 <div class="pane" id="p2">
  <div class="section-head"><div><h1>Models</h1><p>Choose a model that fits this PC, or add one you already downloaded.</p></div></div>
- <section class="surface model-choice"><div><h2>Add a model</h2><p>Choose one path now. You can manage configured models below.</p></div><div class="row"><button class="act" id="recommendChoice" aria-pressed="true" onclick="modelPath('recommend')">Find a recommended model</button><button class="gh" id="importChoice" aria-pressed="false" onclick="modelPath('import')">I already have a GGUF</button></div></section>
- <section class="surface picker acquisition-path" id="recommendPath">
+ <section class="surface model-choice"><div><h2>Add a model</h2><p>Choose one path now. You can manage configured models below.</p></div><div class="model-path-tabs" role="tablist" aria-label="Model source"><button class="model-path-tab" id="recommendChoice" role="tab" aria-selected="true" aria-controls="recommendPath" tabindex="0" onclick="modelPath('recommend')" onkeydown="modelPathKeydown(event,'recommend')">Find a recommended model</button><button class="model-path-tab" id="importChoice" role="tab" aria-selected="false" aria-controls="importPath" tabindex="-1" onclick="modelPath('import')" onkeydown="modelPathKeydown(event,'import')">I already have a GGUF</button></div></section>
+ <section class="surface picker acquisition-path" id="recommendPath" role="tabpanel" aria-labelledby="recommendChoice">
   <div class="eyebrow">START HERE</div><h2>Find a model for this PC</h2>
   <p>We rank models against the memory available on this PC. Review the download size before choosing.</p>
   <div class="row">
@@ -870,7 +869,7 @@ table.ep .note{color:var(--dim);font-size:11px;margin-top:1px}
   </div>
   <div id="sug"></div>
  </section>
- <div class="home-grid model-tools acquisition-path" id="importPath" hidden>
+ <div class="home-grid model-tools acquisition-path" id="importPath" role="tabpanel" aria-labelledby="importChoice" hidden>
   <section class="surface"><div class="eyebrow">ALREADY DOWNLOADED?</div><h2>Find models on your drive</h2>
    <p>Choose a folder and scan for GGUF files. Adding one creates a model entry with 16k context and q8_0 KV defaults; the file stays where it is and is never copied or moved. Tune can measure settings for this PC later.</p>
    <div class="row"><button class="gh" onclick="browseDir()">Choose model folder</button><button class="gh" id="scanModelsBtn" onclick="scanModels()">Scan folder</button></div>
@@ -1093,8 +1092,14 @@ function modelPath(path){
  document.getElementById('recommendPath').hidden=!recommendation;
  document.getElementById('importPath').hidden=recommendation;
  const rec=document.getElementById('recommendChoice'),imp=document.getElementById('importChoice');
- rec.className=recommendation?'act':'gh';imp.className=recommendation?'gh':'act';
- rec.setAttribute('aria-pressed',String(recommendation));imp.setAttribute('aria-pressed',String(!recommendation));
+ rec.setAttribute('aria-selected',String(recommendation));imp.setAttribute('aria-selected',String(!recommendation));
+ rec.tabIndex=recommendation?0:-1;imp.tabIndex=recommendation?-1:0;
+}
+function modelPathKeydown(event,path){
+ if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+ event.preventDefault();
+ const next=event.key==='Home'||event.key==='ArrowLeft'?'recommend':'import';
+ modelPath(next);document.getElementById(next==='recommend'?'recommendChoice':'importChoice').focus();
 }
 // ---- sensors (Monitoring tab)
 let MON={},monTimer=null,monN=0;
