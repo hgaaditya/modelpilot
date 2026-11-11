@@ -2,12 +2,10 @@
 
 ## Decision
 
-Model Pilot automates discovery, review preparation, and an offline-test installer build. It does not
-adopt runtime updates or publish a release automatically.
-
-The updater may create or refresh one dependency-candidate pull request. It advances the next patch
-version to a `-deps.<run>` prerelease and builds its installer artifact. A maintainer must run that
-installer on trusted Windows/GPU hardware, then prepare the final version and create its tag.
+Model Pilot automates discovery, review preparation, and offline-test installer builds. A normal
+branch merge never publishes a product release. After a maintainer completes the hardware gate, they
+start the protected **publish Model Pilot release** workflow from `master`; its explicit approval
+builds the installer, creates the matching version tag, and publishes the GitHub Release.
 
 This boundary is deliberate. Hosted GitHub runners can parse PowerShell, build the installer, and
 validate upstream release metadata, but cannot prove model loading, GPU placement, VRAM headroom,
@@ -63,12 +61,21 @@ Do not run this gate from a fork-triggered workflow or a general-purpose self-ho
 personal chats, credentials, or normal user model data.
 
 ## Publishing a product release
+
+Before using the publish workflow, a repository administrator creates the `production-release`
+GitHub Environment, restricts it to `master`, and configures the required reviewers. That environment
+is the approval button: a workflow run waits there until a reviewer approves it.
+
 After offline acceptance:
 
-1. Merge the dependency candidate pull request.
+1. Merge the dependency candidate pull request, if the release includes one.
 2. Open a release-preparation change that turns `X.Y.(Z+1)-deps.<run>` into `X.Y.(Z+1)`, updates
    release notes, and regenerates the manifest.
-3. Merge that change after normal CI.
-4. A maintainer creates the matching `vX.Y.Z` tag.
-5. The tag workflow builds the installer, checksum, and manifest, then publishes the GitHub Release.
-A merge to `master` is never a public release by itself.
+3. Merge that change to `master` after normal CI.
+4. In **Actions**, run **publish Model Pilot release** on `master`.
+5. Approve the waiting `production-release` environment deployment.
+
+The workflow refuses a non-`master` ref, a prerelease `VERSION`, a mismatched manifest, missing
+versioned release notes, or an existing tag. After approval it builds the installer and checksum,
+uploads a retained workflow artifact, creates `vX.Y.Z` on the approved commit, and publishes the
+GitHub Release with the installer, checksum, and supply-chain manifest.

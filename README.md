@@ -185,7 +185,7 @@ The distributable setup file is `installer\output\Model-Pilot-Setup.exe`.
 
 ## Status and support
 
-The latest public release is **0.1.16**. This branch contains the next development candidate, **0.1.17**; it is not a public release until a maintainer completes offline Windows/GPU acceptance testing and creates a version tag. Dependency scans may produce candidate artifacts, but never create a product tag or GitHub Release on their own.
+The latest public release is **0.1.16**. This branch contains the next development candidate, **0.1.17**. A merge to `master` is not a public release: after offline Windows/GPU acceptance, a maintainer starts the approval-gated **publish Model Pilot release** workflow from `master`. Its protected approval builds the installer, creates the matching version tag, and publishes the GitHub Release. Dependency scans continue to create candidate artifacts only.
 
 For supported product boundaries and interface decisions, see [Product scope](docs/PRODUCT_SCOPE.md). For exact model support guarantees, see [Model support](MODEL_SUPPORT.md).
 

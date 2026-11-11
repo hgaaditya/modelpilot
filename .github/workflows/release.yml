@@ -1,14 +1,13 @@
 name: release artifacts
 
 # A dependency-candidate branch produces a downloadable prerelease installer for offline testing.
-# Only an explicit v* tag creates a GitHub Release, so candidate builds cannot publish accidentally.
+# The approval-gated publish-release workflow creates product tags and GitHub Releases from master.
 on:
   push:
     branches:
       - 'release/**'
       - 'version/**'
       - 'automation/dependency-candidates'
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -92,28 +91,3 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
           retention-days: 30
-
-  publish-github-release:
-    name: Publish tagged GitHub Release
-    needs: build-windows-installer
-    if: github.ref_type == 'tag'
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Download installer candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: model-pilot-${{ needs.build-windows-installer.outputs.version }}
-          path: release-assets
-
-      - name: Publish setup EXE and checksum
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
-            release-assets/Model-Pilot-Setup.exe
-            release-assets/SHA256SUMS.txt
-            release-assets/supply-chain.json
-          body_path: RELEASE_NOTES.md
