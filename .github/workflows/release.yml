@@ -77,7 +77,7 @@ jobs:
           $installer = 'installer\output\Model-Pilot-Setup.exe'
           if (-not (Test-Path $installer)) { throw 'Installer output was not created.' }
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  Model-Pilot-Setup.exe" | Set-Content installer\output\SHA256SUMS.txt -Encoding ascii
+          "$hash *Model-Pilot-Setup.exe" | Set-Content installer\output\SHA256SUMS.txt -Encoding ascii
 
       - name: Stage release assets
         shell: pwsh

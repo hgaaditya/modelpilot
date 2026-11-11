@@ -1,289 +1,194 @@
+<div align="center">
+
 # Model Pilot
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078d4)
-![No Docker](https://img.shields.io/badge/Docker-not%20required-lightgrey)
+**Private local AI on Windows, without assembling the stack yourself.**
 
-**One Windows desktop app to install, connect and run your local AI stack.**
-Model Pilot brings the inference engine, model router, chat interface and hardware-fit recommender
-together so you can use local models without wiring the components together yourself. You choose what
-to download and can tune it for this PC. Inference and chat history stay local by default; runtime and
-model downloads come from their upstream sources.
+[![Latest release](https://img.shields.io/github/v/release/hgaaditya/modelpilot?display_name=tag&sort=semver&style=flat-square&label=release)](https://github.com/hgaaditya/modelpilot/releases/latest)
+[![Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?style=flat-square)](https://github.com/hgaaditya/modelpilot/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square)](LICENSE)
+[![No Docker](https://img.shields.io/badge/Docker-not%20required-555?style=flat-square)](#what-you-need)
 
-**The installable control-panel product targets Windows 10/11 desktop only.** PowerShell itself is cross-platform, and parts of the backend include macOS Apple Silicon support; that does not make the Windows installer, panel or tray a supported macOS product. Phones and tablets are not supported targets.
+[**Download for Windows**](https://github.com/hgaaditya/modelpilot/releases/latest) · [How it works](#your-first-local-model) · [Use an existing model](#bring-your-own-gguf) · [Advanced setup](#advanced)
 
-**Install it, double-click one file, press Start.** The installer is per-user by default: no admin
-rights, no PATH changes, and a standard per-user Windows uninstall entry.
-
-The setup EXE contains the launcher and project scripts only, not the large runtime or model
-weights. The stack downloads its dependencies the first time you press **Start**.
-
-<!-- SCREENSHOT: the control panel's Dashboard tab, full window.
-     Suggested filename: docs/img/dashboard.png  (~1040x720, the panel's native size) -->
-![The Model Pilot control panel](docs/img/dashboard.png)
-
-## Development status
-
-`0.1.16` remains the latest public release. The default branch contains unreleased work that:
-
-- prepares a next-patch `-deps.<run>` installer artifact when a compatible upstream dependency update is found;
-- never creates a product tag or GitHub Release until a maintainer completes offline Windows/GPU testing;
-- keeps Home to one state-driven action, separates recommended-model and existing-GGUF paths, groups repeated Activity history, and marks destructive removal controls clearly.
-
-The latest live upstream scan is intentionally blocked: `llama.cpp v0.7.0` no longer provides the
-expected Windows CPU archive name. Current pins stay unchanged until replacement assets are verified.
+</div>
 
 ---
 
-## How to install it
+## Your first local model
 
-### 1. Download and run the setup EXE
+<img src="docs/img/model-pilot-path.svg" width="960" alt="Four steps in Model Pilot: start local services, choose a model, verify a real response, then open local chat.">
 
-> **Release status:** `0.1.16` is an unsigned public Model Pilot release.
-> Windows may show an **Unknown Publisher** or SmartScreen warning. Continue only when you downloaded
-> the installer from this project's Releases page and its SHA-256 matches the attached
-> `SHA256SUMS.txt`; neither check establishes publisher identity.
+Model Pilot is a Windows desktop control panel for a local chat stack. It installs per user, keeps its runtime private to its install folder, and gives you **one next step** instead of a pile of services to connect.
 
-Download `Model-Pilot-Setup.exe` and `SHA256SUMS.txt` from the project's Releases page and run the
-installer. It installs into your user's Local AppData by default and offers Start Menu and optional
-Desktop shortcuts.
+| You want to… | Model Pilot does |
+| --- | --- |
+| Run a model without learning the plumbing | Downloads and starts the local runtime when you press **Start**. No Docker, WSL, Python, Node, PATH edits, or administrator access. |
+| Pick a model that fits this PC | Shows hardware-fit recommendations with quantisation, approximate download size, estimated speed, and trained context. |
+| Use weights you already have | Scans a folder for GGUF files and registers the original path. It never copies, moves, or deletes your files. |
+| Know that it actually works | Sends a short real completion through the local router before you open chat. |
+| Keep control of local data | Models, configuration, and chat data stay local by default. Diagnostics are redacted; backups remain on your machine. |
 
-Upgrades from the earlier LocalLLM-branded build keep the existing `%LOCALAPPDATA%\LocalLLM`
-installation folder in place so models, configuration and chat data do not need to move. The
-shortcuts and installed-app display use the **Model Pilot** name.
+### 1. Install
 
-The installer does not bundle the runtime; pressing **Start** in the panel downloads and sets up
-the stack on first launch.
+1. Open the [latest release](https://github.com/hgaaditya/modelpilot/releases/latest).
+2. Download **`Model-Pilot-Setup.exe`** and **`SHA256SUMS.txt`**.
+3. Verify the download, then run the setup EXE. It creates Start Menu and optional Desktop shortcuts.
+4. Launch **Model Pilot** and press **Start**.
 
-To build the installer yourself, install **Inno Setup 6** and run this from the repository root:
+> [!IMPORTANT]
+> Releases are currently **unsigned**. Windows may show an Unknown Publisher or SmartScreen warning. Download only from this repository’s Releases page and verify the EXE against its attached `SHA256SUMS.txt`. A checksum detects corruption or alteration only when you obtained the checksum from a trusted release page; it does not establish publisher identity.
+
+<details>
+<summary><strong>Verify the download in PowerShell</strong></summary>
+
+```powershell
+Get-FileHash .\Model-Pilot-Setup.exe -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+```
+
+Compare the hash values. The checksum file uses the standard `sha256sum` format, so it can also be checked by compatible tooling.
+
+</details>
+
+### 2. Let it prepare the local stack
+
+The installer contains Model Pilot’s launcher and scripts, not the large runtime or model weights. The first **Start** downloads the pinned components from their upstream sources, takes roughly 20–30 minutes on a normal connection, and uses about 4 GB before model weights.
+
+Nothing preinstalled is required. Model Pilot fetches private copies of what it needs into its install folder and does not modify the Python or Node installation already on your machine.
+
+### 3. Choose, verify, chat
+
+Open **Models** and choose one of two paths:
+
+- **Find models** — recommendations for everyday local chat, ranked for your hardware.
+- **Find models on your drive** — register existing GGUF weights without moving them.
+
+When a model is ready, Home offers **Test a real response**. It may cold-load the model, then shows the result or the specific failure. Open chat when that test succeeds.
+
+---
+
+## The part that usually goes wrong
+
+A local model is not one download. It is a set of decisions: which quantisation fits, how much context the machine can afford, whether the server is healthy, and whether a configuration still points at a real file.
+
+Model Pilot owns that boring middle layer:
+
+| Instead of… | You get… |
+| --- | --- |
+| Guessing which model might fit | Hardware-fit recommendations and explicit estimates before the download. |
+| Finding a server error after opening chat | A guided real-response check through the same local router chat uses. |
+| Rebuilding configuration after every experiment | A visible model list, health checks, and validation against files on disk. |
+| Losing a working setup to an update | In-panel update, readiness checks, local backup/restore, and redacted diagnostics. |
+
+The supported everyday path stays deliberately small: **start services → choose a model → verify one response → chat**. System controls and hardware monitoring stay available under **More** when you need them.
+
+---
+
+## Bring your own GGUF
+
+Already have a model folder? Model Pilot can use it in place.
+
+1. Go to **Models → Find models on your drive**.
+2. Select the folder containing your GGUF files.
+3. Choose **Scan folder**.
+4. Review the discovered files and select **Add to Models**.
+
+The original file remains where it is. Already-registered weights are hidden from the scan, duplicate model IDs are surfaced as conflicts, and an inaccessible folder is reported as incomplete rather than silently treated as empty.
+
+---
+
+## What you need
+
+- **Windows 10 or 11 desktop.** The installer, panel, and tray are Windows-only.
+- **Disk space:** about 4 GB for the runtime after first setup, plus model weights—commonly 2–20 GB each.
+- **Hardware:** an NVIDIA GPU is recommended for useful speed. CPU-only works, but is slow. Exact model fit depends on VRAM, quantisation, context length, and what else is running.
+- **Nothing else.** No Docker, WSL, Python, Node, package manager, or administrator account required.
+
+Phones, tablets, macOS, and Linux are not supported install targets.
+
+---
+
+## Everyday controls
+
+| Where | What it is for |
+| --- | --- |
+| **Home** | The one next step: setup, start, choose a model, test a response, or open chat. |
+| **Models** | Recommended downloads, existing-GGUF registration, and model availability. |
+| **Activity** | Progress and history for long-running work, with technical details on demand. |
+| **Settings** | Updates, backups, restore, readiness checks, diagnostics, storage, and startup. |
+| **More → System** | Local service details and compatible API endpoints. |
+| **More → Monitoring** | Live GPU/CPU sensor readings while the view is open. |
+
+Closing the panel minimizes it to the system tray; active models keep serving. To stop everything, use the tray menu’s **Stop** command.
+
+<details>
+<summary><strong>Recovery, removal, and privacy details</strong></summary>
+
+- **Backups** include Model Pilot configuration, panel preferences, and Open WebUI data. They exclude weights, logs, download caches, and runtime binaries. Store them privately: they can contain session data.
+- **Diagnostics** are designed to exclude chats, prompts, logs, local paths, usernames, machine name, tokens, model names, and weights. Review every archive before sharing it.
+- **Uninstall** stops Model Pilot’s local services, panel, and tray before removing the launcher and shortcuts. It deliberately retains downloaded runtime, models, configuration, chats, and logs.
+- To remove downloaded components and local chat data, use **Settings → Remove parts of the install → Everything**. Model folders outside the Model Pilot installation are always retained.
+
+</details>
+
+---
+
+## Advanced
+
+### Use the local models from another tool
+
+Model Pilot’s local router exposes OpenAI- and Anthropic-compatible API shapes on the same port. Use the literal IPv4 address, not `localhost`: Windows can resolve `localhost` to IPv6 first while these services bind IPv4 only.
+
+```text
+http://127.0.0.1:9292/v1/chat/completions    OpenAI-compatible
+http://127.0.0.1:9292/v1/messages            Anthropic-compatible
+```
+
+The **Engine** view lists the active endpoints and ready model IDs. These endpoints are for compatible clients; Model Pilot does not install, configure, update, or support external coding-agent CLIs.
+
+### Use the terminal when you mean to
+
+For everyday use, start and stop from Home or the tray. Advanced maintenance and model operations remain available through PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action status
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action test-model -Id 'your-model-id'
+```
+
+Other maintenance actions include `upgrade`, `autotune`, `bench`, `check-config`, `check-ui`, `suggest`, `install-llmfit`, `install-prism`, `autostart`, and `uninstall`.
+
+<details>
+<summary><strong>Build the installer from source</strong></summary>
+
+Install **Inno Setup 6**, then run this from the repository root:
 
 ```powershell
 ISCC.exe installer\ModelPilot.iss
 ```
 
-The generated `installer\output\Model-Pilot-Setup.exe` is the distributable setup file.
+The distributable setup file is `installer\output\Model-Pilot-Setup.exe`.
 
-### 2. Launch Model Pilot
-
-Use the Start Menu shortcut (or the optional Desktop shortcut). The launcher opens the control
-panel, where you can press **Start** to download and install the runtime.
-
-The first setup downloads about **850 MB** and unpacks to roughly **4 GB** on disk, most of which
-is the chat UI's Python dependencies. Budget **20-30 minutes** on a normal connection. You only
-ever do this once.
-
-You don't need Python, Node, Docker, WSL, or a package manager. If they're missing, it fetches its
-own private copies into the install folder. It never touches anything you already have installed.
-
-**Then pick a model.** Go to **Models** and press **Find models**. Recommendations show llmfit's
-hardware-fit rating, quantisation, approximate download size, estimated speed and trained context.
-These are estimates, not a promise of a successful load or benchmark; the chosen context may need
-tuning for this PC. If there are no matches, relax a filter or scan for weights you already have.
-The recommender is powered by optional **llmfit** (~5 MB to download). If it is missing, the panel offers to install it; chat and scanning existing files work without it.
-
-To use existing weights, go to **Models → Find models on your drive**. Choose their folder and
-press **Scan folder**. **Add to Models** adds a config entry at the existing path; it does not copy,
-move or delete the file. Registered files are hidden from the scan. A filename that would duplicate
-an existing model id is shown as a conflict instead of being added. If the folder is missing or
-cannot be read, the panel reports an incomplete scan and asks you to choose an available folder or
-check its access permissions; it does not present that scan as complete. New downloads go to the
-selected folder.
-
-When a model is present and llama-swap is running, Home offers **Test a real response**. It sends one
-short completion, may cold-load the model and shows the reply and any failure. This proves only that
-inference returned text; it does not assess accuracy or usefulness. Use **Open chat** to judge the
-model on your own tasks.
-
-**Updates and recovery.** Settings checks GitHub automatically for a newer Model Pilot release. When
-one is available, **Update now** downloads the release installer, verifies its SHA-256 against the
-attached checksum, preserves models/chats/settings, and restarts the panel. The same page can run a
-disk/RAM/accelerator readiness check, create a local ZIP backup, restore one of those backups, and
-create a redacted diagnostics ZIP for support. Backups deliberately exclude GGUF weights, logs and
-download caches; the ZIP includes session data, so store it privately.
-
-The Models table distinguishes a configured model from one that has returned text through the local
-router. See the [model support contract](MODEL_SUPPORT.md) for the precise boundary.
-
-**Home** guides you through the next needed step: set up the local services, choose a model, test a
-real response, then open chat. Long-running work appears under **Activity**. Component details and
-hardware monitoring are under **More → System** and **More → Monitoring**.
-
-The supported product boundary and interface decisions are recorded in
-[docs/PRODUCT_SCOPE.md](docs/PRODUCT_SCOPE.md).
-
-<!-- SCREENSHOT: the Models page showing recommendations and the model-folder scanner.
-     Suggested filename: docs/img/models.png -->
-![Choosing and managing models](docs/img/models.png)
-
-### Every time after that
-
-Launch Model Pilot from the Start Menu or Desktop shortcut. Home presents the one next action, such
-as **Start services**, and skips everything already installed—seconds rather than minutes. Closing
-the panel window doesn't shut anything down. It minimises to an icon in the system tray and your
-models keep serving. To actually stop everything, right-click that tray icon and choose Stop.
-
-### If something goes wrong
-
-Downloads and start-up write to the `logs` folder, and the **Activity** tab shows the same output
-live. Uninstalling the setup first stops Model Pilot's local services, panel and tray, then removes
-its launcher and shortcuts. It deliberately leaves the downloaded stack, including an optional
-ComfyUI installation, model weights, configuration, chats and logs in place. To remove downloaded
-components and local chat data, use **Settings → Remove parts of the install → Everything** in the
-panel. That reset also removes optional ComfyUI models, inputs, outputs and user settings. The
-model-weight checkbox applies only to `llama.cpp\models` inside this Model Pilot installation; a
-model folder you selected elsewhere is always kept.
-
-### Getting help
-
-This repository is public; use its issue tracker for general support or release questions. The local
-QA candidate is not for end-user distribution. Include the app version, Windows
-version, steps to reproduce and exact error. Review logs or diagnostics before attaching them: they
-can contain computer name, hardware and drive details, event-log text, model names and local paths.
-Redact anything identifying; do not attach weights, secrets or chat history unless you have
-deliberately checked and need to share it. For security vulnerabilities, follow
-[SECURITY.md](SECURITY.md) instead of posting exploit details publicly.
-
-The repository provides structured bug and installation-recovery reports. Use the panel's **GitHub
-support** link or [open an issue](https://github.com/hgaaditya/modelpilot/issues/new/choose) after
-running the local readiness check; redact the result before posting.
-
+</details>
 
 ---
 
-## Why this exists
+## Status and support
 
-Running a local model is easy. Running one *well* is a pile of fiddly, undocumented decisions —
-which quantisation fits your card, how much context you can afford, how many expert layers to
-push to the CPU, why the model that worked yesterday now returns HTTP 400. This does those for
-you, and it measures rather than guesses.
+The latest public release is **0.1.16**. This branch contains the next development candidate, **0.1.17**; it is not a public release until a maintainer completes offline Windows/GPU acceptance testing and creates a version tag. Dependency scans may produce candidate artifacts, but never create a product tag or GitHub Release on their own.
 
-- **Sizes models to your actual hardware.** Tells you which ones will run *before* you spend an
-  hour downloading one that won't.
-- **Tunes by measurement.** `-Action autotune` loads the model and times it. On the development
-  machine, that setting was the difference between **15 and 47 tokens/sec** — the same model,
-  the same card, one flag.
-- **Never leaves you guessing.** Anything slow says what it is doing, how long it usually takes
-  and how far along it is — a real percentage for downloads, which is the step you spend the most
-  time watching.
-- **Verifies instead of assuming.** Launches are health-checked and model configs are validated
-  against what is actually on disk, so a broken entry is caught before it becomes a connection
-  error mid-chat.
+For supported product boundaries and interface decisions, see [Product scope](docs/PRODUCT_SCOPE.md). For exact model support guarantees, see [Model support](MODEL_SUPPORT.md).
 
-## What you need
+Need help? Use the panel’s **GitHub support** link or [open an issue](https://github.com/hgaaditya/modelpilot/issues/new/choose) with the application version, Windows version, reproduction steps, and exact error. Review logs and diagnostics before attaching them: they may still reveal hardware and drive details. Do not attach weights, secrets, or chat history unless you deliberately intend to share them.
 
-- **Windows 10 or 11.**
-- **An NVIDIA GPU is recommended for useful speed.** CPU-only mode works but is slow. Which models
-  fit depends on available VRAM, quantisation, context length and the rest of this PC; there is no
-  single VRAM threshold that guarantees a particular model.
-- **Disk:** about 4 GB for the stack once installed, plus model weights (2-20 GB each).
-- **Nothing needs to be preinstalled.** No Python, no Node, no Docker, no WSL, no package manager,
-  no admin rights. Python arrives as a private copy inside the install folder (via
-  [uv](https://github.com/astral-sh/uv)); Node is fetched the same way and deleted once the frontend
-  is built. Your existing Python and Node are never touched. **Settings → Remove parts of the
-  install** removes downloaded runtime and local state; model weights in this install are kept unless
-  you select the checkbox. Model folders outside the install are always preserved.
+For a security vulnerability, follow [SECURITY.md](SECURITY.md) instead of posting exploit details publicly.
 
+---
 
-## Monitoring
+## Trust and project details
 
-A GPU-Z style sensor readout — clocks, temperature, power, VRAM, and the memory the inference
-process is actually holding — sampled once a second while the tab is open, and not at all while
-it isn't.
-
-<!-- SCREENSHOT: the Monitoring tab after it has been open long enough to have min/max/avg values.
-     Suggested filename: docs/img/monitoring.png -->
-![Sensor readout](docs/img/monitoring.png)
-
-## If you need a terminal
-
-For normal use, manage Start, Stop and Restart from Home or the tray menu. Direct CLI lifecycle commands are deprecated for end users; the underlying actions remain as internal adapters for the panel/tray and for compatibility. The terminal is for advanced maintenance and model operations:
-
-```bash
-powershell -ExecutionPolicy Bypass -File .\start.ps1
-```
-
-```bash
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action add-model -Model 'unsloth/gpt-oss-20b-GGUF:Q4_K_M'
-```
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action test-model -Id 'your-model-id'
-```
-
-This sends a real short completion through llama-swap, may load the weights, and fails with a
-specific message if the service, model entry or weights are unavailable.
-
-Other maintenance actions include `status`, `upgrade`, `autotune`, `bench`, `check-config`, `check-ui`, `suggest`, `test-model`, `install-llmfit`, `install-prism`, `autostart` and `uninstall`. `status` compares installed and pinned versions; `check-config` validates model configuration. Use the panel for everyday lifecycle control.
-
-To have the stack come back by itself after a restart, tick **Start the stack when I log in** in
-Settings, or:
-
-```bash
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Action autostart
-```
-
-That drops a shortcut in your Startup folder — so it needs no admin rights, and you can switch it
-off again in Task Manager > Startup apps like any other startup item. It starts llama-swap, the
-chat UI and the tray indicator; the control panel stays on demand. `-Action autostart -Remove`
-undoes it, and `uninstall` removes it for you.
-
-## Using the models from other tools
-
-llama-swap serves the OpenAI and Anthropic API shapes on the same port and routes by the `model`
-field, so anything that takes a base URL and a model name works — continue.dev, Zed, aider, a
-shell script. The **Engine** tab lists every endpoint with the model ids that are ready to use.
-
-```
-http://127.0.0.1:9292/v1/chat/completions    OpenAI shape
-http://127.0.0.1:9292/v1/messages            Anthropic shape
-```
-
-Use the literal IP, not `localhost` — on Windows `localhost` can resolve to `::1` first, and these
-servers bind IPv4 only.
-
-## Things worth knowing before you run it
-
-- **The control panel has no password.** It binds `127.0.0.1` and rejects cross-origin requests, so
-  websites you visit can't drive it — but any program running as you on this machine can. It
-  assumes a single-user desktop. See [SECURITY.md](SECURITY.md).
-- **`bench\run.py` can execute code the model writes**, to grade whether that code works. It asks
-  first and skips those tasks unless you agree; nothing runs code because you started a benchmark.
-- Model Pilot does not add a telemetry or analytics service. First-run setup and optional installs
-  contact component distributors and package indexes to fetch runtimes and dependencies; model
-  and embedding weights come from their upstream providers. Default inference routes to the local
-  llama-swap service. If you configure a remote provider or extension, that provider may receive
-  the requests you send through it. See [SECURITY.md](SECURITY.md) for the network and trust
-  boundaries.
-
-The shipped [supply-chain manifest](supply-chain.json) lists the pinned bootstrap components and
-their upstream distribution locations. GitHub release installers are accompanied by
-`SHA256SUMS.txt`; checksum matching detects corruption but, because this public release is unsigned,
-does not establish publisher identity.
-
-## Where things live
-
-```
-llama.cpp\          inference engine + llama.cpp\models\*.gguf   (downloaded)
-llamaswap\          the router, and config.yaml - one entry per model
-open-webui-*\       the chat UI                                  (downloaded)
-logs\               everything's output, plus a log per download
-start.ps1           the CLI that does all the work
-ui.ps1              the control panel
-```
-
-`llamaswap\config.yaml` is the one file you'd ever hand-edit — it defines each model's context size
-and how much of it goes on the GPU. It's generated on first run from `config.example.yaml`.
-
-## Licence and contributing
-
-MIT — see [LICENSE](LICENSE). The name is a separate matter: fork it freely, but give your fork its
-own name ([NAMING.md](NAMING.md)).
-
-Nothing third-party is redistributed here; every component is downloaded from its own release page
-at a pinned version. One of those licences has a clause people miss — see
-[THIRD-PARTY.md](THIRD-PARTY.md). Model weights carry their own separate terms.
-
-[CONTRIBUTING.md](CONTRIBUTING.md) has the project's development ground rules.
-
-Maintainers: [dependency update and release promotion](docs/DEPENDENCY_UPDATES.md) documents the
-automated candidate workflow and the required real-hardware acceptance gate.
+- Model Pilot’s control panel binds to `127.0.0.1` and rejects cross-origin requests. It assumes a single-user desktop: other programs running as you can reach local services.
+- Model Pilot adds no telemetry or analytics service. First-run setup and optional installs contact component distributors and package indexes; model weights have their own upstream terms.
+- The [supply-chain manifest](supply-chain.json) lists pinned bootstrap components and their upstream distribution locations.
+- The project is [MIT licensed](LICENSE). Fork the code freely, but use your own name; see [NAMING.md](NAMING.md).
+- Contributions follow [CONTRIBUTING.md](CONTRIBUTING.md). Third-party licenses and model-weight terms remain separate; see [THIRD-PARTY.md](THIRD-PARTY.md).
